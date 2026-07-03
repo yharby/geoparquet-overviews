@@ -88,8 +88,8 @@ def _find_geometry_column(schema: pa.Schema) -> str:
             primary = json.loads(raw).get("primary_column")
             if primary and primary in schema.names:
                 return primary
-        except (ValueError, KeyError):
-            pass
+        except ValueError:
+            log.warning("ignoring a malformed `geo` footer block, it is not valid JSON")
     if "geometry" in schema.names:
         return "geometry"
     raise ValueError("no geometry column found, expected a `geo` footer block or a `geometry` column")
@@ -903,7 +903,9 @@ def _write(table: pa.Table, dst: str, plan: list[int], kv: dict[str, str], opts:
         if pa.types.is_string(table.schema.field(n).type)
         or pa.types.is_large_string(table.schema.field(n).type)
     ]
-    stats_cols = [n for n in names if n not in ("geometry", "geom_overview")] + bbox_doubles
+    # `bbox` is a struct parent, statistics are meaningful only on its four
+    # leaves (added via bbox_doubles), so exclude the parent name itself.
+    stats_cols = [n for n in names if n not in ("geometry", "geom_overview", "bbox")] + bbox_doubles
     # Resolve `band` to its physical leaf index. The `bbox` struct flattens into
     # four leaves, so a top-level column index would point at the wrong column.
     sorting = (
