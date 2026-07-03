@@ -876,3 +876,152 @@ button.action:disabled {
     transition: none !important;
   }
 }
+
+/* Feature attribute popup, shown on a geometry click and anchored by MapLibre so
+   it pans with the map. The app does not load maplibre-gl.css, so this popup's
+   structural layout, the absolute placement, the flex tip orientation per anchor,
+   the relative content box, and the absolutely positioned close button, is
+   provided here scoped to the popup's own class, then themed to match the panels.
+   Without these rules the content box and close button fall into normal flow. */
+.feature-popup-shell {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: flex;
+  will-change: transform;
+  pointer-events: none;
+}
+.feature-popup-shell.maplibregl-popup-anchor-top,
+.feature-popup-shell.maplibregl-popup-anchor-top-left,
+.feature-popup-shell.maplibregl-popup-anchor-top-right {
+  flex-direction: column;
+}
+.feature-popup-shell.maplibregl-popup-anchor-bottom,
+.feature-popup-shell.maplibregl-popup-anchor-bottom-left,
+.feature-popup-shell.maplibregl-popup-anchor-bottom-right {
+  flex-direction: column-reverse;
+}
+.feature-popup-shell.maplibregl-popup-anchor-left {
+  flex-direction: row;
+}
+.feature-popup-shell.maplibregl-popup-anchor-right {
+  flex-direction: row-reverse;
+}
+.feature-popup-shell .maplibregl-popup-content {
+  position: relative;
+  pointer-events: auto;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 30px 12px 12px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+  font-family: var(--body);
+}
+.feature-popup-shell .maplibregl-popup-close-button {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.feature-popup-shell .maplibregl-popup-close-button:hover {
+  color: var(--heading);
+  background: transparent;
+}
+.feature-popup-shell .maplibregl-popup-tip {
+  width: 0;
+  height: 0;
+  border: 8px solid transparent;
+  z-index: 1;
+}
+.feature-popup-shell.maplibregl-popup-anchor-top .maplibregl-popup-tip {
+  align-self: center;
+  border-top: none;
+  border-bottom-color: var(--panel);
+}
+.feature-popup-shell.maplibregl-popup-anchor-top-left .maplibregl-popup-tip {
+  align-self: flex-start;
+  border-top: none;
+  border-left: none;
+  border-bottom-color: var(--panel);
+}
+.feature-popup-shell.maplibregl-popup-anchor-top-right .maplibregl-popup-tip {
+  align-self: flex-end;
+  border-top: none;
+  border-right: none;
+  border-bottom-color: var(--panel);
+}
+.feature-popup-shell.maplibregl-popup-anchor-bottom .maplibregl-popup-tip {
+  align-self: center;
+  border-bottom: none;
+  border-top-color: var(--panel);
+}
+.feature-popup-shell.maplibregl-popup-anchor-bottom-left .maplibregl-popup-tip {
+  align-self: flex-start;
+  border-bottom: none;
+  border-left: none;
+  border-top-color: var(--panel);
+}
+.feature-popup-shell.maplibregl-popup-anchor-bottom-right .maplibregl-popup-tip {
+  align-self: flex-end;
+  border-bottom: none;
+  border-right: none;
+  border-top-color: var(--panel);
+}
+.feature-popup-shell.maplibregl-popup-anchor-left .maplibregl-popup-tip {
+  align-self: center;
+  border-left: none;
+  border-right-color: var(--panel);
+}
+.feature-popup-shell.maplibregl-popup-anchor-right .maplibregl-popup-tip {
+  align-self: center;
+  border-right: none;
+  border-left-color: var(--panel);
+}
+.feature-popup .fp-head {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--clay);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 6px;
+}
+.feature-popup .fp-note {
+  font-size: 12px;
+  color: var(--muted);
+}
+.feature-popup .fp-error {
+  color: var(--clay);
+}
+.feature-popup .fp-table {
+  display: block;
+  border-collapse: collapse;
+  font-size: 12px;
+  max-height: 240px;
+  overflow: auto;
+}
+.feature-popup .fp-table th,
+.feature-popup .fp-table td {
+  text-align: left;
+  padding: 2px 8px 2px 0;
+  vertical-align: top;
+  font-family: var(--mono);
+}
+.feature-popup .fp-table th {
+  color: var(--muted);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.feature-popup .fp-table td {
+  color: var(--fg);
+  word-break: break-word;
+  max-width: 220px;
+}

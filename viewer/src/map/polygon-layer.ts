@@ -49,7 +49,10 @@ export function buildPolygonLayer(
       },
       _normalize: false,
       getFillColor: fillColor,
-      pickable: false,
+      // The fill is pickable so a click resolves to a polygon ordinal, mapped
+      // back to its parquet row via the bucket's rowIds. The outline below stays
+      // unpickable so one click never resolves to two primitives.
+      pickable: true,
     }),
     new PathLayer({
       id: `${id}-outline`,
@@ -85,7 +88,7 @@ export function buildPointLayer(id: string, flat: FlatPoints, fillColor: Rgba = 
     getRadius: 2.5,
     radiusMinPixels: 1.5,
     getFillColor: fillColor,
-    pickable: false,
+    pickable: true,
   });
 }
 
@@ -106,7 +109,7 @@ export function buildLineLayer(id: string, flat: FlatPaths, lineColor: Rgba = LI
     widthUnits: 'pixels',
     getWidth: 1,
     widthMinPixels: 1,
-    pickable: false,
+    pickable: true,
   });
 }
 
@@ -156,7 +159,9 @@ export function buildHoledPolygonLayer(
       // the fill actually tesselates.
       positionFormat: 'XY',
       getFillColor: fillColor,
-      pickable: false,
+      // Pickable like the hole-free fill; info.index is the polygon ordinal in
+      // fillData, aligned with holedPolygons.rowIds. The outline stays unpickable.
+      pickable: true,
     }),
     new PathLayer({
       id: `${id}-outline`,
