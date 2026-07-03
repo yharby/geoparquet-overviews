@@ -1,0 +1,27 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+viewer/dist/
+.vite/
+
+# Parquet files are never committed, except the small bundled demo the viewer
+# loads by default. Large fixtures and converter outputs stay local only.
+*.parquet
+!viewer/public/sample.parquet
+
+# Local tooling and editor state
+.claude/
+.code-review-graph/
+.playwright-mcp/
+
+# OS
+.DS_Store

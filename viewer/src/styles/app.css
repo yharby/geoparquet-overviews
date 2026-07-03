@@ -1,0 +1,1030 @@
+/* parquet-e viewer — "instrument" design system.
+   Ported from the project's own reference docs (overviews explainer,
+   read-path chart): ink field with a faint dot grid, cream "paper"
+   surfaces, clay/teal/amber accents, Space Grotesk / Inter / IBM Plex Mono. */
+:root {
+  color-scheme: dark;
+  --ink: #12161a;
+  --panel: #1a2026;
+  --panel2: #222b33;
+  --line: #2e3944;
+  --paper: #efe9db;
+  --fg: #e5decf;
+  --heading: #f3eee2;
+  --muted: #948e80;
+  --dim: #6e6a5f;
+  --clay: #d8613c;
+  --clay-soft: rgba(216, 97, 60, 0.16);
+  --index: #4f9d8c;
+  --index-soft: rgba(79, 157, 140, 0.16);
+  --amber: #e8b24a;
+  /* per-file series (compare, heatmaps) */
+  --p0: #4f9d8c;
+  --p1: #5b8bd4;
+  --p2: #c9843c;
+  --p3: #b85c9e;
+
+  --disp: 'Space Grotesk', system-ui, sans-serif;
+  --body: 'Inter', system-ui, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--ink);
+  background-image: radial-gradient(circle at 1px 1px, rgba(255, 255, 255, 0.025) 1px, transparent 0);
+  background-size: 22px 22px;
+  color: var(--fg);
+  font-family: var(--body);
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+app-root {
+  display: block;
+  height: 100%;
+}
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 18px 20px 20px;
+  gap: 14px;
+}
+
+/* ---------- top bar ---------- */
+.topbar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.brand .eyebrow {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--index);
+  margin: 0 0 6px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.brand .eyebrow .dot {
+  width: 5px;
+  height: 5px;
+  background: var(--clay);
+  border-radius: 50%;
+}
+.brand h1 {
+  font-family: var(--disp);
+  font-weight: 700;
+  font-size: clamp(20px, 2.6vw, 28px);
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  margin: 0;
+  color: var(--heading);
+}
+
+.tabs {
+  display: flex;
+  gap: 6px;
+}
+.tabs button {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.tabs button:hover {
+  color: var(--fg);
+}
+.tabs button.active {
+  color: var(--heading);
+  border-color: var(--clay);
+  background: var(--clay-soft);
+}
+
+/* ---------- control deck (file loader) ---------- */
+.load-control {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  flex-wrap: wrap;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px 16px;
+}
+.load-control .field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.load-control .field.grow {
+  flex: 1;
+  min-width: 220px;
+}
+.load-control label,
+label.k {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+select,
+input[type='text'] {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 11px;
+}
+select:focus,
+input[type='text']:focus {
+  outline: none;
+  border-color: var(--index);
+}
+
+button.action {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--heading);
+  background: var(--clay);
+  border: 1px solid var(--clay);
+  border-radius: 8px;
+  padding: 9px 18px;
+  cursor: pointer;
+  transition: filter 0.15s;
+}
+button.action:hover {
+  filter: brightness(1.08);
+}
+button.action:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  filter: none;
+}
+
+/* ---------- dashboard ---------- */
+.dashboard {
+  display: grid;
+  grid-template-columns: minmax(0, 1.9fr) minmax(320px, 1fr);
+  gap: 14px;
+  flex: 1;
+  min-height: 0;
+}
+.side-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+/* ---------- map surface ---------- */
+.map-stage {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.map-frame {
+  position: relative;
+  flex: 1;
+  min-height: 60vh;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: #0e1216;
+}
+.map-container {
+  position: absolute;
+  inset: 0;
+}
+/* loading badge floats over the map, top-right (toolbar owns top-left) */
+.map-loading {
+  position: absolute;
+  z-index: 6;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(18, 22, 26, 0.82);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 7px 11px;
+}
+.map-loading .spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--line);
+  border-top-color: var(--clay);
+  animation: map-spin 0.7s linear infinite;
+}
+.map-loading-text {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+@keyframes map-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .map-loading .spinner {
+    animation-duration: 1.6s;
+  }
+}
+/* map toolbar floats over the map, top-left */
+.map-toolbar {
+  position: absolute;
+  z-index: 5;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+  background: rgba(18, 22, 26, 0.82);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 7px 9px;
+}
+.map-toolbar .tb-label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+  padding: 0 4px;
+}
+.map-toolbar button {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted);
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 6px 11px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.map-toolbar button:hover {
+  color: var(--fg);
+  border-color: var(--muted);
+}
+.map-toolbar button.on {
+  color: var(--heading);
+  background: var(--clay-soft);
+  border-color: var(--clay);
+}
+.map-toolbar .chip {
+  min-width: 30px;
+  text-align: center;
+}
+.map-toolbar .sep {
+  width: 1px;
+  align-self: stretch;
+  background: var(--line);
+  margin: 2px 3px;
+}
+.map-toolbar .zoom-slider {
+  width: 96px;
+  height: 4px;
+  cursor: pointer;
+  accent-color: var(--clay);
+  background: transparent;
+}
+.map-toolbar .zoom-read {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  white-space: nowrap;
+}
+.map-toolbar .zoom-read.overview {
+  color: var(--ink);
+  background: var(--amber);
+  border-color: var(--amber);
+}
+.map-toolbar .zoom-read.exact {
+  color: var(--fg);
+  background: var(--panel2);
+}
+
+.map-toolbar .tb-note {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  padding: 0 4px;
+}
+/* the compare custom element must not break the app-shell flex column */
+viz-compare {
+  display: contents;
+}
+
+/* status line under the map */
+.status {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  padding: 9px 2px 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--index);
+  flex: none;
+}
+.status.err {
+  color: var(--clay);
+}
+.status.err::before {
+  background: var(--clay);
+}
+
+/* ---------- panels ---------- */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px;
+}
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  margin-bottom: 12px;
+}
+.panel-head h2 {
+  font-family: var(--disp);
+  font-weight: 500;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+  margin: 0;
+  color: var(--heading);
+}
+.panel-head .n {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--clay);
+}
+.panel-head .note {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+}
+.panel .empty {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--dim);
+  padding: 4px 0;
+}
+
+/* ---------- stats / meter (signature) ---------- */
+.meter {
+  border-top: 1px solid var(--line);
+  padding-top: 13px;
+  margin-top: 3px;
+}
+.meter .cap {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.meter .big {
+  font-family: var(--mono);
+  font-size: 34px;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  margin: 3px 0 2px;
+  color: var(--heading);
+}
+.meter .big small {
+  font-size: 14px;
+  color: var(--muted);
+}
+.meter .sub {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.meter .sub b {
+  color: var(--amber);
+  font-weight: 500;
+}
+.meter .bar {
+  position: relative;
+  height: 8px;
+  background: var(--ink);
+  border-radius: 5px;
+  margin-top: 11px;
+  overflow: hidden;
+}
+.meter .bar > span {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: var(--clay);
+  border-radius: 5px;
+  transition: width 0.25s ease;
+}
+
+.readouts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-top: 13px;
+}
+.ro {
+  background: var(--panel2);
+  padding: 11px 12px;
+}
+.ro .k {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-bottom: 4px;
+}
+.ro .v {
+  font-family: var(--mono);
+  font-size: 15px;
+  color: var(--fg);
+  font-weight: 500;
+}
+.ro .v small {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.sub-head {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin: 15px 0 8px;
+}
+
+.phases {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.phase {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  background: var(--panel2);
+  padding: 8px 12px;
+}
+.phase-k {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+.phase-v {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--fg);
+  font-weight: 500;
+}
+.phase-v small {
+  font-size: 10px;
+  color: var(--dim);
+  margin-left: 4px;
+}
+
+/* ---------- layout heatmap ---------- */
+.heatmap-summary,
+.pruning-summary {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+.heatmap-bar {
+  display: flex;
+  height: 22px;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+}
+.heatmap-segment {
+  height: 100%;
+  border-right: 1px solid rgba(0, 0, 0, 0.35);
+  transition: background 0.15s;
+}
+.heatmap-segment:last-child {
+  border-right: none;
+}
+.heatmap-segment.fetched {
+  background: var(--clay);
+}
+.heatmap-segment.unfetched {
+  background: #2a3440;
+}
+.heatmap-legend,
+.legend {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
+  margin-top: 10px;
+}
+.legend i {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  margin-right: 5px;
+  vertical-align: -1px;
+}
+
+/* ---------- pruning grid ---------- */
+.pruning-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+.pruning-cell {
+  width: 13px;
+  height: 13px;
+  border-radius: 2px;
+}
+.pruning-cell.pruning-fetched {
+  background: var(--clay);
+}
+.pruning-cell.pruning-pruned {
+  background: #2a3440;
+}
+.pruning-cell.pruning-no-bbox {
+  background: #7a3d3d;
+}
+.pruning-cell,
+.heatmap-segment {
+  cursor: pointer;
+}
+.pruning-cell:hover,
+.heatmap-segment:hover {
+  outline: 1px solid var(--fg);
+  outline-offset: -1px;
+}
+/* linked highlight, driven from hover/selection anywhere else */
+.pruning-cell.hov,
+.heatmap-segment.hov {
+  outline: 1px solid var(--amber);
+  outline-offset: -1px;
+}
+.pruning-cell.sel,
+.heatmap-segment.sel {
+  outline: 2px solid var(--amber);
+  outline-offset: -1px;
+}
+
+/* ---------- row-group detail modal ---------- */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(8, 11, 14, 0.72);
+  backdrop-filter: blur(3px);
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.modal {
+  width: min(560px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 22px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+}
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+.modal-head h2 {
+  font-family: var(--mono);
+  font-weight: 500;
+  font-size: 26px;
+  letter-spacing: -0.01em;
+  margin: 0;
+  color: var(--heading);
+}
+.badge {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 4px 9px;
+  border-radius: 6px;
+  align-self: center;
+}
+.badge-fetched {
+  background: var(--clay-soft);
+  color: var(--clay);
+  border: 1px solid var(--clay);
+}
+.badge-pruned {
+  background: #222b33;
+  color: var(--muted);
+  border: 1px solid var(--line);
+}
+.badge-no-bbox {
+  background: rgba(122, 61, 61, 0.2);
+  color: #d08a8a;
+  border: 1px solid #7a3d3d;
+}
+.modal-close {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  width: 30px;
+  height: 30px;
+  cursor: pointer;
+}
+.modal-close:hover {
+  color: var(--fg);
+  border-color: var(--muted);
+}
+.modal-body {
+  display: grid;
+  grid-template-columns: 300px 1fr;
+  gap: 18px;
+  align-items: start;
+}
+@media (max-width: 560px) {
+  .modal-body {
+    grid-template-columns: 1fr;
+  }
+}
+.modal-map {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #0e1216;
+  overflow: hidden;
+}
+.modal-map svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+/* MapLibre overview mini-map of the row-group bboxes */
+.rg-mini {
+  height: 240px;
+  margin: 4px 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.rg-mini .maplibregl-ctrl-attrib {
+  display: none;
+}
+.modal-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.bbox-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.bbox-grid > div {
+  background: var(--panel2);
+  padding: 10px 12px;
+}
+.bbox-grid .k {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  display: block;
+  margin-bottom: 3px;
+}
+.bbox-grid b {
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--fg);
+}
+
+.band-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.band-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.band-chip {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex: 0 0 auto;
+}
+.band-role {
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.band-role b {
+  color: var(--fg);
+  font-weight: 600;
+}
+.band-role code,
+.band-note code {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--amber);
+}
+.band-note {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+.band-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+.band-tick {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  opacity: 0.55;
+}
+.band-tick.on {
+  opacity: 1;
+  color: var(--fg);
+  border-color: var(--clay);
+  background: var(--clay-soft);
+}
+
+/* ---------- waterfall ---------- */
+.waterfall {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.waterfall-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 18px;
+}
+.waterfall-label {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
+  width: 108px;
+  flex: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.waterfall-track {
+  position: relative;
+  flex: 1;
+  height: 9px;
+  background: var(--ink);
+  border-radius: 4px;
+}
+.waterfall-bar {
+  position: absolute;
+  height: 100%;
+  border-radius: 4px;
+  min-width: 2px;
+}
+.waterfall-size {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--amber);
+  width: 62px;
+  text-align: right;
+  flex: none;
+}
+
+/* ---------- compare tab ---------- */
+.compare {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+}
+.compare-controls {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+.compare-controls .vs {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+.compare-panes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+}
+.compare-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.compare-status {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.compare-map {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  flex: 1;
+  min-height: 40vh;
+}
+
+/* ---------- responsive ----------
+   The desktop layout is a fixed-viewport app: the shell is height:100%, the
+   dashboard fills the leftover height, and the side panels scroll internally.
+   On narrow screens that model overlaps (the map's min-height overflows its
+   grid track onto the panels below), so below 900px we drop the fixed height
+   and let the whole page flow and scroll naturally, map above panels. */
+@media (max-width: 900px) {
+  html,
+  body,
+  app-root {
+    height: auto;
+  }
+  .app-shell {
+    height: auto;
+    min-height: 100%;
+    padding: 14px 14px 18px;
+    gap: 12px;
+  }
+  .dashboard {
+    grid-template-columns: 1fr;
+    flex: none;
+    min-height: 0;
+  }
+  .map-stage {
+    min-height: 0;
+  }
+  .map-frame {
+    flex: none;
+    height: 58vh;
+    min-height: 320px;
+  }
+  .side-panels {
+    overflow: visible;
+    padding-right: 0;
+  }
+  .compare {
+    flex: none;
+  }
+  .compare-panes {
+    grid-template-columns: 1fr;
+  }
+  .compare-map {
+    min-height: 52vh;
+  }
+}
+
+/* phones: tighten spacing and let the loader controls stack full width */
+@media (max-width: 560px) {
+  .app-shell {
+    padding: 12px 12px 16px;
+    gap: 10px;
+  }
+  .map-frame {
+    height: 52vh;
+    min-height: 300px;
+  }
+  .load-control {
+    padding: 12px;
+    gap: 10px;
+  }
+  .load-control .field {
+    width: 100%;
+  }
+  .load-control .field.grow {
+    min-width: 0;
+    flex-basis: 100%;
+  }
+  .load-control select {
+    width: 100%;
+  }
+  .load-control .action {
+    width: 100%;
+  }
+  /* the "pan or zoom to fetch" hint is redundant on a small map toolbar */
+  .map-toolbar .tb-note {
+    display: none;
+  }
+  /* move the loading badge off the top so it clears the floating toolbar */
+  .map-loading {
+    top: auto;
+    bottom: 12px;
+    right: 12px;
+  }
+  .panel {
+    padding: 14px;
+  }
+}
+
+:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}

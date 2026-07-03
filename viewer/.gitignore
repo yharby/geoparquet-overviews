@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.local
+scripts/fixture.parquet
+# tsc is type-check only (noEmit); never commit compiled JS emitted into src
+src/**/*.js
+*.tsbuildinfo

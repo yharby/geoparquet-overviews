@@ -1,0 +1,814 @@
+import { LitElement, html } from 'lit';
+import './load-control';
+import '../viz/layout-heatmap';
+import '../viz/layout-map';
+import '../viz/waterfall';
+import '../viz/pruning-map';
+import '../viz/stats';
+import '../viz/row-group-detail';
+import type { FileLoadRequest } from './load-control';
+import { installFetchInstrumentation, setActiveUrl, timeWork, withPhase } from '../core/phase';
+import { emitEvent } from '../core/events';
+import type { Bbox } from '../geo/aoi';
+import {
+  loadMetadataFromUrl,
+  fileExtent,
+  schemaLookup,
+  hasRenderableGeometry,
+  computeFileFacts,
+  type GeoParquetMetadata,
+  type FileFacts,
+} from '../data/metadata';
+import { readColumnProgressive, getFileForUrl, type RowGroupRange } from '../data/rowgroups';
+import { pageRangesForRowGroup, mergePageRanges } from '../data/pageindex';
+import { getPageRangeMemo, getFlatCache, isFilePrefetched } from '../data/file-cache';
+import { detectLayout, type LayoutStrategy } from '../data/layout';
+import { viewFetchKey } from './fetch-key';
+import { DEFAULT_PRESET } from '../data/presets';
+import { MapView } from '../map/map-view';
+import { buildLayers } from '../map/polygon-layer';
+import { vertexCount, mergeFlatGeometries, type FlatGeometries } from '../geo/geojson';
+import type { LayoutHeatmap } from '../viz/layout-heatmap';
+import type { VizWaterfall } from '../viz/waterfall';
+import type { LoadStats, LoadSummary } from '../viz/stats';
+
+installFetchInstrumentation();
+
+export class AppRoot extends LitElement {
+  static properties = {
+    status: { state: true },
+    statusErr: { state: true },
+    metadata: { state: true },
+    aoiBbox: { state: true },
+    fetchedIndices: { state: true },
+    busy: { state: true },
+    summary: { state: true },
+    fileFacts: { state: true },
+    selectedIndex: { state: true },
+    currentZoom: { state: true },
+    pendingIndices: { state: true },
+    viewBbox: { state: true },
+    hoveredIndex: { state: true },
+    loading: { state: true },
+  };
+
+  // `declare` erases these fields at compile time so TypeScript's ES2022
+  // class-field emit does not shadow the reactive accessors Lit installs on
+  // the prototype for the properties named in `static properties`.
+  // Initializing them as normal class fields throws Lit's class-field-
+  // shadowing error at runtime under this project's tsconfig, so they are
+  // assigned in the constructor instead.
+  declare status: string;
+  declare statusErr: boolean;
+  declare metadata: GeoParquetMetadata | null;
+  declare aoiBbox: Bbox | null;
+  declare fetchedIndices: ReadonlySet<number>;
+  declare busy: boolean;
+  declare summary: LoadSummary | null;
+  declare fileFacts: FileFacts | null;
+  declare selectedIndex: number | null;
+  declare currentZoom: number;
+  declare pendingIndices: ReadonlySet<number>;
+  declare viewBbox: Bbox | null;
+  declare hoveredIndex: number | null;
+  declare loading: boolean;
+  private mapView: MapView | null = null;
+  private currentUrl: string | null = null;
+  private metadataMs = 0;
+  private fileBytes = 0;
+  private moveUnsub: (() => void) | null = null;
+  // Mutable source of truth for in-flight pending row groups. `pendingIndices`
+  // (the reactive, Set-typed prop every side panel reads) is only refreshed
+  // from this by `flushVizNow`/`scheduleVizFlush`, so a burst of per-batch
+  // arrivals coalesces into at most one reactive update per animation frame
+  // instead of one Lit re-render (of every panel) per row group.
+  private pendingWorking: Set<number> = new Set();
+  private vizFlushHandle: ReturnType<typeof requestAnimationFrame> | null = null;
+  // Coalesce bursts of moveend (e.g. a zoom that settles then an immediate pan)
+  // into a single read, so fast camera moves do not each kick off a fetch.
+  private fetchTimer: ReturnType<typeof setTimeout> | null = null;
+  // Fetches are serialized (one wasm read at a time) and superseded by token,
+  // so a pan mid-read cancels the stale read at the next row-group boundary and
+  // never paints stale results.
+  private fetchToken = 0;
+  // Bumped on every loadUrl so a load in flight for a superseded file does not
+  // reset shared state (busy, the active URL) under a newer load.
+  private loadToken = 0;
+  private fetchChain: Promise<void> = Promise.resolve();
+  // Dedupe key of the last view fetched, so an idle moveend (no real camera
+  // change) does not refetch the identical bbox and band.
+  private lastFetchKey: string | null = null;
+  private strategy: LayoutStrategy | null = null;
+
+  constructor() {
+    super();
+    this.status = 'Load a file to begin.';
+    this.statusErr = false;
+    this.metadata = null;
+    this.aoiBbox = null;
+    this.fetchedIndices = new Set();
+    this.busy = false;
+    this.summary = null;
+    this.fileFacts = null;
+    this.selectedIndex = null;
+    this.currentZoom = 6;
+    this.pendingIndices = new Set();
+    this.viewBbox = null;
+    this.hoveredIndex = null;
+    this.loading = false;
+  }
+
+  createRenderRoot() {
+    return this;
+  }
+
+  render() {
+    return html`
+      <div class="app-shell">
+        <div class="topbar">
+          <div class="brand">
+            <p class="eyebrow"><span class="dot"></span> GeoParquet overviews · read-path inspector</p>
+            <h1>The read path, traced live</h1>
+          </div>
+        </div>
+        ${this.renderInspectTab()}
+      </div>
+    `;
+  }
+
+  private renderInspectTab() {
+    return html`
+      <load-control .busy=${this.busy} @file-load=${this.onFileLoad}></load-control>
+      <div class="dashboard" @rowgroup-select=${this.onRowGroupSelect} @rowgroup-hover=${this.onRowGroupHover}>
+        <div class="map-stage">
+          <div class="map-frame">
+            <div class="map-container"></div>
+            ${this.loading || this.busy
+              ? html`<div class="map-loading" role="status" aria-label="Loading">
+                  <span class="spinner"></span>
+                  <span class="map-loading-text">loading</span>
+                </div>`
+              : ''}
+            <div class="map-toolbar">
+              <span class="tb-label">view</span>
+              <span class="tb-note">pan or zoom to fetch</span>
+              ${this.strategy?.hasZoomLevels ? this.renderZoomControl() : ''}
+            </div>
+          </div>
+          <div class="status ${this.statusErr ? 'err' : ''}">${this.status}</div>
+        </div>
+        <div class="side-panels">
+          <load-stats .summary=${this.summary} .facts=${this.fileFacts}></load-stats>
+          <layout-map
+            .metadata=${this.metadata}
+            .fetchedIndices=${this.fetchedIndices}
+            .pendingIndices=${this.pendingIndices}
+            .viewBbox=${this.viewBbox}
+            .selectedIndex=${this.selectedIndex}
+            .hoveredIndex=${this.hoveredIndex}
+          ></layout-map>
+          <pruning-map
+            .metadata=${this.metadata}
+            .aoi=${this.aoiBbox}
+            .fetchedIndices=${this.fetchedIndices}
+            .selectedIndex=${this.selectedIndex}
+            .hoveredIndex=${this.hoveredIndex}
+          ></pruning-map>
+          <layout-heatmap
+            .metadata=${this.metadata}
+            .fetchedIndices=${this.fetchedIndices}
+            .selectedIndex=${this.selectedIndex}
+            .hoveredIndex=${this.hoveredIndex}
+          ></layout-heatmap>
+          <viz-waterfall></viz-waterfall>
+        </div>
+      </div>
+      <row-group-detail
+        .metadata=${this.metadata}
+        .index=${this.selectedIndex}
+        .aoi=${this.aoiBbox}
+        .fetchedIndices=${this.fetchedIndices}
+        @close=${() => (this.selectedIndex = null)}
+      ></row-group-detail>
+    `;
+  }
+
+  private onRowGroupSelect(event: CustomEvent<{ index: number }>) {
+    this.selectedIndex = event.detail.index;
+  }
+
+  firstUpdated() {
+    this.ensureMap();
+    // Open on the default preset so the read path is traced immediately, with no
+    // manual load step. The user can still switch files with the control.
+    if (this.mapView) void this.loadUrl(DEFAULT_PRESET.url);
+  }
+
+  updated() {
+    this.ensureMap();
+  }
+
+  private ensureMap() {
+    if (this.mapView) return;
+    const container = this.querySelector('.map-container') as HTMLElement | null;
+    if (container) {
+      this.mapView = new MapView(container);
+      this.currentZoom = this.mapView.getZoom();
+      this.viewBbox = this.mapView.getBounds();
+      // The map view is the area. Every settled pan or zoom updates the mini
+      // map's viewport box and fetches whatever is now on screen at the band
+      // the zoom selects, like a slippy tile client.
+      this.moveUnsub = this.mapView.onMoveEnd(this.onMapMove);
+    }
+  }
+
+  disconnectedCallback() {
+    super.disconnectedCallback();
+    this.moveUnsub?.();
+    this.moveUnsub = null;
+    if (this.fetchTimer !== null) {
+      clearTimeout(this.fetchTimer);
+      this.fetchTimer = null;
+    }
+    if (this.vizFlushHandle !== null) {
+      cancelAnimationFrame(this.vizFlushHandle);
+      this.vizFlushHandle = null;
+    }
+    // Tear down the main map and its WebGL context, otherwise it leaks on
+    // disconnect the way the layout mini-map already avoids.
+    this.mapView?.destroy();
+    this.mapView = null;
+  }
+
+  // Coalesce pending-row-group updates. Batches arrive one at a time behind an
+  // inter-batch yield (see the `setTimeout(0)` below), so each one is its own
+  // Lit update pass unless we throttle how often `pendingIndices` (the prop
+  // every side panel re-renders on) actually changes reference. Multiple
+  // batches landing within one animation frame collapse into a single flush.
+  private scheduleVizFlush(token: number): void {
+    if (this.vizFlushHandle !== null) return;
+    this.vizFlushHandle = requestAnimationFrame(() => {
+      this.vizFlushHandle = null;
+      if (token !== this.fetchToken) return;
+      this.pendingIndices = new Set(this.pendingWorking);
+    });
+  }
+
+  // Flush the working set to the reactive prop immediately, bypassing (and
+  // cancelling) any scheduled rAF flush. Used at fetch start and fetch
+  // completion so the panels always end up showing the exact final state,
+  // never a stale in-between one left over from the last scheduled frame.
+  private flushVizNow(token: number): void {
+    if (this.vizFlushHandle !== null) {
+      cancelAnimationFrame(this.vizFlushHandle);
+      this.vizFlushHandle = null;
+    }
+    if (token !== this.fetchToken) return;
+    this.pendingIndices = new Set(this.pendingWorking);
+  }
+
+  private onRowGroupHover(event: CustomEvent<{ index: number | null }>) {
+    this.hoveredIndex = event.detail.index;
+  }
+
+  private onMapMove = () => {
+    if (!this.mapView) return;
+    // Keep the readouts (zoom, viewport box) live on every settle, but debounce
+    // the actual read so a rapid zoom-then-pan issues one fetch, not two.
+    this.currentZoom = this.mapView.getZoom();
+    this.viewBbox = this.mapView.getBounds();
+    if (this.fetchTimer !== null) clearTimeout(this.fetchTimer);
+    this.fetchTimer = setTimeout(() => {
+      this.fetchTimer = null;
+      this.fetchCurrentView();
+    }, 150);
+  };
+
+  // Fetch whatever the map currently shows, at the band the current zoom picks.
+  // Skips the read when neither the viewport nor the band changed since the
+  // last fetch, so an incidental moveend does not re-download the same view.
+  private fetchCurrentView(): void {
+    // A load is in flight, the strategy may not be prepared yet, so skip user-driven fetches until it settles.
+    if (this.busy) {
+      this.lastFetchKey = null;
+      return;
+    }
+    const metadata = this.metadata;
+    if (!metadata || !this.mapView) {
+      this.lastFetchKey = null;
+      return;
+    }
+    // An unsupported projected CRS is left in its native units, so an AOI in
+    // lon/lat cannot prune it and the map cannot place it. The no-reprojection
+    // notice is already shown, so skip fetching entirely.
+    if (!metadata.projection.supported) {
+      this.lastFetchKey = null;
+      return;
+    }
+    const bbox = this.mapView.getBounds();
+    const zoom = this.currentZoom;
+    // Key the dedupe on the strategy's level-of-detail for this zoom, so any LOD
+    // change refetches even when the viewport is unchanged, and on the AOI edges
+    // rounded per zoom, so small pans at high zoom are not swallowed.
+    const plan = this.strategy ? this.strategy.planRead(bbox, zoom) : null;
+    const lodKey = plan ? plan.lodKey : 'none';
+    const key = viewFetchKey(lodKey, bbox, zoom);
+    if (key === this.lastFetchKey) return;
+    this.lastFetchKey = key;
+    this.fetchAoi(bbox, zoom);
+  }
+
+  // The zoom slider range, derived from the pyramid's levels so it spans from a
+  // world view to the file's finest max_zoom (which can be far past the old
+  // hardcoded 15). Falls back to 4 to 15 when there are no levels.
+  private zoomRange(): { min: number; max: number } {
+    const levels = this.metadata?.overviewsInfo?.levels;
+    if (!levels || levels.length === 0) return { min: 4, max: 15 };
+    const maxZoom = Math.max(...levels.map((l) => l.maxZoom));
+    return { min: 1, max: Math.max(6, Math.ceil(maxZoom)) };
+  }
+
+  private renderZoomControl() {
+    // Label the current LOD from the strategy's plan for this zoom. column and
+    // read column depends only on the zoom, so any bbox works as the probe.
+    const probe = this.viewBbox ?? { xmin: 0, ymin: 0, xmax: 0, ymax: 0 };
+    const plan = this.strategy!.planRead(probe, this.currentZoom);
+    const isOverview = plan.column !== 'geometry';
+    const bandName = isOverview ? 'overview' : 'exact';
+    const range = this.zoomRange();
+    return html`
+      <span class="sep"></span>
+      <span class="tb-label">zoom</span>
+      <input
+        class="zoom-slider"
+        type="range"
+        min=${range.min}
+        max=${range.max}
+        step="0.5"
+        .value=${String(this.currentZoom)}
+        @input=${this.onZoomSlider}
+      />
+      <span class="zoom-read ${isOverview ? 'overview' : 'exact'}">z${this.currentZoom.toFixed(1)} · ${bandName}</span>
+    `;
+  }
+
+  private onZoomSlider = (e: Event) => {
+    const z = Number((e.target as HTMLInputElement).value);
+    this.currentZoom = z;
+    this.mapView?.setZoom(z);
+  };
+
+  private resetViz() {
+    (this.querySelector('layout-heatmap') as LayoutHeatmap | null)?.reset();
+    (this.querySelector('viz-waterfall') as VizWaterfall | null)?.reset();
+    (this.querySelector('load-stats') as LoadStats | null)?.reset();
+  }
+
+  private onFileLoad(event: CustomEvent<FileLoadRequest>) {
+    void this.loadUrl(event.detail.url);
+  }
+
+  private async loadUrl(url: string) {
+    if (!this.mapView) return;
+    // Invalidate any in-flight view fetch of the previous file so its
+    // progressive reader stops painting into this new file's map, and take a
+    // fresh load token so a superseded load does not reset shared state under a
+    // newer one (its finally would otherwise null the active URL mid-load).
+    this.fetchToken++;
+    const loadToken = ++this.loadToken;
+    this.resetViz();
+    // A new file, so clear the cumulative session totals too, not just the
+    // per-view ones resetViz clears. The footer and metadata reads that follow
+    // then count as the first bytes of this file's session.
+    (this.querySelector('load-stats') as LoadStats | null)?.resetSession();
+    this.currentUrl = url;
+    this.aoiBbox = null;
+    this.fetchedIndices = new Set();
+    this.pendingWorking = new Set();
+    this.flushVizNow(this.fetchToken);
+    this.lastFetchKey = null;
+    this.summary = null;
+    this.fileFacts = null;
+    this.busy = true;
+    this.statusErr = false;
+    this.status = 'Reading footer and metadata…';
+
+    setActiveUrl(url);
+    try {
+      const t0 = performance.now();
+      const metadata = await loadMetadataFromUrl(url);
+      // A newer load started while this file's metadata was fetching, so abandon
+      // this one rather than overwrite the newer file's metadata and strategy.
+      if (loadToken !== this.loadToken) return;
+      this.metadataMs = performance.now() - t0;
+      this.metadata = metadata;
+      this.strategy = detectLayout(metadata);
+      await this.strategy.prepare(url);
+      this.fileBytes = metadata.rowGroups.reduce((sum, rg) => sum + rg.totalByteSize, 0);
+      this.fileFacts = computeFileFacts(metadata, this.fileBytes, isFilePrefetched(url));
+      const proj = metadata.projection;
+      const crsCode = proj.geographic ? 'lon/lat' : proj.epsg ? `EPSG:${proj.epsg}` : proj.label;
+      const crsDetail = proj.geographic
+        ? 'native'
+        : proj.supported
+          ? 'reprojected to lon/lat'
+          : 'unsupported';
+      this.summary = {
+        fileBytes: this.fileBytes,
+        rowGroupsTotal: metadata.rowGroups.length,
+        rowGroupsFetched: 0,
+        features: 0,
+        vertices: 0,
+        metadataMs: this.metadataMs,
+        fetchMs: 0,
+        decodeMs: 0,
+        uploadMs: 0,
+        totalMs: this.metadataMs,
+        crs: crsCode,
+        crsDetail,
+        column: '',
+        band: null,
+        pagePrunedGroups: 0,
+        wholeGroups: 0,
+      };
+
+      this.mapView.clearLayers();
+      let crsNote = '';
+      if (!proj.supported) {
+        // The data is in a projected CRS with no reprojection defined, so its
+        // bboxes stay in native units. Flying the map to them would feed
+        // MapLibre out-of-range lat/lon and throw, so skip the fly and skip
+        // fetching (fetchCurrentView also guards on this), and keep the parsed
+        // metadata so the layout panels still render. Just show the notice.
+        this.statusErr = true;
+        crsNote = ` Cannot render, ${proj.label} is a projected CRS with no reprojection defined.`;
+      } else {
+        const extent = fileExtent(metadata.rowGroups);
+        // Flying to the extent settles into a moveend, which auto-fetches the
+        // opening overview for the whole file, no manual step.
+        if (extent) this.mapView.flyToBbox(extent);
+        if (!proj.geographic) crsNote = ` Reprojected from ${proj.label} to lon/lat.`;
+      }
+      // The file declares its geometry types but none are ones the renderer can
+      // draw (or the list is empty), so warn rather than silently paint nothing.
+      // A missing geometry_types is common and never triggers this.
+      let typeNote = '';
+      if (!hasRenderableGeometry(metadata.geometryTypes)) {
+        this.statusErr = true;
+        const declared = (metadata.geometryTypes ?? []).join(', ') || 'none';
+        typeNote = ` This file declares no renderable geometry types (${declared}).`;
+      }
+      this.status = `${metadata.rowGroups.length} row groups, ${(this.fileBytes / 1_000_000).toFixed(0)} MB. Pan or zoom to fetch.${crsNote}${typeNote}`;
+    } catch (err) {
+      if (loadToken !== this.loadToken) return;
+      this.statusErr = true;
+      this.status = `Could not read ${url}. ${err instanceof Error ? err.message : String(err)}`;
+      this.metadata = null;
+      // Clear the strategy so a stale one from the previous file cannot drive a
+      // fetch against the failed load.
+      this.strategy = null;
+    } finally {
+      // Only release busy and the active URL if this is still the latest load,
+      // so a superseded load does not clear them out from under the newer one.
+      if (loadToken === this.loadToken) {
+        this.busy = false;
+        setActiveUrl(null);
+      }
+    }
+  }
+
+  // Queue a fetch for one area at one zoom. Fetches are serialized on a promise
+  // chain so only one wasm read runs at a time, and each carries a token so a
+  // newer request supersedes an in-flight one instead of racing it.
+  private fetchAoi(bbox: Bbox, zoom: number): void {
+    const token = ++this.fetchToken;
+    this.fetchChain = this.fetchChain.then(() => this.runFetch(bbox, zoom, token));
+  }
+
+  // Fetch and render one area at one zoom. The zoom picks the overview level
+  // (which row-group prefix and which geometry column), the AOI bbox prunes
+  // within that prefix, and the row groups are read in batches so the map fills
+  // in progressively rather than after one long wait. Files with no overview
+  // pyramid read the full geometry column for every intersecting row group.
+  private async runFetch(bbox: Bbox, zoom: number, token: number) {
+    const url = this.currentUrl;
+    const metadata = this.metadata;
+    if (!url || !metadata || !this.mapView) return;
+    // Superseded by a newer request before this one got its turn on the chain.
+    if (token !== this.fetchToken) return;
+
+    this.aoiBbox = bbox;
+    // Show the map spinner while this view is in flight. A superseded fetch
+    // leaves it on for the newer fetch that already owns the token.
+    this.loading = true;
+
+    // Each fetch reports its own cost, so clear the accumulating panels (byte
+    // meter, waterfall, layout heatmap) and the map before this area's requests.
+    this.resetViz();
+    this.mapView.clearLayers();
+
+    const plan = this.strategy!.planRead(bbox, zoom);
+    const indices = plan.indices;
+    const column = plan.column;
+
+    this.fetchedIndices = new Set(indices);
+    this.pendingWorking = new Set(indices);
+    this.flushVizNow(token);
+    this.statusErr = false;
+    // A file with no covering bbox cannot be pruned to the view, so note that
+    // rather than imply the area was empty.
+    const prunable = this.strategy!.prunable;
+    if (indices.length === 0) {
+      this.pendingWorking.clear();
+      this.flushVizNow(token);
+      this.loading = false;
+      // Allow an immediate retry of the same view once data comes into range.
+      this.lastFetchKey = null;
+      this.status = prunable
+        ? 'No row groups intersect this area. Try a larger or different area.'
+        : 'This file has no covering bbox, so pruning is unavailable, and it has no row groups to read.';
+      return;
+    }
+
+    const pruneNote = prunable ? '' : ' This file has no covering bbox, so pruning is unavailable.';
+    const readingLabel = column === 'geometry' ? 'exact geometry' : `overview (${column})`;
+    this.status = `Fetching ${indices.length} of ${metadata.rowGroups.length} row groups, ${readingLabel}…${pruneNote}`;
+
+    // Map each selected row group to its absolute row range, so hyparquet reads
+    // exactly that group's column chunk over a range request.
+    const offsets: number[] = [];
+    let acc = 0;
+    for (const rg of metadata.rowGroups) {
+      offsets.push(acc);
+      acc += rg.rowCount;
+    }
+    const ranges: RowGroupRange[] = indices.map((i) => ({
+      index: i,
+      rowStart: offsets[i],
+      rowEnd: offsets[i] + metadata.rowGroups[i].rowCount,
+    }));
+
+    // Only claim the active URL if this fetch is still current, so a fetch
+    // already superseded before it runs cannot steal attribution from the
+    // fetch that superseded it.
+    if (token === this.fetchToken) setActiveUrl(url);
+    // Refine wide row groups to page-level sub-ranges over the offset index, so
+    // a small viewport reads only the overlapping pages of a large row group.
+    // Any failure in the page path falls back to a whole-group read.
+    const readRanges = await this.refineToPages(url, metadata, ranges, bbox);
+    if (token !== this.fetchToken) {
+      // Stale: do not touch the active URL, it may already belong to whatever
+      // superseded this fetch.
+      return;
+    }
+    // refineToPages drops a group whose pages all miss the view, so re-derive
+    // the indices actually being read and update the panels, otherwise a dropped
+    // group would sit listed as pending forever.
+    const readIndices = readRanges.map((r) => r.index);
+    this.fetchedIndices = new Set(readIndices);
+    this.pendingWorking = new Set(readIndices);
+    this.flushVizNow(token);
+    const total = readIndices.length;
+    if (total === 0) {
+      this.pendingWorking.clear();
+      this.flushVizNow(token);
+      this.loading = false;
+      this.lastFetchKey = null;
+      this.status = 'No data pages intersect this area. Try a larger or different area.';
+      setActiveUrl(null);
+      return;
+    }
+    const pagePruned = readRanges.filter((r) => r.subRanges).length;
+    if (pagePruned > 0) {
+      this.status = `Fetching ${total} of ${metadata.rowGroups.length} row groups, ${readingLabel}, ${pagePruned} page pruned…${pruneNote}`;
+    }
+    // The band all groups in this view belong to (they share one level's
+    // prefix), for the read-cost panel's efficiency readout.
+    const viewBand = metadata.rowGroups[readIndices[0]]?.band ?? null;
+
+    const tStart = performance.now();
+    let features = 0;
+    let vertices = 0;
+    let decodeMs = 0;
+    let uploadMs = 0;
+    let batchOrdinal = 0;
+    const arrived: number[] = [];
+    // Every batch's flattened buckets, cached-hit and freshly decoded alike, are
+    // collected here and merged into one layer set per kind at fetch completion,
+    // so a settled view holds a handful of layers instead of one per row group.
+    const batches: FlatGeometries[] = [];
+
+    // Flat-geometry cache for this file. The key must separate partial page-pruned
+    // reads (a subset of a group's rows) from whole-group reads and from the same
+    // group read via a different column at another level of detail, otherwise a
+    // partial decode could be served to a later full read.
+    const flatCache = getFlatCache(url);
+    const rangeSignature = (range: RowGroupRange): string =>
+      range.subRanges ? range.subRanges.map((s) => `${s.rowStart}-${s.rowEnd}`).join(',') : 'full';
+    const cacheKey = (range: RowGroupRange): string => `${column}\u0000${range.index}\u0000${rangeSignature(range)}`;
+
+    // Paint one batch progressively and collect its buckets for the end-of-fetch
+    // merge. Shared by the cache-hit and fresh-decode paths so both update the
+    // load summary and pending list identically.
+    const paintBatch = (flat: FlatGeometries, batchFeatures: number, batchIndices: number[]) => {
+      features += batchFeatures;
+      vertices += vertexCount(flat);
+      batches.push(flat);
+
+      const tUpload = performance.now();
+      timeWork('gpu-upload', `${batchFeatures} geometries`, () =>
+        this.mapView!.addLayers(buildLayers(`rg-batch-${batchOrdinal}`, flat)),
+      );
+      uploadMs += performance.now() - tUpload;
+      batchOrdinal += 1;
+
+      arrived.push(...batchIndices);
+      // Mutate the working set and coalesce the reactive flush with a rAF, so
+      // several batches arriving in the same frame (or the same macrotask,
+      // before the next paint) collapse into one `pendingIndices` update
+      // instead of one per row group. Every side panel reads `pendingIndices`,
+      // so this is what keeps a fast progressive fetch from re-rendering all
+      // of them once per batch.
+      for (const i of batchIndices) this.pendingWorking.delete(i);
+      this.scheduleVizFlush(token);
+
+      const wallMs = performance.now() - tStart;
+      this.summary = {
+        fileBytes: this.fileBytes,
+        rowGroupsTotal: metadata.rowGroups.length,
+        rowGroupsFetched: arrived.length,
+        features,
+        vertices,
+        metadataMs: this.metadataMs,
+        fetchMs: Math.max(0, wallMs - decodeMs - uploadMs),
+        decodeMs,
+        uploadMs,
+        totalMs: this.metadataMs + wallMs,
+        // Carry the CRS readout set when the file loaded, it does not change
+        // between fetches of the same file.
+        crs: this.summary?.crs ?? '',
+        crsDetail: this.summary?.crsDetail ?? '',
+        column,
+        band: viewBand,
+        pagePrunedGroups: pagePruned,
+        wholeGroups: total - pagePruned,
+      };
+      this.status = `Painted ${arrived.length}/${total} row groups (${features.toLocaleString('en-US')} features)…`;
+    };
+
+    // Split the read ranges into cache hits (skip the byte fetch and the decode
+    // entirely) and misses (read and decode). The hit's byte cost is zero, so no
+    // fetch event fires and the byte accounting stays coherent.
+    const cachedHits: { range: RowGroupRange; cached: { flat: FlatGeometries; features: number } }[] = [];
+    const uncachedRanges: RowGroupRange[] = [];
+    for (const range of readRanges) {
+      const cached = flatCache.get(cacheKey(range));
+      if (cached) cachedHits.push({ range, cached });
+      else uncachedRanges.push(range);
+    }
+    const uncachedByIndex = new Map(uncachedRanges.map((r) => [r.index, r]));
+
+    try {
+      // Repaint the cached groups first, instantly, then stream the misses in.
+      for (const { range, cached } of cachedHits) {
+        if (token !== this.fetchToken) return;
+        const t0 = performance.now();
+        emitEvent({ kind: 'work', phase: 'flatten-cache', label: `rg ${range.index}`, t0, t1: performance.now() });
+        paintBatch(cached.flat, cached.features, [range.index]);
+      }
+
+      await readColumnProgressive(
+        url,
+        uncachedRanges,
+        column,
+        async (geometries, batchIndices) => {
+        // A newer view fetch started, so stop painting this stale one. The
+        // reader also bails at the next row-group boundary via shouldStop below,
+        // so a fast pan or zoom abandons the stale read instead of waiting it out.
+        if (token !== this.fetchToken) return;
+
+        const tDecode = performance.now();
+        const flat = timeWork('wkb-decode', `${geometries.length} geometries`, () => plan.decode(geometries));
+        decodeMs += performance.now() - tDecode;
+
+        // Cache the per-group decode before merging, so a repeat view reuses it.
+        // Merging is per view, caching is per group, so the merged result is not
+        // cached.
+        const range = uncachedByIndex.get(batchIndices[0]);
+        if (range) flatCache.set(cacheKey(range), { flat, features: geometries.length });
+
+        paintBatch(flat, geometries.length, batchIndices);
+
+        // Yield a macrotask between row groups so the decode burst after a gesture
+        // cannot block the main thread for the whole read. Cancellation is checked
+        // at the next boundary by shouldStop below.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        },
+        () => token !== this.fetchToken,
+      );
+      if (token !== this.fetchToken) return;
+      this.pendingWorking.clear();
+      // Atomically collapse the per-batch layers into one layer set per kind. The
+      // merged layers are built first, then swapped in with a single setLayers, so
+      // there is no frame where the map is empty.
+      const merged = mergeFlatGeometries(batches);
+      timeWork('gpu-upload', `${features.toLocaleString('en-US')} merged`, () =>
+        this.mapView!.setLayers(buildLayers('rg-merged', merged)),
+      );
+      this.status = `Rendered ${features.toLocaleString('en-US')} features from ${total} row groups, ${readingLabel}.${pruneNote}`;
+    } catch (err) {
+      if (token !== this.fetchToken) return;
+      this.statusErr = true;
+      // Clear the dedupe key so the same view can be retried without moving the
+      // camera first.
+      this.lastFetchKey = null;
+      this.status = `Fetch failed. ${err instanceof Error ? err.message : String(err)}`;
+    } finally {
+      // Whatever happened, land the exact final pending state, never a stale
+      // one left over from a scheduled-but-not-yet-fired rAF flush.
+      this.flushVizNow(token);
+      // Only clear the active URL if this fetch is still the latest, so a
+      // fetch superseded mid-read cannot null out the newer fetch's URL.
+      if (token === this.fetchToken) setActiveUrl(null);
+      // Only clear the spinner if this fetch is still the latest, so a fetch
+      // superseded mid-read leaves it on for the newer one.
+      if (token === this.fetchToken) this.loading = false;
+    }
+  }
+
+  // Turn whole-group read ranges into page-pruned sub-ranges where it pays off.
+  // A row group is only page-pruned when its footprint dwarfs the viewport (>=
+  // 4x area) and the file exposes the covering page indexes. Every other group,
+  // and any read error, falls back to a whole-group read, so this never throws.
+  private async refineToPages(
+    url: string,
+    metadata: GeoParquetMetadata,
+    ranges: RowGroupRange[],
+    aoi: Bbox,
+  ): Promise<RowGroupRange[]> {
+    const covering = metadata.coveringPaths;
+    const aoiArea = bboxArea(aoi);
+    if (!covering || !(aoiArea > 0)) return ranges;
+
+    let file;
+    try {
+      file = await getFileForUrl(url);
+    } catch {
+      return ranges;
+    }
+    // A prefetched file is fully resident, so page pruning saves no bytes and
+    // would only add index reads and decode work. Read whole groups from memory.
+    if (isFilePrefetched(url)) return ranges;
+    const lookup = schemaLookup(metadata.schema);
+    const transform = metadata.projection.transform;
+    const memo = getPageRangeMemo(url);
+
+    const out: RowGroupRange[] = [];
+    for (const range of ranges) {
+      const rg = metadata.rowGroups[range.index];
+      const raw = metadata.rawRowGroups[range.index];
+      const wideEnough = rg?.bbox && raw && bboxArea(rg.bbox) >= 4 * aoiArea;
+      if (!wideEnough) {
+        out.push(range);
+        continue;
+      }
+      // The page indexes are immutable for the file, and the per-page bboxes are
+      // absolute, so the decoded pages are reused across every pan and zoom. Only
+      // the AOI filter in mergePageRanges below is recomputed per view. A null
+      // memo value records a group that cannot be page pruned.
+      let pages = memo.get(range.index) ?? null;
+      if (!memo.has(range.index)) {
+        try {
+          pages = await withPhase('page-index', () =>
+            pageRangesForRowGroup(file, raw, covering, range.rowStart, rg.rowCount, transform, lookup),
+          );
+        } catch {
+          pages = null;
+        }
+        memo.set(range.index, pages);
+      }
+      if (!pages) {
+        out.push(range);
+        continue;
+      }
+      const subRanges = mergePageRanges(pages, aoi);
+      if (subRanges.length === 0) continue; // no page meets the viewport, read nothing
+      const whole =
+        subRanges.length === 1 &&
+        subRanges[0].rowStart <= range.rowStart &&
+        subRanges[0].rowEnd >= range.rowEnd;
+      if (whole) {
+        out.push(range);
+        continue;
+      }
+      out.push({ ...range, subRanges });
+    }
+    return out;
+  }
+}
+
+function bboxArea(b: Bbox): number {
+  return Math.max(0, b.xmax - b.xmin) * Math.max(0, b.ymax - b.ymin);
+}
+
+customElements.define('app-root', AppRoot);
