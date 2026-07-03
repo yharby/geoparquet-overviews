@@ -136,6 +136,17 @@ button.action:disabled {
   overflow-y: auto;
   padding-right: 2px;
 }
+/* MapLibre canvases (the main map and the panel mini-maps) carry an explicit
+   pixel width, which pins their container's min-content. Grid and flex items
+   default to min-width auto, so without this the dashboard column and the panel
+   stack cannot shrink below the map size and the page scrolls sideways under
+   about 360px. min-width 0 lets the tracks shrink past their content, and each
+   map's own resize observer refits its canvas to the width that frees up. */
+.map-stage,
+.side-panels,
+.side-panels > * {
+  min-width: 0;
+}
 
 /* ---------- map surface ---------- */
 .map-stage {
