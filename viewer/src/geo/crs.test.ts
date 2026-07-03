@@ -44,11 +44,27 @@ describe('parseCrs', () => {
     expect(lat).toBeLessThan(61);
   });
 
+  it('supports EPSG:3857 web mercator through a proj4 built-in, with no local def', () => {
+    const c = parseCrs(projected(3857));
+    expect(c.geographic).toBe(false);
+    expect(c.supported).toBe(true);
+    expect(c.epsg).toBe(3857);
+    // The 3857 origin (0, 0) is lon/lat (0, 0).
+    const [lon, lat] = c.transform!(0, 0);
+    expect(lon).toBeCloseTo(0, 6);
+    expect(lat).toBeCloseTo(0, 6);
+  });
+
   it('marks an unknown projected CRS unsupported', () => {
     const c = parseCrs(projected(999999));
     expect(c.geographic).toBe(false);
     expect(c.supported).toBe(false);
     expect(c.transform).toBeNull();
+  });
+
+  it('treats a bare standalone 4326 token (no EPSG prefix) as geographic', () => {
+    const c = parseCrs({ primary_column: 'geometry', columns: { geometry: { crs: 'urn:ogc:def:crs:custom:4326' } } });
+    expect(c.geographic).toBe(true);
   });
 
   // V10. A code that merely contains the digits 4326 (like 104326) must not be

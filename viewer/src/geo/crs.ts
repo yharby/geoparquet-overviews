@@ -8,8 +8,9 @@ import type { Bbox } from './aoi';
 export type CoordTransform = (x: number, y: number) => [number, number];
 
 // proj4 definitions for projected CRSes the viewer can reproject to lon/lat.
-// EPSG:4326 and 3857 ship with proj4. Add projected codes here as needed, keyed
-// by EPSG code. The viewer shows a clear notice for any code not listed.
+// EPSG:4326 and 3857 already ship inside proj4, so `projected()` handles those
+// without an entry here. Add any other projected code you need, keyed by EPSG
+// code. The viewer shows a clear notice for any code it cannot resolve.
 const PROJ_DEFS: Record<number, string> = {
   // ETRS89 / TM35FIN(E,N), the Finnish national grid, metres.
   3067: '+proj=utm +zone=35 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +type=crs',
@@ -29,13 +30,15 @@ export interface CrsInfo {
   label: string;
 }
 
-const GEOGRAPHIC: CrsInfo = {
+// Frozen so a caller that reads this shared singleton can never mutate the
+// value returned to every other geographic file.
+const GEOGRAPHIC: CrsInfo = Object.freeze({
   geographic: true,
   epsg: null,
   supported: true,
   transform: null,
   label: 'CRS84 lon/lat',
-};
+});
 
 function epsgFromCrs(crs: Record<string, unknown>): number | null {
   // PROJJSON carries the authority code in a single `id` object, but some
@@ -63,12 +66,16 @@ function mentions4326(text: string): boolean {
 }
 
 function projected(epsg: number, label: string): CrsInfo {
-  const def = PROJ_DEFS[epsg];
-  if (!def) {
+  const name = `EPSG:${epsg}`;
+  const localDef = PROJ_DEFS[epsg];
+  if (localDef) proj4.defs(name, localDef);
+  // proj4 ships a few common codes built in (notably EPSG:3857 web mercator),
+  // so a code with no local def may still be resolvable. If neither a local
+  // def nor a proj4 built-in covers it, report it unsupported so the viewer
+  // shows a notice instead of a broken render.
+  if (!localDef && !proj4.defs(name)) {
     return { geographic: false, epsg, supported: false, transform: null, label };
   }
-  const name = `EPSG:${epsg}`;
-  proj4.defs(name, def);
   const transform: CoordTransform = (x, y) => proj4(name, 'EPSG:4326', [x, y]) as [number, number];
   return { geographic: false, epsg, supported: true, transform, label };
 }
