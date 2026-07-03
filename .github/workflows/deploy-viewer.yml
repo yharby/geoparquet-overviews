@@ -1,9 +1,14 @@
 name: Deploy viewer
 
-# Build the browser viewer and publish it to GitHub Pages on every push to main.
+# Build the browser viewer and publish it to GitHub Pages when a push to main
+# touches the viewer or this workflow. Other changes (converter, spec, docs) do
+# not rebuild it. Use the manual trigger to force a full deploy.
 on:
   push:
     branches: [main]
+    paths:
+      - 'viewer/**'
+      - '.github/workflows/deploy-viewer.yml'
   workflow_dispatch:
 
 permissions:

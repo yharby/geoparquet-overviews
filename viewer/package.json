@@ -2,6 +2,7 @@
   "name": "geoparquet-overviews-viewer",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "packageManager": "pnpm@11.9.0",
   "description": "Browser inspector that traces the GeoParquet with overviews read path over HTTP range requests.",
@@ -17,7 +18,7 @@
     "@deck.gl/layers": "9.3.6",
     "@deck.gl/mapbox": "9.3.6",
     "hyparquet": "1.26.2",
-    "hyparquet-compressors": "^1.1.1",
+    "hyparquet-compressors": "1.1.1",
     "lit": "3.3.3",
     "maplibre-gl": "5.24.0",
     "proj4": "2.20.9"

@@ -164,7 +164,7 @@ The footer records what was done, `importance` names the ranking and
 ## Measured on real data
 
 5.65 million building polygons, EPSG 3067 metres, Finland. A whole-country
-preview reads the band 0 overview, about 9 MB in 3 range requests. The full
+preview reads the band 0 overview, about 9 MB in a few range requests. The full
 exact geometry column is about 620 MB, roughly 67x more. Per band, the
 overview column is 73 to 81 percent smaller than the exact geometry it stands
 in for. Page pruning adds about 5.8x on large row groups and 1.5 to 2x on

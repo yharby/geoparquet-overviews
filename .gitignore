@@ -10,7 +10,6 @@ dist/
 
 # Node
 node_modules/
-viewer/dist/
 .vite/
 
 # Parquet files are never committed, except the small bundled demo the viewer
