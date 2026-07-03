@@ -9,7 +9,7 @@ dependencies = [
     "pyarrow>=24.0.0",
     "shapely>=2.1.2",
     "numpy>=2.5.0",
-    "click>=8.3.0",
+    "click>=8.4.2",
 ]
 
 [project.scripts]
@@ -24,8 +24,8 @@ packages = ["src/geoparquet_overviews"]
 
 [dependency-groups]
 dev = [
-    "pytest>=8",
-    "ruff>=0.14",
+    "pytest>=9.1.1",
+    "ruff>=0.15.20",
 ]
 
 [tool.ruff]
