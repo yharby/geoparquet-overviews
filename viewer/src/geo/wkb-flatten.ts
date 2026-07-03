@@ -129,10 +129,10 @@ function readGeometry(c: WkbCursor, b: FlatBuilders): void {
   const { geomType, extra } = readHeader(c);
   switch (geomType) {
     case 1: {
-      // Point. A NaN x is the WKB idiom for an empty point; skip it so it does
-      // not paint a dot at (NaN, NaN).
+      // Point. A NaN coordinate is the WKB idiom for an empty point; skip it so
+      // it does not paint a dot at (NaN, NaN).
       const [x, y] = readXY(c, extra);
-      if (!Number.isNaN(x)) b.pointPos.push2(x, y);
+      if (!Number.isNaN(x) && !Number.isNaN(y)) b.pointPos.push2(x, y);
       break;
     }
     case 2: {

@@ -106,6 +106,10 @@ export function createByteCache(base: AsyncBuffer, opts: ByteCacheOptions = {}):
         if (entry.bytes > 0) residentBytes += nowPinned ? -entry.bytes : entry.bytes;
         entry.pinned = nowPinned;
       }
+      // Unpinning adds those bytes back to the resident total, which can push it
+      // over budget, so re-run eviction to restore the invariant immediately
+      // rather than waiting for the next slice.
+      evict('');
     },
     stats() {
       let pinnedBytes = 0;

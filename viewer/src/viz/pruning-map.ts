@@ -2,7 +2,7 @@ import { LitElement, html } from 'lit';
 import { bboxIntersects, type Bbox } from '../geo/aoi';
 import type { GeoParquetMetadata } from '../data/metadata';
 
-type Outcome = 'no-bbox' | 'pruned' | 'fetched';
+type Outcome = 'no-bbox' | 'idle' | 'pruned' | 'fetched';
 
 export class PruningMap extends LitElement {
   static properties = {
@@ -47,7 +47,11 @@ export class PruningMap extends LitElement {
   }
 
   private outcomeFor(index: number, bbox: Bbox | null): Outcome {
-    if (!bbox || !this.aoi) return 'no-bbox';
+    // A truly missing bbox is the only 'no-bbox' case. Before the first fetch
+    // settles there is no area yet, so a bbox-carrying group is 'idle', not
+    // bbox-less, otherwise a normal file misreports as red during load.
+    if (!bbox) return 'no-bbox';
+    if (!this.aoi) return 'idle';
     if (!bboxIntersects(bbox, this.aoi)) return 'pruned';
     return this.fetchedIndices.has(index) ? 'fetched' : 'pruned';
   }
