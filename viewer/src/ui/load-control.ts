@@ -18,8 +18,8 @@ export class LoadControl extends LitElement {
   // (target ES2022, useDefineForClassFields true) and aborts every render.
   declare busy: boolean;
   // Seeded with the file the viewer auto-loads on open, the `url` query
-  // parameter when present, else the default preset, so the URL box and the
-  // auto-load agree and the Load button is enabled from the first render.
+  // parameter when present, else the default preset, so the URL box agrees with
+  // the file the app loads on the first render.
   private urlInput = initialUrl();
 
   constructor() {
@@ -36,7 +36,7 @@ export class LoadControl extends LitElement {
       <div class="load-control">
         <div class="field">
           <label>File preset</label>
-          <select @change=${this.onPresetChange}>
+          <select @change=${this.onPresetChange} ?disabled=${this.busy}>
             <option value="" ?selected=${!FILE_PRESETS.some((p) => p.url === this.urlInput)}>
               custom URL
             </option>
@@ -53,32 +53,34 @@ export class LoadControl extends LitElement {
             type="text"
             .value=${this.urlInput}
             @input=${this.onUrlInput}
-            @keydown=${this.onKeydown}
-            placeholder="https://.../file.parquet"
+            @change=${this.onUrlCommit}
+            placeholder="paste a .parquet URL, then Enter"
           />
         </div>
-        <button class="action" ?disabled=${this.busy || !this.urlInput} @click=${this.dispatchLoad}>
-          ${this.busy ? 'reading…' : 'Load file'}
-        </button>
       </div>
     `;
   }
 
+  // Selecting a preset loads it straight away. The empty "custom URL" option
+  // carries no url, so it just clears the selection without a load.
   private onPresetChange(event: Event) {
     const value = (event.target as HTMLSelectElement).value;
-    if (value) this.urlInput = value;
+    if (!value) return;
+    this.urlInput = value;
     this.requestUpdate();
+    this.dispatchLoad();
   }
 
+  // Track the typed URL so a re-render (e.g. on busy change) keeps the field's
+  // text, without loading on every keystroke.
   private onUrlInput(event: Event) {
     this.urlInput = (event.target as HTMLInputElement).value;
-    // urlInput is not a reactive property, so re-render explicitly to keep the
-    // Load button's disabled state in sync as the field is typed into.
-    this.requestUpdate();
   }
 
-  private onKeydown(event: KeyboardEvent) {
-    if (event.key === 'Enter') this.dispatchLoad();
+  // The field commits on Enter or blur, which is when a typed URL loads. There
+  // is no Load button, auto-loading on selection and on commit replaces it.
+  private onUrlCommit() {
+    this.dispatchLoad();
   }
 
   private dispatchLoad() {
