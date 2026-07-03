@@ -26,3 +26,19 @@ export const FILE_PRESETS: FilePreset[] = [
 
 // The preset loaded automatically when the viewer opens.
 export const DEFAULT_PRESET = FILE_PRESETS[0];
+
+// The viewer opens on the `url` query parameter when it is present and looks
+// like an http or https address, so a link can point straight at any hosted
+// GeoParquet file. Anything else falls back to the default preset. The search
+// string is a parameter so this stays pure and testable. loadUrl mirrors the
+// loaded file back into this parameter, so a refresh reopens the same file.
+export function initialUrl(
+  search = typeof window === 'undefined' ? '' : window.location.search,
+): string {
+  const param = new URLSearchParams(search).get('url');
+  if (param) {
+    const trimmed = param.trim();
+    if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  }
+  return DEFAULT_PRESET.url;
+}

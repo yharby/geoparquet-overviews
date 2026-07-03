@@ -61,6 +61,13 @@ Any GeoParquet URL can be pasted into the URL box. The server must support
 HTTP range requests (respond 206 to `Range` headers) and allow CORS from the
 viewer's origin.
 
+The viewer also opens directly on a `url` query parameter, so a link can deep
+link straight into a hosted file, for example
+`?url=https://host/path/file.parquet`. The parameter must be an http or https
+address, anything else falls back to the default preset. The address bar
+mirrors the loaded file, so it is always a shareable link and a refresh
+reopens the same file.
+
 ## CRS support
 
 Projected files reproject to lon and lat in the browser via proj4. The known

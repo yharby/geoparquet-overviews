@@ -1,5 +1,5 @@
 import { LitElement, html } from 'lit';
-import { DEFAULT_PRESET, FILE_PRESETS } from '../data/presets';
+import { FILE_PRESETS, initialUrl } from '../data/presets';
 
 export interface FileLoadRequest {
   url: string;
@@ -17,9 +17,10 @@ export class LoadControl extends LitElement {
   // class-field-shadowing error at runtime under this project's tsconfig
   // (target ES2022, useDefineForClassFields true) and aborts every render.
   declare busy: boolean;
-  // Seeded with the default preset so the URL box and the auto-load on open
-  // agree, and the Load button is enabled from the first render.
-  private urlInput = DEFAULT_PRESET.url;
+  // Seeded with the file the viewer auto-loads on open, the `url` query
+  // parameter when present, else the default preset, so the URL box and the
+  // auto-load agree and the Load button is enabled from the first render.
+  private urlInput = initialUrl();
 
   constructor() {
     super();

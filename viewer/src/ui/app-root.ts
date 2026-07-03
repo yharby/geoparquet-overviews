@@ -24,7 +24,7 @@ import { pageRangesForRowGroup, mergePageRanges } from '../data/pageindex';
 import { getPageRangeMemo, getFlatCache, isFilePrefetched } from '../data/file-cache';
 import { detectLayout, type LayoutStrategy } from '../data/layout';
 import { viewFetchKey } from './fetch-key';
-import { DEFAULT_PRESET } from '../data/presets';
+import { initialUrl } from '../data/presets';
 import { MapView } from '../map/map-view';
 import { buildLayers } from '../map/polygon-layer';
 import { vertexCount, mergeFlatGeometries, type FlatGeometries } from '../geo/geojson';
@@ -199,9 +199,10 @@ export class AppRoot extends LitElement {
 
   firstUpdated() {
     this.ensureMap();
-    // Open on the default preset so the read path is traced immediately, with no
-    // manual load step. The user can still switch files with the control.
-    if (this.mapView) void this.loadUrl(DEFAULT_PRESET.url);
+    // Open on the `url` query parameter when present, else the default preset,
+    // so the read path is traced immediately with no manual load step. The user
+    // can still switch files with the control.
+    if (this.mapView) void this.loadUrl(initialUrl());
   }
 
   updated() {
@@ -364,6 +365,16 @@ export class AppRoot extends LitElement {
     (this.querySelector('load-stats') as LoadStats | null)?.reset();
   }
 
+  // Mirror the loaded file into the `url` query parameter so a refresh reopens
+  // it and the address bar is a shareable deep link. replaceState keeps this
+  // out of the back-button history, a file switch is not a navigation.
+  private reflectUrlParam(url: string) {
+    if (typeof window === 'undefined' || !window.history) return;
+    const next = new URL(window.location.href);
+    next.searchParams.set('url', url);
+    window.history.replaceState(null, '', next);
+  }
+
   private onFileLoad(event: CustomEvent<FileLoadRequest>) {
     void this.loadUrl(event.detail.url);
   }
@@ -382,6 +393,7 @@ export class AppRoot extends LitElement {
     // then count as the first bytes of this file's session.
     (this.querySelector('load-stats') as LoadStats | null)?.resetSession();
     this.currentUrl = url;
+    this.reflectUrlParam(url);
     this.aoiBbox = null;
     this.fetchedIndices = new Set();
     this.pendingWorking = new Set();
