@@ -83,6 +83,11 @@ pnpm dev                                            # vite, port 5173+
   for lines, an attribute column or grid thinning for points, and writes the
   resulting `overview_method` into the footer. The viewer renders points,
   lines, collections, and polygon holes.
+- Viewer supports click-to-inspect. Each rendered primitive carries a
+  per-primitive `rowIds` provenance array back to its absolute parquet row,
+  so a click resolves the feature, reads only that row's non-geometry columns
+  on demand, and shows them in a MapLibre popup. The geometry decode path
+  stays zero-copy, the attribute read is the single on-demand row fetch.
 - Viewer decode path is zero-copy oriented. hyparquet reads columnar (onChunk,
   identity geometry parser, no row objects), a DataView WKB scanner in
   `geo/wkb-flatten.ts` fills flat typed-array buckets directly (no GeoJSON

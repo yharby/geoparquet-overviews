@@ -39,6 +39,10 @@ the current view needs.
   can never break a fetch.
 - A byte meter and a waterfall panel show the live read cost of every
   settle, so the overview payoff is visible as you pan and zoom.
+- Clicking a rendered feature resolves it to its source parquet row, reads
+  only that row's non-geometry attribute columns on demand, and shows them in
+  a popup. The geometry decode path stays zero-copy, the attribute read is the
+  single on-demand fetch for the clicked row.
 
 Files without an `overviews` footer still work. They render through a plain
 flat-WKB path, pruned by the covering bbox when one exists.

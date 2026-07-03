@@ -48,7 +48,16 @@ Node >= 24, pnpm 11.9.0.
   and `file-cache.ts` cache bytes and file handles one level down.
 - `src/map/polygon-layer.ts` and `map-view.ts` build deck.gl layers.
   Batches paint progressively, then each settled view consolidates to
-  single-digit layer counts.
+  single-digit layer counts. The fill, line, and point layers are pickable
+  (outlines are not), so a click resolves to a primitive ordinal.
+- `src/data/feature-detail.ts` reads one clicked feature's non-geometry
+  attribute columns on demand (`parquetReadObjects` over a single-row range),
+  and `src/ui/feature-popup.ts` renders them into a MapLibre popup. The
+  clicked primitive maps to its parquet row via the per-primitive `rowIds`
+  provenance arrays carried on every flat bucket (see `src/geo/geojson.ts`),
+  keyed by the absolute row the reader records in `src/data/rowgroups.ts`.
+  `attributeColumns` in `metadata.ts` picks the columns to read. The reads are
+  serialized and each races a timeout, see the hard constraint below.
 - `src/viz/` holds the side panels (waterfall, layout map, pruning map,
   stats, row-group detail).
 
@@ -69,7 +78,10 @@ Node >= 24, pnpm 11.9.0.
 - The decode path is zero-copy oriented. No per-feature GeoJSON objects, no
   per-row `{column: value}` wrappers, no `[x, y]` pair allocations on the
   hot path. Coordinates should materialize about twice (page bytes, flat
-  buffer) before deck.gl's fp64 split.
+  buffer) before deck.gl's fp64 split. The `rowIds` provenance array is one
+  Uint32 per primitive, not per vertex, so it does not change this. The
+  attribute read for the click popup is the one place row objects are built,
+  and only for a single clicked row, on demand, off the hot path.
 - Page-index offsets (`column_index_offset`, `offset_index_offset` and their
   lengths) live on the outer hyparquet `ColumnChunk`, not on
   `chunk.meta_data`. Reading them from meta_data made the index probe
@@ -80,6 +92,25 @@ Node >= 24, pnpm 11.9.0.
 - Interleaved deck.gl rendering in `map-view.ts` is deliberate, it fixed
   polygons drifting out of sync with the MapLibre v5 basemap. Do not switch
   to overlaid mode.
+- The hover cursor comes from deck.gl's `getCursor` prop on the overlay, not
+  from writing `canvas.style.cursor` in an `onHover`. MapLibre rewrites the
+  canvas cursor on every mouse move, so a manual write fights it and the cursor
+  flickers over a pickable feature. Let deck own the cursor (one writer).
+- The click popup must be a fresh `maplibregl.Popup` per click, not one reused
+  instance. Calling `addTo` on an already-open popup fires an internal close
+  (which nulls the reference) and can orphan a node, so a later `setHTML` for
+  the resolved attributes lands on a detached popup and the body stays stuck on
+  "loading". `openFeaturePopup` closes the previous popup first, then builds a
+  new one; the pick token still guarantees only the latest click writes into it.
+- Attribute reads in `feature-detail.ts` are serialized through one promise
+  chain and each races a timeout. A single-row read spans every attribute
+  column, so hyparquet fires a burst of range requests per read; two bursts
+  overlapping (a quick second click) exhaust the browser connection pool and
+  can leave a request stalled, which never settles and wedges the shared byte
+  cache for every later read. Serializing keeps it to one burst at a time, a
+  superseded queued read skips its fetch, and the timeout makes a stalled read
+  reject rather than block the chain or spin the popup forever. Do not fire
+  these reads concurrently.
 - deck.gl shallow-compares layer `data` by reference. Keep stable
   `{length, attributes}` wrappers, a fresh wrapper per render forces a full
   GPU re-upload.
