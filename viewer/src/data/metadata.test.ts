@@ -8,6 +8,7 @@ import {
   columnChunkBytes,
   parseOverviews,
   hasRenderableGeometry,
+  attributeColumns,
   type OverviewsInfo,
   type RowGroupInfo,
   type GeoParquetMetadata,
@@ -280,6 +281,52 @@ describe('computeFileFacts', () => {
       expect(columnChunkBytes(meta, 0, 'bbox')).toBeNull(); // struct path, not a leaf
       expect(columnChunkBytes(meta, 9, 'geometry')).toBeNull(); // out-of-range group
     });
+  });
+});
+
+describe('attributeColumns', () => {
+  const col = (path: string[]) => ({ meta_data: { path_in_schema: path } });
+
+  it('keeps scalar and struct attributes, drops geometry, overview, and the bbox struct', () => {
+    // A struct attribute (`names`) contributes several multi-part leaves; it must
+    // survive, collapsed to its one top-level root, so hyparquet reads it whole.
+    const meta = {
+      geo: { primary_column: 'geometry', columns: { geometry: {} } },
+      coveringPaths: { xmin: ['bbox', 'xmin'], ymin: ['bbox', 'ymin'], xmax: ['bbox', 'xmax'], ymax: ['bbox', 'ymax'] },
+      overviewsInfo: { overviewColumn: 'geom_overview' },
+      rawRowGroups: [
+        {
+          columns: [
+            col(['geometry']),
+            col(['geom_overview']),
+            col(['bbox', 'xmin']),
+            col(['bbox', 'ymin']),
+            col(['bbox', 'xmax']),
+            col(['bbox', 'ymax']),
+            col(['band']),
+            col(['id']),
+            col(['names', 'primary']),
+            col(['names', 'common']),
+          ],
+        },
+      ],
+    } as unknown as GeoParquetMetadata;
+    expect(attributeColumns(meta)).toEqual(['band', 'id', 'names']);
+  });
+
+  it('drops a column literally named geometry even when the geo block is absent', () => {
+    const meta = {
+      geo: null,
+      coveringPaths: null,
+      overviewsInfo: null,
+      rawRowGroups: [{ columns: [col(['geometry']), col(['id']), col(['name'])] }],
+    } as unknown as GeoParquetMetadata;
+    expect(attributeColumns(meta)).toEqual(['id', 'name']);
+  });
+
+  it('returns an empty list when there are no row groups', () => {
+    const meta = { geo: null, coveringPaths: null, overviewsInfo: null, rawRowGroups: [] } as unknown as GeoParquetMetadata;
+    expect(attributeColumns(meta)).toEqual([]);
   });
 });
 

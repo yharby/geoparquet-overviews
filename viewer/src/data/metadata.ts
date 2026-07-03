@@ -401,6 +401,47 @@ export function schemaLookup(schema: SchemaElement[]): Map<string, SchemaElement
   return map;
 }
 
+// The top-level non-geometry columns, i.e. the feature attributes to show in the
+// click popup. Excluded are every geometry column named in the `geo` block, the
+// primary geometry column (so a non-conformant file with no `geo` block but a
+// column literally named `geometry` still drops it), the overview column, and the
+// `bbox` covering struct (dropped by its root name, not by being nested, so real
+// struct attributes survive). Every remaining top-level column is emitted once by
+// its root name, so both a scalar column and a struct attribute column (whose
+// leaves carry multi-part paths, e.g. an Overture `names.primary`) come through,
+// the struct read whole by hyparquet. The importance `band` ordinal is kept.
+// Reads the first row group's column list, which every row group shares. Order
+// follows the file's schema.
+export function attributeColumns(meta: GeoParquetMetadata): string[] {
+  const excluded = new Set<string>();
+  const geo = meta.geo && typeof meta.geo === 'object' ? meta.geo : null;
+  const geoColumns = geo && typeof geo.columns === 'object' ? (geo.columns as Record<string, unknown>) : null;
+  if (geoColumns) {
+    for (const name of Object.keys(geoColumns)) excluded.add(name);
+  }
+  excluded.add(geo && typeof geo.primary_column === 'string' ? geo.primary_column : 'geometry');
+  const overviewCol = meta.overviewsInfo?.overviewColumn;
+  if (overviewCol) excluded.add(overviewCol);
+  // The covering struct's root (e.g. `bbox`), so its members drop by name rather
+  // than by being nested, which would also drop legitimate struct attributes.
+  const coveringRoot = meta.coveringPaths?.xmin?.[0];
+  if (coveringRoot) excluded.add(coveringRoot);
+
+  const first = meta.rawRowGroups[0];
+  if (!first) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const column of first.columns as ColumnChunk[]) {
+    const path = column.meta_data?.path_in_schema ?? [];
+    if (path.length === 0) continue;
+    const root = path[0]; // a struct's leaves collapse to one top-level entry
+    if (excluded.has(root) || seen.has(root)) continue;
+    seen.add(root);
+    out.push(root);
+  }
+  return out;
+}
+
 export async function loadMetadataFromUrl(url: string): Promise<GeoParquetMetadata> {
   const { metadata: rawMeta } = await getCachedFile(url);
   const meta = readGeoParquetMetadata(rawMeta);
