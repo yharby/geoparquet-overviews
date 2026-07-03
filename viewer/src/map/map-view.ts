@@ -26,6 +26,11 @@ export class MapView {
       style: BASEMAP_STYLE,
       center: [13, 2],
       zoom: 6,
+      // Force the attribution into compact mode so it collapses to MapLibre's
+      // native info icon that expands the basemap license on click, instead of a
+      // full-width text bar. The app does not load maplibre-gl.css, so the icon
+      // and the control layout are reproduced in app.css, scoped to the map.
+      attributionControl: { compact: true },
     });
     // Interleaved rendering draws the deck.gl layers inside MapLibre's own
     // WebGL context and camera, so there is no second viewport that can drift

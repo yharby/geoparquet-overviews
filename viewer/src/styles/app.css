@@ -1025,3 +1025,77 @@ button.action:disabled {
   word-break: break-word;
   max-width: 220px;
 }
+
+/* MapLibre's native attribution control on the main basemap. The app does not
+   load maplibre-gl.css, so the control's placement (bottom right, floated) and
+   its native info icon are reproduced here, scoped to the main map so the mini
+   maps are untouched. The basemap license must stay visible, so this styles the
+   control rather than hiding it. Compact mode is forced in map-view.ts, so the
+   collapsed state shows the native info toggle and a click expands the license
+   text. The translucent-white pill and black icon match MapLibre's own look so
+   the control reads as the standard, recognizable map attribution. */
+.map-container .maplibregl-ctrl-bottom-right {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+.map-container .maplibregl-ctrl-attrib {
+  float: right;
+  clear: both;
+  position: relative;
+  margin: 0 8px 8px 0;
+  border-radius: 12px;
+  background: hsla(0, 0%, 100%, 0.5);
+  color: rgba(0, 0, 0, 0.75);
+  font-family: var(--body);
+  font-size: 11px;
+  line-height: 1.4;
+  pointer-events: auto;
+  box-sizing: content-box;
+}
+.map-container .maplibregl-ctrl-attrib a {
+  color: rgba(0, 0, 0, 0.75);
+  text-decoration: none;
+}
+.map-container .maplibregl-ctrl-attrib a:hover {
+  color: rgba(0, 0, 0, 0.9);
+  text-decoration: underline;
+}
+/* Collapsed compact state, just the info button with the license text hidden. */
+.map-container .maplibregl-ctrl-attrib.maplibregl-compact {
+  min-height: 20px;
+  padding: 2px 24px 2px 0;
+}
+.map-container .maplibregl-ctrl-attrib-inner {
+  display: none;
+}
+/* Expanded state, toggled by MapLibre when the info icon is clicked. */
+.map-container .maplibregl-ctrl-attrib.maplibregl-compact-show {
+  padding: 2px 8px 2px 28px;
+}
+.map-container .maplibregl-ctrl-attrib.maplibregl-compact-show .maplibregl-ctrl-attrib-inner {
+  display: block;
+}
+/* The native info icon, MapLibre's own SVG on a translucent circle. */
+.map-container .maplibregl-ctrl-attrib-button {
+  display: none;
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 12px;
+  box-sizing: border-box;
+  cursor: pointer;
+  background-color: hsla(0, 0%, 100%, 0.5);
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' fill-rule='evenodd' viewBox='0 0 20 20'%3E%3Cpath d='M4 10a6 6 0 1 0 12 0 6 6 0 1 0-12 0m5-3a1 1 0 1 0 2 0 1 1 0 1 0-2 0m0 3a1 1 0 1 1 2 0v3a1 1 0 1 1-2 0'/%3E%3C/svg%3E");
+}
+.map-container .maplibregl-ctrl-attrib.maplibregl-compact .maplibregl-ctrl-attrib-button {
+  display: block;
+}
+.map-container .maplibregl-ctrl-attrib.maplibregl-compact-show .maplibregl-ctrl-attrib-button {
+  background-color: rgba(0, 0, 0, 0.05);
+}
