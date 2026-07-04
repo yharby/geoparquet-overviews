@@ -483,6 +483,13 @@ export class AppRoot extends LitElement {
     // newer one (its finally would otherwise null the active URL mid-load).
     this.fetchToken++;
     const loadToken = ++this.loadToken;
+    // Cancel any debounced view fetch still pending from the previous file, so
+    // it cannot fire against this new file at the old camera before the opening
+    // camera below moves it.
+    if (this.fetchTimer !== null) {
+      clearTimeout(this.fetchTimer);
+      this.fetchTimer = null;
+    }
     this.resetViz();
     // A new file, so clear the cumulative session totals too, not just the
     // per-view ones resetViz clears. The footer and metadata reads that follow
@@ -563,9 +570,24 @@ export class AppRoot extends LitElement {
           // Consumed once so a later file switch fits to its own extent.
           this.mapView.jumpTo(this.pendingInitialView);
           this.pendingInitialView = null;
+          // jumpTo is instant, so the camera is already at the target. Seed the
+          // viewport readouts from it and hold the spinner on until the debounced
+          // fetch starts, so the panels and spinner do not lag the metadata.
+          this.viewBbox = this.mapView.getBounds();
+          this.currentZoom = this.mapView.getZoom();
+          this.loading = true;
         } else if (extent) {
-          // Flying to the extent settles into a moveend, which auto-fetches the
-          // opening overview for the whole file, no manual step.
+          // flyToBbox animates for 600ms and only emits moveend at the end, so
+          // busy clears here while the fly is still running and the first fetch
+          // has not started. Seed the viewport readouts to the fly target and
+          // hold the spinner on across that gap, so the side panels do not draw
+          // the pre-fly camera and the spinner does not blink off between the
+          // metadata read and the opening fetch. The moveend fetch overwrites
+          // these with the exact settled camera.
+          this.viewBbox = extent;
+          const targetZoom = this.mapView.zoomForBbox(extent);
+          if (targetZoom != null) this.currentZoom = targetZoom;
+          this.loading = true;
           this.mapView.flyToBbox(extent);
         }
         if (!proj.geographic) crsNote = ` Reprojected from ${proj.label} to lon/lat.`;
@@ -707,9 +729,11 @@ export class AppRoot extends LitElement {
     if (pagePruned > 0) {
       this.status = `Fetching ${total} of ${metadata.rowGroups.length} row groups, ${readingLabel}, ${pagePruned} page pruned…${pruneNote}`;
     }
-    // The band all groups in this view belong to (they share one level's
-    // prefix), for the read-cost panel's efficiency readout.
-    const viewBand = metadata.rowGroups[readIndices[0]]?.band ?? null;
+    // The overview level this view reads, for the read-cost panel's efficiency
+    // readout. Taken from the plan's selected level, not the first read group,
+    // so the finest (exact) level reports its own level rather than 0, even
+    // though it owns the whole prefix and reads groups that span several levels.
+    const viewBand = plan.band;
 
     const tStart = performance.now();
     let features = 0;

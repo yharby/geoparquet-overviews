@@ -21,6 +21,12 @@ export interface ReadPlan {
   // ordinal for the overviews path, since several coarse levels can share one
   // overview column, and a fixed token for the flat path.
   lodKey: string;
+  // The overview level this plan reads, for the read-cost panel's efficiency
+  // readout. Null for the flat path, which has no pyramid. Taken from the level
+  // the zoom selects, not a row group, so the finest (exact) level reports its
+  // own level even though it owns the whole prefix and therefore reads row
+  // groups that span several levels.
+  band: number | null;
   // `rows` is the parallel absolute-parquet-row of each raw value, carried
   // through so a picked geometry resolves to its source row for the click popup.
   decode: (rawValues: unknown[], rows?: ArrayLike<number>) => FlatGeometries;
@@ -75,6 +81,7 @@ function flatStrategy(metadata: GeoParquetMetadata): LayoutStrategy {
         : metadata.rowGroups.map((rg) => rg.index),
       column: 'geometry',
       lodKey: 'flat',
+      band: null,
       decode: (geometries, rows) => decodeGeometries(geometries, transform, rows),
     }),
   };
@@ -95,6 +102,7 @@ function overviewsStrategy(metadata: GeoParquetMetadata): LayoutStrategy {
         indices: rowGroupsForLevel(metadata.rowGroups, level, aoi),
         column,
         lodKey: `L${level.level}:${column}`,
+        band: level.level,
         decode: (geometries, rows) => decodeGeometries(geometries, transform, rows),
       };
     },
