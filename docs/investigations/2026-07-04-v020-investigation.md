@@ -1,6 +1,6 @@
 # v0.2.0 investigation report
 
-Date 2026-07-04. Status complete except one pending section, marked below.
+Date 2026-07-04. Status complete.
 Scope of the investigation, three questions raised for a possible 0.2.0 of the
 overviews convention, plus one external event that arrived mid-investigation
 and reshapes the conclusions.
@@ -34,7 +34,7 @@ GeoParquet 2.0 native statistics support is reflected in section 4.
 | VARIANT column as the container | No. Wrong tool, no pyarrow write support, zero benefit over plain binary. |
 | PBF or TWKB encoded overview geometry in the file | Not recommended for 0.2.0. Real but small size win after zstd, slower browser decode than the current zero copy WKB path, custom decoder burden, and it conflicts with the alignment opportunity. |
 | Per tile MVT blobs inside the file | Not recommended. Proven elsewhere (CARTO, RaQuet) but reintroduces the duplicated, clipped, per zoom geometry the convention exists to avoid. Better served by deriving PMTiles from the file. |
-| Dropping the `bbox` covering column under GeoParquet 2.0 | Live option, make it a profile choice. Native statistics replace row group pruning only. Nothing replaces page level pruning, so the covering column stays recommended for range request readers. See section 4 for support matrix status. |
+| Dropping the `bbox` covering column under GeoParquet 2.0 | Yes, as an opt in profile. Native statistics replace row group pruning only, confirmed no page level equivalent exists in the format. The covering column stays the default for range request readers. Writer and reader support for native types plus statistics is already in place in pyarrow 21+ and hyparquet 1.19+, verified. |
 | gpq-tiles | Far more than a helper library. It is a sibling implementation of the same convention, and the author proposes merging drafts. Strongly recommend alignment. |
 
 ---
@@ -160,40 +160,85 @@ Sources.
 
 ## 4. The bbox covering column under GeoParquet 2.0
 
-The intent for 0.2.0 is to target GeoParquet 2.0 (not yet released, draft OGC
-24-013) and offer a file profile without the physical `bbox` struct column.
+The intent for 0.2.0 is to target GeoParquet 2.0 and offer a file profile
+without the physical `bbox` struct column.
 
-What is already established.
+### 4.1 Format level facts, verified against parquet.thrift
 
-- Parquet native GEOMETRY and GEOGRAPHY logical types landed in parquet-format
-  2.11.0 and carry WKB plus per row group geospatial statistics.
-- Native geospatial statistics are row group granularity only. There is no
-  page level geospatial statistic in the format. This is the reason SPEC.md
-  currently requires keeping the covering column even under 2.0, because the
-  viewer's sub row group pruning reads the covering column's ColumnIndex and
-  OffsetIndex, a mechanism native statistics cannot replace.
-- The measured value of page pruning is about 5.8x fewer bytes on large row
-  groups and about 1.5 to 2x on default 16 MB groups.
-- The byte cost of the covering column is four float64 per row, roughly 180 MB
-  raw on the 5.65M row validation file before compression and byte stream
-  split.
+- `GeospatialStatistics` is field 17 of `ColumnMetaData`, so it lives per
+  column chunk per row group in the footer. It carries an optional
+  `BoundingBox` (xmin, xmax, ymin, ymax, optional z and m) and an optional
+  list of ISO WKB geometry type codes present in the chunk. Added in
+  parquet-format 2.11.0 (March 2025).
+- Page level geospatial statistics do not exist, confirmed by reading the
+  full `ColumnIndex` struct. Its fields are null pages, generic min and max,
+  boundary order, null counts, level histograms, nan counts. Generic binary
+  min and max on a WKB column are byte lexicographic and spatially
+  meaningless, and GEOMETRY and GEOGRAPHY have undefined sort order.
+- Consequence, native statistics give row group granularity only. The
+  viewer's sub row group page pruning through the covering column's
+  ColumnIndex and OffsetIndex has no native replacement. The measured value
+  of that pruning is about 5.8x fewer bytes on large row groups and about
+  1.5 to 2x on default 16 MB groups. The covering column costs four float64
+  per row, roughly 180 MB raw on the 5.65M row validation file before
+  compression and byte stream split.
 
-Recommended shape, pending the support matrix below. Make the covering column
-a writer profile choice rather than a MUST.
+### 4.2 Support matrix, July 2026
 
-- Profile A, maximum pruning. Covering column present, page index written.
-  Readers get row group pruning from either source and page pruning from the
-  ColumnIndex. This stays the default.
-- Profile B, lean 2.0. No covering column. Native statistics provide row group
-  pruning. Page pruning is unavailable and the spec says so plainly. The
-  viewer falls back to whole group reads, which it already does whenever the
-  page path fails, so no viewer redesign is needed.
+| Implementation | Native GEOMETRY | GeospatialStatistics |
+|---|---|---|
+| pyarrow / Arrow C++ | Write and read since Arrow 21.0.0 (July 2025), via the registered `geoarrow.wkb` extension type and plain `pq.write_table` | Computed and written automatically per row group chunk, exposed on read via `ColumnChunkMetaData.geo_statistics`. Verified empirically on pyarrow 24.0.0 |
+| hyparquet | Since 1.19.0, native GEOMETRY decodes with an overridable parser, so the viewer's identity parser zero copy path survives | Exposed to the caller as `geospatial_statistics` on the column chunk metadata. Verified in this repo's installed hyparquet 1.26.2 source |
+| DuckDB | Read since 1.4.0, core GEOMETRY type in 1.5.0 with row group bbox and type statistics and pushdown into the `&&` operator | Whether DuckDB 1.5 feeds Parquet file GeospatialStatistics into pruning is plausible but not officially confirmed, flagged uncertain. Late 2025 benchmarks found no engine pruning on native Parquet geo stats yet |
 
-PENDING. A research agent is completing the precise support matrix, whether
-pyarrow can write native GEOMETRY with statistics today and at which Arrow
-version, whether hyparquet exposes geospatial statistics to the caller,
-whether DuckDB uses them for pushdown, and what the 2.0 draft currently says
-about covering columns. This section will be updated when it reports.
+Two verified enablers matter for the converter.
+
+- Dual writing works today. In the empirical test a file carried the native
+  GEOMETRY logical type with automatic statistics and a `geo` file level key
+  side by side. One file can be GeoParquet 1.1 with covering for old readers
+  and natively typed with statistics for new ones.
+- No special writer options are needed, register the extension type, build
+  the table, write.
+
+### 4.3 GeoParquet 2.0 status
+
+The spec on the main branch declares version 2.0.0. The community has agreed
+on the release but OGC approval (24-013 track) is still pending, and the last
+git tag remains 1.1.0. In 2.0 geometry columns MUST be native GEOMETRY or
+GEOGRAPHY logical types, the `geo` key itself becomes optional, and the
+`covering` bbox construct is removed from the spec entirely (zero occurrences
+in the 2.0.0 text). The stated rationale is that native statistics replace
+it. Nothing forbids carrying an extra physical bbox column, and a 1.1 style
+`geo` key with `covering` can ride along in the same file.
+
+### 4.4 Recommendation, two writer profiles
+
+Make the covering column a writer profile choice rather than a MUST.
+
+- Profile A, maximum pruning, stays the default. Covering column present,
+  page index written, plus native GEOMETRY types and statistics. Readers get
+  row group pruning from either source and page pruning from the
+  ColumnIndex. Dual 1.1 and 2.0 metadata.
+- Profile B, lean 2.0. No covering column, native statistics provide row
+  group pruning, and the spec says plainly that page pruning is unavailable.
+  The viewer falls back to whole group reads, which it already does whenever
+  the page path fails, so no viewer redesign is needed.
+
+Caveats recorded for the spec text. Engine support for pruning on native
+statistics is still uneven through 2026, and GeoParquet 1.0 and 1.1 only
+readers ignore native types entirely, so Profile B should stay opt in until
+the ecosystem catches up. The transition era practice is dual writing, which
+Profile A already embodies.
+
+Sources.
+- https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift
+- https://github.com/apache/parquet-format/blob/master/Geospatial.md
+- https://arrow.apache.org/blog/2025/07/17/21.0.0-release/
+- https://parquet.apache.org/docs/file-format/implementationstatus/
+- https://github.com/opengeospatial/geoparquet/blob/main/format-specs/geoparquet.md
+- https://duckdb.org/2026/03/09/announcing-duckdb-150
+- https://cloudnativegeo.org/blog/2025/10/geoparquet-parquet-geospatial-types-a-time-of-transition/
+- https://dewey.dunnington.ca/post/2025/lazy-geoparquet-reading-in-sedonadb-duckdb-geopandas-and-gdal/
 
 ---
 
@@ -282,8 +327,10 @@ the table.
    optional column on partitioning mode.
 3. Adopt GeoParquet 2.0 readiness as the second 0.2.0 work item. Covering
    column becomes a profile choice, present by default for page pruning,
-   omittable in a lean profile once the writer stack supports native
-   statistics end to end (section 4 pending).
+   omittable in a lean opt in profile. The writer and reader stack is ready
+   today, pyarrow 21+ writes native GEOMETRY with automatic statistics
+   alongside the `geo` key, and hyparquet 1.19+ reads both the type and the
+   statistics (section 4).
 4. Serve the ecosystem compatibility goal through derivation, not in file
    tiles. gpq-tiles already exports PMTiles from overview bands. The two
    projects together cover canonical file, fast converter, tile export, and
@@ -314,7 +361,6 @@ the table.
 
 ## 8. Open items
 
-- Section 4 support matrix, pending the running research agent.
 - Field by field mapping table of the two footer schemas, worth attaching to
   the reply to Nissim.
 - Whether the merged draft keeps this repo's `band` column name or his
