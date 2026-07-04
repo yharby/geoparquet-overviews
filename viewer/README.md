@@ -18,7 +18,11 @@ pnpm typecheck    # tsc --noEmit
 pnpm test         # vitest run
 pnpm build        # typecheck then vite build
 pnpm preview      # serve the production build
+pnpm bench        # network benchmark, outside the normal test run
 ```
+
+`pnpm bench` runs a separate suite that hits real hosted files over the
+network, so it is deliberately kept out of `pnpm test`.
 
 ## What it does
 
@@ -30,11 +34,16 @@ the current view needs.
   `geom_overview` column from the coarse row-group prefix, high zooms read
   the exact `geometry` column.
 - It prunes row groups by bbox, so only groups intersecting the viewport are
-  fetched.
+  fetched. The bbox comes from the physical `bbox` covering column when the
+  file carries one. For files written without it (Profile B, converter
+  `--no-bbox`) it falls back to the native Parquet geospatial statistics on
+  the geometry chunks and prunes row groups from those instead.
 - When a chosen row group covers far more area than the view and the file
   carries the Parquet page indexes, it reads the `bbox` covering column's
   ColumnIndex and OffsetIndex and fetches only the overlapping pages, a
-  read below row-group granularity.
+  read below row-group granularity. This page-level path still needs the
+  physical covering column, so a Profile B file prunes only at row-group
+  granularity.
 - Any failure on the page path falls back to a whole-group read, so pruning
   can never break a fetch.
 - A byte meter and a waterfall panel show the live read cost of every
@@ -60,6 +69,14 @@ thing.
 | Overture buildings (Tokyo, 6.5M polygons) | Overview payoff on polygons at scale |
 | Overture roads (Tokyo, 1.4M lines) | Overview payoff on lines |
 | Overture POIs (Tokyo, 266K points) | Overview payoff on points |
+
+A data version selector sits alongside the preset dropdown, fed by a hosted
+`versions.json` manifest that lists each published converter data version and
+its datasets. Picking a version swaps the preset list to that version's
+datasets and, when the same dataset exists in both, reloads the counterpart so
+you can compare byte cost across versions. The manifest is fetched on load,
+and when it cannot be reached the version selector is hidden and the viewer
+falls back to the built-in presets above.
 
 Any GeoParquet URL can be pasted into the URL box. The server must support
 HTTP range requests (respond 206 to `Range` headers) and allow CORS from the

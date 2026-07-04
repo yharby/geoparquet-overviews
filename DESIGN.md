@@ -68,7 +68,7 @@ live in [SPEC.md](SPEC.md).
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "spatial_key": "hilbert",
   "importance": "area_desc",
   "covering": {
@@ -82,9 +82,12 @@ live in [SPEC.md](SPEC.md).
   "overview_column": "geom_overview",
   "overview_method": "simplify_snap",
   "levels": [
-    { "level": 0, "row_group_end": 0,  "max_zoom": 8,  "gsd": 0.005 },
-    { "level": 1, "row_group_end": 6,  "max_zoom": 10, "gsd": 0.00125 },
-    { "level": 2, "row_group_end": 22, "max_zoom": 24, "gsd": 0.0 }
+    { "level": 0, "row_group_end": 0,  "max_zoom": 8,  "gsd": 0.005,
+      "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [4096, 428112] },
+    { "level": 1, "row_group_end": 6,  "max_zoom": 10, "gsd": 0.00125,
+      "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [428112, 9532048] },
+    { "level": 2, "row_group_end": 22, "max_zoom": 24, "gsd": 0.0,
+      "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [9532048, 62004224] }
   ]
 }
 ```
@@ -107,6 +110,8 @@ Each `levels` entry.
 | `row_group_end` | Index of the last row group in this band, inclusive. The band owns the prefix from row group 0. Strictly increasing across levels. |
 | `max_zoom` | Highest web zoom this band should paint, an advisory hint on the 256px WebMercator model. Strictly increasing. |
 | `gsd` | Ground sample distance the band was simplified to, in CRS units per pixel. The final band is exact and has `gsd` 0. `gsd` is the authoritative resolution signal. |
+| `extent` | Padded bounding box of the band's own features, `[xmin, ymin, xmax, ymax]` in CRS units, or null when the band has no valid geometry. Encloses both the exact and the overview geometry of the band. Optional. |
+| `bytes` | File byte offsets `[start, end)` spanning this band's own row groups. Contiguous across bands, so a reader can price a prefix read up to any band. Optional. |
 
 ## Layout rules
 

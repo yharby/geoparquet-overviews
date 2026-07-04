@@ -20,7 +20,14 @@ uv run pytest tests/test_convert.py::test_reconvert_is_idempotent   # one test
 uv run gpo convert in.parquet out.parquet     # convert, -v verbose, -q quiet
 uv run python examples/make_sample.py         # rebuilds viewer/public/sample.parquet
 uv run ruff check                             # lint
+uv run --with duckdb python - <<'PY'          # duckdb is NOT a project dep, pull it per run
+import duckdb; print(duckdb.sql("SELECT count(*) FROM 'out.parquet'").fetchone())
+PY
 ```
+
+DuckDB is handy for a row-count or read sanity on an output, but it is not in
+the converter's dependencies. Run it with `uv run --with duckdb` rather than
+adding it to the project.
 
 ## Architecture, convert.py as a pipeline
 
@@ -137,6 +144,17 @@ idempotent re-conversion, CRS detection and preservation, point thinning and
 attribute ranking, line and mixed layer banding, and bbox padding. Run one
 test with `uv run pytest tests/test_convert.py::<name>`. Add a test alongside
 any pipeline change, especially anything touching an invariant above.
+
+Caution on re-conversion tests. The inline tables are built fresh, so they
+carry no pre-existing `geo` covering, `overviews` block, or native geometry
+types. That means a fresh-table test can pass while re-conversion of a real
+prior converter output still misbehaves. A `--no-bbox` re-conversion of a file
+that already had a covering once shipped a dangling covering exactly this way,
+the fresh-table test never exercised the strip in `footer.geo_meta`. When you
+touch footer building, the drop list, or the profiles, add a test that first
+converts, then re-converts that output, and asserts the second file, not just
+a synthetic one. `test_reconvert_native_output_is_idempotent` is the tripwire
+for native-typed round trips, never weaken it.
 
 ## Known limitations
 

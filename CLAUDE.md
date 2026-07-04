@@ -110,6 +110,28 @@ pnpm dev                                            # vite, port 5173+
   see viewer/CLAUDE.md). Remaining open, worker decode, also tracked in
   viewer/CLAUDE.md.
 
+## Hosted test data and its layout
+
+The demo datasets the viewer loads live on source.coop, public base
+`https://data.source.coop/youssef-harby/geoparquet-overviews`. The layout is
+versioned by convention draft.
+
+- Root objects (the files directly under the base, no version prefix) are what
+  the live web app reads today. NEVER modify or delete them. Reconvert into a
+  version prefix instead.
+- Each draft gets its own prefix, `v0.1.0/` and `v0.2.0/`, holding the same
+  dataset set reconverted with that draft's converter. `v0.2.0/` also carries
+  `nls_rakennus_overviews.nobbox.parquet`, the Profile B (`--no-bbox`) twin of
+  the Finland file.
+- `versions.json` at the base root is the manifest the viewer's version
+  dropdown reads (see `viewer/src/data/manifest.ts`, `MANIFEST_URL`). It lists
+  each version and its datasets, with `latest` pointing at the newest. Publish
+  it with content type `application/json`, parquet with `binary/octet-stream`.
+- The bucket is a real AWS S3 bucket, `us-west-2.opendata.source.coop` (the
+  dots are part of the name), region `us-west-2`, no `--endpoint-url`. The
+  write credentials and the exact `aws s3 cp` recipe are maintainer-local, not
+  in this repo.
+
 ## Known limitations
 
 - Converter reads the whole table into memory, fine for tens of millions of
