@@ -39,7 +39,7 @@ flowchart TB
 ## Links
 
 - **Live viewer**, https://yharby.github.io/geoparquet-overviews/
-- Status, draft 0.1.0. License, Apache-2.0. See [LICENSE](LICENSE).
+- Status, draft 0.2.0. License, Apache-2.0. See [LICENSE](LICENSE).
 
 ## Quickstart
 

@@ -5,7 +5,7 @@
 `geoparquet-overviews` is a proposal for the GeoParquet community. It defines one
 GeoParquet file that a web map can preview instantly and a SQL engine can read in
 full, with no duplicated exact geometry. It is a draft convention plus a
-reference converter and a live viewer. Status draft 0.1.0, Apache-2.0. This is a
+reference converter and a live viewer. Status draft 0.2.0, Apache-2.0. This is a
 proposal repo, so keep everything vendor neutral, no commercial company names in
 code, docs, or the spec.
 
