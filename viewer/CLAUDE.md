@@ -63,6 +63,17 @@ Node >= 24, pnpm 11.9.0.
 - `src/geo/wkb-flatten.ts` scans WKB with a DataView straight into flat
   typed-array buckets, no GeoJSON intermediate. `src/geo/geojson.ts` keeps
   the GeoJSON flattener only as a fallback for already-decoded values.
+  `decodeFlat` is the shared probe both paths and the worker route through.
+- `src/geo/decode-worker.ts` runs that decode plus the proj4 reprojection off
+  the main thread, so a load does not freeze map pan and zoom.
+  `src/geo/decode-client.ts` is the main-thread client and
+  `src/geo/decode-protocol.ts` the pure pack/unpack helpers and message types.
+  The input WKB is copied into one fresh buffer and transferred (never the
+  reader's own views, which alias the byte cache), the worker's fresh flat
+  buffers transfer back, and the transform closure is rebuilt in the worker
+  from a serializable `{name, def}` spec (`crsTransformSpec` /
+  `buildTransformFromSpec` in `crs.ts`). With no Worker (node tests, or a
+  failed construction) `decodeBatch` falls back to `plan.decode` inline.
 - `src/geo/crs.ts` reprojects projected files to lon and lat with proj4,
   in place on the flat buffers. Known defs live in `PROJ_DEFS`, add EPSG
   codes there.
@@ -98,6 +109,11 @@ Node >= 24, pnpm 11.9.0.
   `pageRangesForRowGroup` returns null on missing indexes, page-count
   disagreement, or any read error, keep that contract, the page path may
   never break a fetch.
+- The decode worker's input WKB must be copied (packed into a fresh buffer),
+  never transferred. The reader's WKB Uint8Arrays view the byte cache's
+  immutable decompressed pages, and transferring detaches them, corrupting the
+  cache for the next view. Only the worker's own fresh flat output buffers are
+  transferred. See `packWkb` in `decode-protocol.ts`.
 - The decode path is zero-copy oriented. No per-feature GeoJSON objects, no
   per-row `{column: value}` wrappers, no `[x, y]` pair allocations on the
   hot path. Coordinates should materialize about twice (page bytes, flat
@@ -147,20 +163,28 @@ Node >= 24, pnpm 11.9.0.
 
 ## Open work
 
-Phase 3 of the performance plan remains open, worker decode. Move the
-read-decode-flatten chain into a Web Worker with transferable ArrayBuffers,
-upload on the main thread. Known design tensions, transferring detaches
-buffers which conflicts with the byte cache's aliasing contract (see the
-contract note at the top of `byte-cache.ts`), so either copy input bytes into
-the worker or move fetch plus cache ownership into the worker, and
-cancellation must cross the boundary (the current cooperative row-group-grain
-cancellation maps to per-message posting). A separate spike only if profiles
-still show polygon tessellation after that, worker-side earcut, which would
-require subclassing SolidPolygonLayer internals since deck.gl exposes no
-public prop for precomputed indices.
+Phase 3 of the performance plan, worker decode, is done (see
+`decode-worker.ts` above). The decode plus reprojection runs off the main
+thread with copy-in, transfer-out buffers; input bytes are copied (they alias
+the byte cache) and cancellation stays cooperative on the main thread by
+re-checking the fetch token after the worker reply. One worker decodes batches
+serially, which already frees the main thread; a worker pool for parallel
+decode is a possible follow-up but adds ordering and transfer complexity for a
+second-order win.
+
+Remaining main-thread synchronous work, cheaper than the proj4 decode that
+moved but still worth watching on very large settled views: the end-of-fetch
+`mergeFlatGeometries` concat, the cached-hit repaint loop (no yield between
+hits), and the deck.gl GPU upload (which must stay on the main thread). A
+separate spike only if profiles still show polygon tessellation, worker-side
+earcut, which would require subclassing SolidPolygonLayer internals since
+deck.gl exposes no public prop for precomputed indices.
 
 Verify perf work with the existing `timeWork` events (`wkb-decode`,
-`gpu-upload`) on a scripted session, plus `pnpm typecheck` and `pnpm test`.
+`gpu-upload`) on a scripted session, plus `pnpm typecheck` and `pnpm test`. A
+quick main-thread check: a `PerformanceObserver` for `longtask` during a load
+should show only small tasks now (a country-wide EPSG:3067 Finland load
+blocked the main thread ~73ms total).
 
 ## Testing
 
