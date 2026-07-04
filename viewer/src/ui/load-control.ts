@@ -1,6 +1,6 @@
 import { LitElement, html } from 'lit';
 import { FILE_PRESETS, initialUrl, type FilePreset } from '../data/presets';
-import { fetchManifest, presetsForVersion, type VersionManifest } from '../data/manifest';
+import { fetchManifest, presetsForVersion, resolveVersionTwin, type VersionManifest } from '../data/manifest';
 
 export interface FileLoadRequest {
   url: string;
@@ -67,15 +67,16 @@ export class LoadControl extends LitElement {
 
   render() {
     const presets = this.presets();
+    const manifest = this.manifest;
     return html`
       <div class="load-control">
-        ${this.manifest
+        ${manifest
           ? html`<div class="field">
               <label>Data version</label>
               <select @change=${this.onVersionChange} ?disabled=${this.busy}>
-                ${this.manifest.versions.map(
+                ${manifest.versions.map(
                   (v) => html`<option value=${v.version} ?selected=${v.version === this.version}>
-                    v${v.version}${v.version === this.manifest!.latest ? ' (latest)' : ''}
+                    v${v.version}${v.version === manifest.latest ? ' (latest)' : ''}
                   </option>`,
                 )}
               </select>
@@ -119,16 +120,17 @@ export class LoadControl extends LitElement {
   }
 
   // Switching version keeps the selected dataset when the other version has
-  // it, resolved by matching preset id, and loads the counterpart straight
-  // away.
+  // it, resolved by matching preset id (see resolveVersionTwin), and loads
+  // the counterpart straight away.
   private onVersionChange(event: Event) {
     const next = (event.target as HTMLSelectElement).value;
-    const currentId = this.presets().find((p) => p.url === this.urlInput)?.id ?? null;
+    const fromVersion = this.version;
+    const manifest = this.manifest;
     this.version = next;
-    if (currentId) {
-      const twin = this.presets().find((p) => p.id === currentId);
-      if (twin) {
-        this.urlInput = twin.url;
+    if (manifest) {
+      const twinUrl = resolveVersionTwin(manifest, fromVersion, next, this.urlInput);
+      if (twinUrl) {
+        this.urlInput = twinUrl;
         this.dispatchLoad();
       }
     }
