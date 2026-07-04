@@ -80,6 +80,11 @@ class ConvertOptions:
     # the Parquet native GEOMETRY logical type with automatic per-row-group
     # geospatial statistics. The `geo` key is still written, dual 1.1 plus 2.0.
     native_geo: bool = True
+    # Profile choice. True writes the physical bbox covering struct plus page
+    # index pruning surface (Profile A, default). False omits it (Profile B,
+    # lean 2.0), readers prune row groups from native geospatial statistics
+    # only and page-level pruning is unavailable.
+    bbox: bool = True
 
 
 def _find_geometry_column(schema: pa.Schema) -> str:
@@ -613,6 +618,8 @@ def _validate_options(opts: ConvertOptions) -> None:
             )
         if sum(fr[: opts.bands - 1]) > 1.0 + 1e-9:
             raise ValueError(f"the first {opts.bands - 1} band_fractions must sum to at most 1, got {fr}")
+    if not opts.bbox and not opts.native_geo:
+        raise ValueError("--no-bbox requires native geo types, there would be no pruning surface at all")
 
 
 def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
@@ -810,7 +817,8 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
         return gtype.wrap_array(storage) if gtype is not None else storage
 
     table = table.append_column("geometry", _geom_array(geom_wkb))
-    table = table.append_column("bbox", _bbox_struct(bounds, valid))
+    if opts.bbox:
+        table = table.append_column("bbox", _bbox_struct(bounds, valid))
     table = table.append_column("band", pa.array(band, type=pa.int16()))
     if has_overview:
         table = table.append_column("geom_overview", _geom_array(overview_wkb))
@@ -838,6 +846,7 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
             crs=crs if crs_present else footer._NO_CRS,
             source_column=source_column,
             overview_geometry_types=overview_type_names,
+            covering=opts.bbox,
         ),
     }
 
@@ -856,6 +865,7 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
             "overviews": footer.overviews_meta(
                 "hilbert", base_levels, has_overview,
                 importance=importance, overview_method=overview_method,
+                covering=opts.bbox,
             ),
         }
 
@@ -956,7 +966,9 @@ def _write(
     table = table.replace_schema_metadata(meta)
 
     names = table.column_names
-    bbox_doubles = ["bbox.xmin", "bbox.ymin", "bbox.xmax", "bbox.ymax"]
+    bbox_doubles = (
+        ["bbox.xmin", "bbox.ymin", "bbox.xmax", "bbox.ymax"] if "bbox" in names else []
+    )
     float_cols = [
         n for n in names if pa.types.is_floating(table.schema.field(n).type)
     ]

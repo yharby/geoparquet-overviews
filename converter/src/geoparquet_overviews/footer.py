@@ -35,6 +35,7 @@ def geo_meta(
     crs: object = _NO_CRS,
     source_column: dict | None = None,
     overview_geometry_types: list[str] | None = None,
+    covering: bool = True,
 ) -> str:
     """GeoParquet 1.1.0 metadata with the bbox covering.
 
@@ -53,6 +54,10 @@ def geo_meta(
     overview WKB via `overview_geometry_types`, since simplification can drop to
     a lower dimensional type. It never carries a `covering`, and any stale
     covering inherited from a re-converted source column is stripped.
+
+    `covering` is False for Profile B (`--no-bbox`), which omits the physical
+    bbox struct column entirely, so the primary geometry column carries no
+    `covering` block either, there is nothing for it to point at.
     """
 
     def column(types: list[str]) -> dict:
@@ -68,7 +73,8 @@ def geo_meta(
         return col
 
     primary = column(geometry_types)
-    primary["covering"] = COVERING
+    if covering:
+        primary["covering"] = COVERING
     columns = {"geometry": primary}
     if has_overview:
         ov = column(overview_geometry_types if overview_geometry_types is not None else geometry_types)
@@ -86,6 +92,7 @@ def overviews_meta(
     importance: str = "area_desc",
     overview_method: str = "simplify_snap",
     version: str = "0.2.0",
+    covering: bool = True,
 ) -> str:
     """The additive `overviews` footer block, draft 0.2.0.
 
@@ -104,13 +111,18 @@ def overviews_meta(
     `overview_method` states how `geom_overview` was derived, `simplify_snap`
     when an overview column is written, `thin` for a pure-point dataset where
     the banding itself is the level of detail and no overview column exists.
+
+    `covering` is False for Profile B (`--no-bbox`), which omits the physical
+    bbox struct column, so there is no covering to point at and native
+    geospatial statistics are the only row-group pruning surface.
     """
     block: dict = {
         "version": version,
         "spatial_key": spatial_key,
         "importance": importance,
-        "covering": COVERING,
     }
+    if covering:
+        block["covering"] = COVERING
     if levels is not None:
         if has_overview:
             block["overview_column"] = "geom_overview"

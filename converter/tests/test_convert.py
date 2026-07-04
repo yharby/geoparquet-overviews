@@ -797,3 +797,26 @@ def test_no_native_geo_flag(tmp_path):
     convert(str(src), str(dst), ConvertOptions(bands=2, native_geo=False))
     pf = pq.ParquetFile(dst)
     assert str(pf.schema_arrow.field("geometry").type) == "binary"
+
+
+def test_no_bbox_profile(tmp_path):
+    src = tmp_path / "src.parquet"
+    dst = tmp_path / "dst.parquet"
+    pq.write_table(_poly_table(), src)
+    convert(str(src), str(dst), ConvertOptions(bands=2, bbox=False))
+    pf = pq.ParquetFile(dst)
+    assert "bbox" not in pf.schema_arrow.names
+    import json as _json
+    geo = _json.loads(pf.metadata.metadata[b"geo"])
+    assert "covering" not in geo["columns"]["geometry"]
+    ov = _json.loads(pf.metadata.metadata[b"overviews"])
+    assert "covering" not in ov
+    # Native stats still there, they are the only pruning surface now.
+    names = [pf.metadata.row_group(0).column(i).path_in_schema for i in range(pf.metadata.num_columns)]
+    col = pf.metadata.row_group(0).column(names.index("geometry"))
+    assert col.is_geo_stats_set
+
+
+def test_no_bbox_requires_native_geo(tmp_path):
+    with pytest.raises(ValueError, match="native"):
+        convert("x", "y", ConvertOptions(bbox=False, native_geo=False))
