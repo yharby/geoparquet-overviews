@@ -57,17 +57,20 @@ export interface LayoutStrategy {
 
 function flatStrategy(metadata: GeoParquetMetadata): LayoutStrategy {
   const transform = metadata.projection.transform;
-  // A plain GeoParquet file with no covering bbox cannot be pruned to the
-  // viewport, so every row group is a candidate. The progressive reader still
-  // reads them one at a time and a newer view supersedes an in-flight read.
-  const hasCovering = metadata.coveringPaths !== null;
+  // Prunability now reflects reality: a row group carries a usable bbox from
+  // either the physical covering column or, for Profile B (--no-bbox) files,
+  // the native Parquet GeospatialStatistics on the geometry chunk. A file with
+  // neither on any row group cannot be pruned to the viewport, so every row
+  // group is a candidate. The progressive reader still reads them one at a
+  // time and a newer view supersedes an in-flight read.
+  const prunable = metadata.rowGroups.some((rg) => rg.bbox !== null);
   return {
     kind: 'flat-wkb',
     hasZoomLevels: false,
-    prunable: hasCovering,
+    prunable,
     prepare: async () => {},
     planRead: (aoi) => ({
-      indices: hasCovering
+      indices: prunable
         ? rowGroupsIntersecting(metadata.rowGroups, aoi)
         : metadata.rowGroups.map((rg) => rg.index),
       column: 'geometry',

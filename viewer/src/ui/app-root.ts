@@ -28,7 +28,7 @@ import { pageRangesForRowGroup, mergePageRanges } from '../data/pageindex';
 import { getPageRangeMemo, getFlatCache, isFilePrefetched } from '../data/file-cache';
 import { detectLayout, type LayoutStrategy } from '../data/layout';
 import { viewFetchKey } from './fetch-key';
-import { initialUrl } from '../data/presets';
+import { initialUrl, initialView, type CameraView } from '../data/presets';
 import { MapView } from '../map/map-view';
 import { buildLayers } from '../map/polygon-layer';
 import { vertexCount, mergeFlatGeometries, type FlatGeometries } from '../geo/geojson';
@@ -114,6 +114,10 @@ export class AppRoot extends LitElement {
   // Supersedes an in-flight attribute read when a newer feature is clicked, so a
   // slow read never overwrites a newer popup.
   private pickToken = 0;
+  // A deep-linked camera from the x/y/z query parameters, applied once on the
+  // first file open instead of the default extent fit, then cleared so later
+  // file switches fit to their own extent.
+  private pendingInitialView: CameraView | null = null;
 
   constructor() {
     super();
@@ -208,6 +212,9 @@ export class AppRoot extends LitElement {
 
   firstUpdated() {
     this.ensureMap();
+    // A deep-linked camera in x/y/z is captured before the first load so it can
+    // override the default extent fit once the file's metadata is in.
+    this.pendingInitialView = initialView();
     // Open on the `url` query parameter when present, else the default preset,
     // so the read path is traced immediately with no manual load step. The user
     // can still switch files with the control.
@@ -351,6 +358,8 @@ export class AppRoot extends LitElement {
     // the actual read so a rapid zoom-then-pan issues one fetch, not two.
     this.currentZoom = this.mapView.getZoom();
     this.viewBbox = this.mapView.getBounds();
+    // Mirror the live camera into the address bar so it is a shareable deep link.
+    this.reflectViewParam();
     if (this.fetchTimer !== null) clearTimeout(this.fetchTimer);
     this.fetchTimer = setTimeout(() => {
       this.fetchTimer = null;
@@ -408,7 +417,7 @@ export class AppRoot extends LitElement {
     const probe = this.viewBbox ?? { xmin: 0, ymin: 0, xmax: 0, ymax: 0 };
     const plan = this.strategy!.planRead(probe, this.currentZoom);
     const isOverview = plan.column !== 'geometry';
-    const bandName = isOverview ? 'overview' : 'exact';
+    const roleName = isOverview ? 'overview' : 'exact';
     const range = this.zoomRange();
     return html`
       <span class="sep"></span>
@@ -422,7 +431,7 @@ export class AppRoot extends LitElement {
         .value=${String(this.currentZoom)}
         @input=${this.onZoomSlider}
       />
-      <span class="zoom-read ${isOverview ? 'overview' : 'exact'}">z${this.currentZoom.toFixed(1)} · ${bandName}</span>
+      <span class="zoom-read ${isOverview ? 'overview' : 'exact'}">z${this.currentZoom.toFixed(1)} · ${roleName}</span>
     `;
   }
 
@@ -445,6 +454,20 @@ export class AppRoot extends LitElement {
     if (typeof window === 'undefined' || !window.history) return;
     const next = new URL(window.location.href);
     next.searchParams.set('url', url);
+    window.history.replaceState(null, '', next);
+  }
+
+  // Mirror the live camera into the x/y/z query parameters (x lng, y lat, z
+  // zoom) alongside the `url` parameter, so the address bar always deep links
+  // into the exact view. replaceState keeps camera moves out of the back-button
+  // history the same way reflectUrlParam does for file switches.
+  private reflectViewParam() {
+    if (typeof window === 'undefined' || !window.history || !this.mapView) return;
+    const c = this.mapView.getCenter();
+    const next = new URL(window.location.href);
+    next.searchParams.set('x', c.lng.toFixed(5));
+    next.searchParams.set('y', c.lat.toFixed(5));
+    next.searchParams.set('z', this.mapView.getZoom().toFixed(2));
     window.history.replaceState(null, '', next);
   }
 
@@ -534,9 +557,17 @@ export class AppRoot extends LitElement {
         crsNote = ` Cannot render, ${proj.label} is a projected CRS with no reprojection defined.`;
       } else {
         const extent = fileExtent(metadata.rowGroups);
-        // Flying to the extent settles into a moveend, which auto-fetches the
-        // opening overview for the whole file, no manual step.
-        if (extent) this.mapView.flyToBbox(extent);
+        if (this.pendingInitialView) {
+          // A camera deep-linked in x/y/z wins over the default fit on the first
+          // open. jumpTo settles into a moveend, which auto-fetches that view.
+          // Consumed once so a later file switch fits to its own extent.
+          this.mapView.jumpTo(this.pendingInitialView);
+          this.pendingInitialView = null;
+        } else if (extent) {
+          // Flying to the extent settles into a moveend, which auto-fetches the
+          // opening overview for the whole file, no manual step.
+          this.mapView.flyToBbox(extent);
+        }
         if (!proj.geographic) crsNote = ` Reprojected from ${proj.label} to lon/lat.`;
       }
       // The file declares its geometry types but none are ones the renderer can
@@ -619,7 +650,7 @@ export class AppRoot extends LitElement {
       // Allow an immediate retry of the same view once data comes into range.
       this.lastFetchKey = null;
       this.status = prunable
-        ? 'No row groups intersect this area. Try a larger or different area.'
+        ? 'No row groups intersect this view. Try zooming out or panning.'
         : 'This file has no covering bbox, so pruning is unavailable, and it has no row groups to read.';
       return;
     }
@@ -668,7 +699,7 @@ export class AppRoot extends LitElement {
       this.flushVizNow(token);
       this.loading = false;
       this.lastFetchKey = null;
-      this.status = 'No data pages intersect this area. Try a larger or different area.';
+      this.status = 'No data pages intersect this view. Try zooming out or panning.';
       setActiveUrl(null);
       return;
     }

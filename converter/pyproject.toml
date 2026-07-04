@@ -1,6 +1,6 @@
 [project]
 name = "geoparquet-overviews"
-version = "0.1.0"
+version = "0.2.0"
 description = "Convert any GeoParquet into the overviews layout, one file a browser can preview and a SQL engine can read."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -10,6 +10,7 @@ dependencies = [
     "shapely>=2.1.2",
     "numpy>=2.5.0",
     "click>=8.4.2",
+    "geoarrow-pyarrow>=0.2",
 ]
 
 [project.scripts]

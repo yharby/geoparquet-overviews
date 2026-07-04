@@ -8,7 +8,7 @@ import type { AsyncBuffer } from './byte-cache';
 // zero-copy Uint8Array views into the decompressed pages instead of GeoJSON
 // objects. hyparquet merges these over its DEFAULT_PARSERS, so a partial
 // override is enough; the cast satisfies the full-interface option type.
-const RAW_WKB_PARSERS = {
+export const RAW_WKB_PARSERS = {
   geometryFromBytes: (bytes: Uint8Array) => bytes,
   geographyFromBytes: (bytes: Uint8Array) => bytes,
 } as unknown as ParquetParsers;

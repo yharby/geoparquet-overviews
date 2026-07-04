@@ -11,10 +11,12 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "bench": "vitest run --config vitest.bench.config.ts"
   },
   "dependencies": {
     "@deck.gl/core": "9.3.6",
+    "@deck.gl/extensions": "9.3.6",
     "@deck.gl/layers": "9.3.6",
     "@deck.gl/mapbox": "9.3.6",
     "hyparquet": "1.26.2",

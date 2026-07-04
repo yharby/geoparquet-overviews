@@ -1,7 +1,8 @@
 import { LitElement, html, type PropertyValues } from 'lit';
 import maplibregl from 'maplibre-gl';
 import { MapboxOverlay } from '@deck.gl/mapbox';
-import { PolygonLayer } from '@deck.gl/layers';
+import { PolygonLayer, PathLayer, type PathLayerProps } from '@deck.gl/layers';
+import { PathStyleExtension, type PathStyleExtensionProps } from '@deck.gl/extensions';
 import type { Layer } from '@deck.gl/core';
 import type { Bbox } from '../geo/aoi';
 import { BASEMAP_STYLE } from '../map/map-view';
@@ -18,6 +19,12 @@ const BAND_RGB: Record<number, [number, number, number]> = {
 const SLATE_RGB: [number, number, number] = [58, 71, 86];
 const CREAM: Rgba = [239, 233, 219, 230];
 const AMBER: Rgba = [232, 178, 74, 255];
+
+// The current view rectangle is drawn as a dashed outline so it reads as an
+// overlay against the solid row-group boxes. highPrecisionDash keeps the dash
+// even across the rectangle's long unequal edges. One shared instance, deck.gl
+// diffs layers by reference so a stable extension avoids needless re-creation.
+const DASHED_STROKE = new PathStyleExtension({ dash: true, highPrecisionDash: true });
 
 // Fill alpha per read state: fetched groups are solid, in-flight ones dimmer,
 // pruned ones barely there.
@@ -263,17 +270,23 @@ export class LayoutMap extends LitElement {
     }
 
     if (viewportChanged) {
-      this.rgViewportLayer = new PolygonLayer<{ polygon: [number, number][] }>({
+      type ViewDatum = { path: [number, number][] };
+      // Extension props (getDashArray, dashJustified) are not part of the base
+      // PathLayer prop type, so declare the intersection to satisfy the excess
+      // property check on the literal.
+      const viewportProps: PathLayerProps<ViewDatum> & PathStyleExtensionProps<ViewDatum> = {
         id: 'rg-viewport',
-        data: this.viewBbox ? [{ polygon: bboxRing(this.viewBbox) }] : [],
-        getPolygon: (d) => d.polygon,
-        filled: false,
-        stroked: true,
-        getLineColor: AMBER,
-        getLineWidth: 1.6,
-        lineWidthUnits: 'pixels',
-        lineWidthMinPixels: 1,
-      });
+        data: this.viewBbox ? [{ path: bboxRing(this.viewBbox) }] : [],
+        getPath: (d) => d.path,
+        getColor: AMBER,
+        getWidth: 1.6,
+        widthUnits: 'pixels',
+        widthMinPixels: 1,
+        getDashArray: [6, 4],
+        dashJustified: true,
+        extensions: [DASHED_STROKE],
+      };
+      this.rgViewportLayer = new PathLayer<ViewDatum>(viewportProps);
       changedAny = true;
     }
 
@@ -313,17 +326,17 @@ export class LayoutMap extends LitElement {
           <span class="note">${this.metadata ? `${fetched}/${total} fetched` : ''}</span>
         </div>
         <div class="heatmap-summary">
-          Every row group's covering bbox on the basemap. The amber box is the main map's current view.
+          Every row group's covering bbox on the basemap. The dashed amber box is the main map's current view.
           Hover to link, click for detail.
         </div>
         <div class="rg-mini"></div>
         <div class="legend">
           ${hasBands
-            ? html`<span><i style="background: #E8B24A"></i>band 0</span>
-                <span><i style="background: #4F9D8C"></i>band 1</span>
-                <span><i style="background: #D8613C"></i>band 2</span>`
+            ? html`<span><i style="background: #E8B24A"></i>Level 0</span>
+                <span><i style="background: #4F9D8C"></i>Level 1</span>
+                <span><i style="background: #D8613C"></i>Level 2</span>`
             : html`<span><i style="background: #3a4756"></i>row group</span>`}
-          <span><i style="background: transparent; border: 1px solid #E8B24A"></i>map view</span>
+          <span><i style="background: transparent; border: 1px dashed #E8B24A"></i>view</span>
         </div>
       </div>
     `;

@@ -76,6 +76,15 @@ class ConvertOptions:
     # Numeric column that ranks dimension-0 (point) features, descending. When
     # unset, points are ranked by grid thinning instead.
     importance_column: str | None = None
+    # Wrap the WKB columns in the geoarrow.wkb extension type so pyarrow writes
+    # the Parquet native GEOMETRY logical type with automatic per-row-group
+    # geospatial statistics. The `geo` key is still written, dual 1.1 plus 2.0.
+    native_geo: bool = True
+    # Profile choice. True writes the physical bbox covering struct plus page
+    # index pruning surface (Profile A, default). False omits it (Profile B,
+    # lean 2.0), readers prune row groups from native geospatial statistics
+    # only and page-level pruning is unavailable.
+    bbox: bool = True
 
 
 def _find_geometry_column(schema: pa.Schema) -> str:
@@ -570,6 +579,20 @@ def _bbox_struct(bounds: np.ndarray, valid: np.ndarray | None = None) -> pa.Arra
     )
 
 
+def _wkb_extension_type(native: bool, crs: object, crs_present: bool):
+    """The geoarrow.wkb extension type carrying the source CRS, or None when
+    native types are disabled. pyarrow 21+ converts this to the Parquet
+    GEOMETRY logical type and computes GeospatialStatistics on write."""
+    if not native:
+        return None
+    import geoarrow.pyarrow as ga
+
+    gtype = ga.wkb()
+    if crs_present and crs is not None:
+        gtype = gtype.with_crs(json.dumps(crs) if isinstance(crs, dict) else str(crs))
+    return gtype
+
+
 def _validate_options(opts: ConvertOptions) -> None:
     """Fail fast on option combinations that would otherwise crash deep in the
     pipeline or silently produce a broken layout."""
@@ -595,6 +618,8 @@ def _validate_options(opts: ConvertOptions) -> None:
             )
         if sum(fr[: opts.bands - 1]) > 1.0 + 1e-9:
             raise ValueError(f"the first {opts.bands - 1} band_fractions must sum to at most 1, got {fr}")
+    if not opts.bbox and not opts.native_geo:
+        raise ValueError("--no-bbox requires native geo types, there would be no pruning surface at all")
 
 
 def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
@@ -773,20 +798,42 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     bounds[coarse, 2] += pad
     bounds[coarse, 3] += pad
 
-    table = table.append_column("geometry", pa.array(geom_wkb, type=pa.binary()))
-    table = table.append_column("bbox", _bbox_struct(bounds, valid))
+    # Per-band extents for `levels[].extent`, computed from the padded bounds so
+    # they enclose the overview geometry too. A band of only null geometries
+    # gets a null extent.
+    band_extents: dict[int, list[float] | None] = {}
+    for b in range(bands):
+        m = valid & (band == b)
+        band_extents[b] = (
+            [float(np.min(bounds[m, 0])), float(np.min(bounds[m, 1])),
+             float(np.max(bounds[m, 2])), float(np.max(bounds[m, 3]))]
+            if m.any() else None
+        )
+
+    gtype = _wkb_extension_type(opts.native_geo, crs if crs_present else None, crs_present)
+
+    def _geom_array(values: np.ndarray) -> pa.Array:
+        storage = pa.array(values, type=pa.binary())
+        return gtype.wrap_array(storage) if gtype is not None else storage
+
+    table = table.append_column("geometry", _geom_array(geom_wkb))
+    if opts.bbox:
+        table = table.append_column("bbox", _bbox_struct(bounds, valid))
     table = table.append_column("band", pa.array(band, type=pa.int16()))
     if has_overview:
-        table = table.append_column("geom_overview", pa.array(overview_wkb, type=pa.binary()))
+        table = table.append_column("geom_overview", _geom_array(overview_wkb))
 
-    levels = []
+    base_levels = []
     prev_zoom = -1
     for b in sorted(band_rg_end):
         gsd = band_tol.get(b, 0.0) if b < bands - 1 else 0.0
         max_zoom = _zoom_for_gsd(gsd, world) if b < bands - 1 else _FINE_MAX_ZOOM
         max_zoom = max(max_zoom, prev_zoom + 1)  # keep the ladder strictly increasing
         prev_zoom = max_zoom
-        levels.append({"level": b, "row_group_end": band_rg_end[b], "max_zoom": max_zoom, "gsd": gsd})
+        base_levels.append({
+            "level": b, "row_group_end": band_rg_end[b],
+            "max_zoom": max_zoom, "gsd": gsd, "extent": band_extents.get(b),
+        })
 
     type_names = _geometry_type_names(geoms)
     # Recompute the overview column's own types from its WKB, since simplify can
@@ -799,12 +846,28 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
             crs=crs if crs_present else footer._NO_CRS,
             source_column=source_column,
             overview_geometry_types=overview_type_names,
-        ),
-        "overviews": footer.overviews_meta(
-            "hilbert", levels, has_overview,
-            importance=importance, overview_method=overview_method,
+            covering=opts.bbox,
         ),
     }
+
+    levels: list[dict] = []
+
+    def _late_kv(rg_ranges: list[tuple[int, int]]) -> dict[str, str]:
+        # Stamp each level with the byte range of its row-group run, known only
+        # after the row groups are written. Ranges are [start, end) file offsets.
+        prev_end = -1
+        for lvl in base_levels:
+            first_rg = prev_end + 1
+            lvl["bytes"] = [rg_ranges[first_rg][0], rg_ranges[lvl["row_group_end"]][1]]
+            prev_end = lvl["row_group_end"]
+        levels.extend(base_levels)
+        return {
+            "overviews": footer.overviews_meta(
+                "hilbert", base_levels, has_overview,
+                importance=importance, overview_method=overview_method,
+                covering=opts.bbox,
+            ),
+        }
 
     # C16, verify the plan covers every row before we write anything, not after.
     if sum(plan) != table.num_rows:
@@ -812,7 +875,7 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
 
     t = time.perf_counter()
     log.info("writing %s with zstd, page index, byte-stream-split doubles, declared sorting", dst)
-    _write(table, dst, plan, kv, opts)
+    _write(table, dst, plan, kv, opts, late_kv=_late_kv)
     log.info("wrote in %.1fs", time.perf_counter() - t)
 
     # The preview payoff, what a lowest-zoom read touches versus a full scan.
@@ -880,10 +943,21 @@ def _geometry_type_names_from_wkb(wkb: np.ndarray) -> list[str]:
     return _geometry_type_names(shapely.from_wkb(present))
 
 
-def _write(table: pa.Table, dst: str, plan: list[int], kv: dict[str, str], opts: ConvertOptions) -> None:
+def _write(
+    table: pa.Table, dst: str, plan: list[int], kv: dict[str, str],
+    opts: ConvertOptions, late_kv=None,
+) -> None:
     """Write with everything the DuckDB writer cannot do, the Page Index,
     BYTE_STREAM_SPLIT on doubles, declared sorting_columns, adaptive row groups,
-    and the exact footer key values."""
+    and the exact footer key values.
+
+    `late_kv`, when given, is called once all row groups are written with the
+    `(start, end)` byte range of each row group in write order. It returns
+    footer keys, such as `overviews`, whose per-level byte ranges are only
+    knowable after the bytes have actually landed. Those keys are added via
+    `add_key_value_metadata` right before close, so they are the only source
+    of that key, no duplicate stale copy survives from the schema metadata.
+    """
     # Exact-key filter, so unrelated keys like `geoarrow` or a user's own
     # `geometry_source` survive instead of being stripped by a `geo` prefix.
     reserved = {b"geo", b"overviews"}
@@ -892,7 +966,9 @@ def _write(table: pa.Table, dst: str, plan: list[int], kv: dict[str, str], opts:
     table = table.replace_schema_metadata(meta)
 
     names = table.column_names
-    bbox_doubles = ["bbox.xmin", "bbox.ymin", "bbox.xmax", "bbox.ymax"]
+    bbox_doubles = (
+        ["bbox.xmin", "bbox.ymin", "bbox.xmax", "bbox.ymax"] if "bbox" in names else []
+    )
     float_cols = [
         n for n in names if pa.types.is_floating(table.schema.field(n).type)
     ]
@@ -904,8 +980,16 @@ def _write(table: pa.Table, dst: str, plan: list[int], kv: dict[str, str], opts:
         or pa.types.is_large_string(table.schema.field(n).type)
     ]
     # `bbox` is a struct parent, statistics are meaningful only on its four
-    # leaves (added via bbox_doubles), so exclude the parent name itself.
-    stats_cols = [n for n in names if n not in ("geometry", "geom_overview", "bbox")] + bbox_doubles
+    # leaves (added via bbox_doubles), so exclude the parent name itself. When
+    # the geometry columns are extension typed, include them here too, since
+    # geospatial statistics are only computed when the writer computes
+    # statistics for the column.
+    geo_native = any(
+        isinstance(table.schema.field(n).type, pa.ExtensionType)
+        for n in ("geometry", "geom_overview") if n in names
+    )
+    excluded = ("bbox",) if geo_native else ("geometry", "geom_overview", "bbox")
+    stats_cols = [n for n in names if n not in excluded] + bbox_doubles
     # Resolve `band` to its physical leaf index. The `bbox` struct flattens into
     # four leaves, so a top-level column index would point at the wrong column.
     sorting = (
@@ -914,20 +998,26 @@ def _write(table: pa.Table, dst: str, plan: list[int], kv: dict[str, str], opts:
         else None
     )
 
-    writer = pq.ParquetWriter(
-        dst,
-        table.schema,
-        compression="zstd",
-        compression_level=opts.compression_level,
-        write_page_index=True,
-        data_page_size=opts.page_size_kb * 1024,
-        use_dictionary=dict_cols or False,
-        use_byte_stream_split=byte_split,
-        write_statistics=stats_cols,
-        sorting_columns=sorting,
-    )
-    offset = 0
-    for rows in plan:
-        writer.write_table(table.slice(offset, rows), row_group_size=rows)
-        offset += rows
-    writer.close()
+    with open(dst, "wb") as sink:
+        writer = pq.ParquetWriter(
+            sink,
+            table.schema,
+            compression="zstd",
+            compression_level=opts.compression_level,
+            write_page_index=True,
+            data_page_size=opts.page_size_kb * 1024,
+            use_dictionary=dict_cols or False,
+            use_byte_stream_split=byte_split,
+            write_statistics=stats_cols,
+            sorting_columns=sorting,
+        )
+        rg_ranges: list[tuple[int, int]] = []
+        offset = 0
+        for rows in plan:
+            start = sink.tell()
+            writer.write_table(table.slice(offset, rows), row_group_size=rows)
+            rg_ranges.append((start, sink.tell()))
+            offset += rows
+        if late_kv is not None:
+            writer.add_key_value_metadata(late_kv(rg_ranges))
+        writer.close()

@@ -72,12 +72,12 @@ export class PruningMap extends LitElement {
         <div class="panel-head">
           <span class="n">◆</span>
           <h2>Row-group pruning</h2>
-          <span class="note">${this.aoi ? `${keptPct}% kept` : 'no area yet'}</span>
+          <span class="note">${this.aoi ? `${keptPct}% kept` : 'no view yet'}</span>
         </div>
         <div class="pruning-summary">
           ${this.aoi
             ? html`${fetchedCount} fetched, ${prunedCount} pruned by bbox statistics before any fetch, of ${total} total.`
-            : html`Fetch an area to see which row groups the bbox statistics prune.`}
+            : html`Pan or zoom the map to see which row groups the bbox statistics prune.`}
         </div>
         <div class="pruning-grid">
           ${this.metadata.rowGroups.map((rg) => {

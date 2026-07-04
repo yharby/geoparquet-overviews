@@ -138,6 +138,17 @@ export class MapView {
     this.map.easeTo({ zoom, duration: 300 });
   }
 
+  getCenter(): { lng: number; lat: number } {
+    const c = this.map.getCenter();
+    return { lng: c.lng, lat: c.lat };
+  }
+
+  // Snap the camera to a deep-linked view with no animation, used to restore the
+  // x/y/z query parameters when the viewer opens on a shared link.
+  jumpTo(view: { lng: number; lat: number; zoom: number }): void {
+    this.map.jumpTo({ center: [view.lng, view.lat], zoom: view.zoom });
+  }
+
   // Subscribe to any camera move end (pan or zoom), used to keep the overview
   // mini-map's viewport rectangle in sync with this map. Returns unsubscribe.
   onMoveEnd(cb: () => void): () => void {

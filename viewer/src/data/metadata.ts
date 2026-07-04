@@ -28,6 +28,10 @@ export interface OverviewLevel {
   rowGroupEnd: number;
   maxZoom: number;
   gsd: number;
+  // Optional 0.2.0 fields. The band's file byte range [start, end) so a reader
+  // can price a prefix read, and its padded extent in CRS units.
+  bytes: [number, number] | null;
+  extent: [number, number, number, number] | null;
 }
 
 export interface OverviewsInfo {
@@ -80,10 +84,20 @@ interface RawStatistics {
   max_value?: number;
 }
 
+interface RawGeoStatsBbox {
+  xmin: number;
+  xmax: number;
+  ymin: number;
+  ymax: number;
+}
+
 interface RawColumn {
   meta_data: {
     path_in_schema: string[];
     statistics?: RawStatistics;
+    // Native Parquet GeospatialStatistics (GEOMETRY logical type), the row
+    // group pruning surface for Profile B files with no covering column.
+    geospatial_statistics?: { bbox?: RawGeoStatsBbox };
   };
 }
 
@@ -111,6 +125,31 @@ function pathsEqual(a: string[], b: string[]): boolean {
 function findColumnStatistics(rowGroup: RawRowGroup, path: string[]): RawStatistics | null {
   const column = rowGroup.columns.find((c) => pathsEqual(c.meta_data.path_in_schema, path));
   return column?.meta_data.statistics ?? null;
+}
+
+// True when a native GeospatialStatistics bbox carries finite, correctly
+// ordered bounds. An all-null column chunk (e.g. the finest band's
+// `geom_overview`, which is null for every row in that band) still gets
+// `geospatial_statistics` from the writer, but with null bounds, so this
+// guard rejects it and lets the caller fall through to the next candidate.
+function isUsableGeoStatsBbox(bbox: RawGeoStatsBbox | undefined): bbox is RawGeoStatsBbox {
+  return (
+    !!bbox &&
+    Number.isFinite(bbox.xmin) &&
+    Number.isFinite(bbox.ymin) &&
+    Number.isFinite(bbox.xmax) &&
+    Number.isFinite(bbox.ymax) &&
+    bbox.xmin <= bbox.xmax &&
+    bbox.ymin <= bbox.ymax
+  );
+}
+
+// The native GeospatialStatistics bbox of one column chunk, or null when the
+// column is absent or its stats are unusable (see isUsableGeoStatsBbox).
+function findGeospatialStatsBbox(rowGroup: RawRowGroup, path: string[]): RawGeoStatsBbox | null {
+  const column = rowGroup.columns.find((c) => pathsEqual(c.meta_data.path_in_schema, path));
+  const bbox = column?.meta_data.geospatial_statistics?.bbox;
+  return isUsableGeoStatsBbox(bbox) ? bbox : null;
 }
 
 // The GeoJSON geometry types the viewer can flatten and draw. Any type not in
@@ -157,6 +196,14 @@ export function parseOverviews(raw: Record<string, unknown> | null): OverviewsIn
       rowGroupEnd: Number(l.row_group_end),
       maxZoom: Number(l.max_zoom),
       gsd: Number(l.gsd),
+      bytes:
+        Array.isArray(l.bytes) && l.bytes.length === 2
+          ? ([Number(l.bytes[0]), Number(l.bytes[1])] as [number, number])
+          : null,
+      extent:
+        Array.isArray(l.extent) && l.extent.length === 4
+          ? (l.extent.map(Number) as [number, number, number, number])
+          : null,
     }))
     .sort((a, b) => a.level - b.level);
   return {
@@ -219,6 +266,29 @@ export function readGeoParquetMetadata(rawMeta: FileMetaData): GeoParquetMetadat
           },
           projection.transform,
         );
+      }
+    }
+    if (!bbox) {
+      // Profile B files (converter --no-bbox) carry no physical covering
+      // column. Fall back to native GeospatialStatistics, which hyparquet
+      // exposes as `geospatial_statistics` on meta_data. At coarse zoom the
+      // viewer paints the grid-snapped `geom_overview` column, not the exact
+      // `geometry` column, so prefer the overview column's own native stats
+      // here: they are computed from the overview geometry actually written,
+      // so (unlike the exact column's stats) they need no separate padding
+      // for the grid snap (see SPEC.md's Profile B paragraph). The finest
+      // band's `geom_overview` chunk is all null, so it carries no usable
+      // bounds (isUsableGeoStatsBbox rejects it) and this falls through to
+      // the primary geometry column's stats, which is correct since the
+      // finest band renders exact geometry anyway. Same reprojection as the
+      // covering path so pruning is identical either way.
+      const primary = (geo?.primary_column as string) ?? 'geometry';
+      const overviewColumn = overviewsInfo?.overviewColumn ?? null;
+      const gs =
+        (overviewColumn ? findGeospatialStatsBbox(rowGroup, [overviewColumn]) : null) ??
+        findGeospatialStatsBbox(rowGroup, [primary]);
+      if (gs) {
+        bbox = reprojectBbox({ xmin: gs.xmin, ymin: gs.ymin, xmax: gs.xmax, ymax: gs.ymax }, projection.transform);
       }
     }
     return {
@@ -476,8 +546,11 @@ export function coarseColumnIntervals(meta: GeoParquetMetadata): Array<[number, 
   return intervals;
 }
 
+// A null bbox means "unknown", not "empty", so it must never be pruned away.
+// Keep any row group whose bbox we could not determine, and prune only the
+// ones we can prove do not intersect the AOI.
 export function rowGroupsIntersecting(rowGroups: RowGroupInfo[], aoi: Bbox): number[] {
-  return rowGroups.filter((rg) => rg.bbox !== null && bboxIntersectsAoi(rg.bbox, aoi)).map((rg) => rg.index);
+  return rowGroups.filter((rg) => rg.bbox === null || bboxIntersectsAoi(rg.bbox, aoi)).map((rg) => rg.index);
 }
 
 // The overview level a web zoom should read. Picks the coarsest level whose
@@ -505,7 +578,7 @@ export function columnForLevel(info: OverviewsInfo, level: OverviewLevel): strin
 // that prefix the bbox covering prunes to the viewport.
 export function rowGroupsForLevel(rowGroups: RowGroupInfo[], level: OverviewLevel, aoi: Bbox): number[] {
   return rowGroups
-    .filter((rg) => rg.index <= level.rowGroupEnd && rg.bbox !== null && bboxIntersectsAoi(rg.bbox, aoi))
+    .filter((rg) => rg.index <= level.rowGroupEnd && (rg.bbox === null || bboxIntersectsAoi(rg.bbox, aoi)))
     .map((rg) => rg.index);
 }
 

@@ -42,3 +42,37 @@ export function initialUrl(
   }
   return DEFAULT_PRESET.url;
 }
+
+// A map camera restored from the query string, x longitude, y latitude, z zoom.
+export interface CameraView {
+  lng: number;
+  lat: number;
+  zoom: number;
+}
+
+// The viewer also opens on x, y, and z query parameters, x longitude, y
+// latitude, z zoom, so a link can point straight at a precise camera and not
+// just a file. All three must be present and in range or the whole camera is
+// ignored, so a partial or malformed set falls back to the default fit. The
+// search string is a parameter so this stays pure and testable. loadUrl mirrors
+// the live camera back into these on every settle.
+export function initialView(
+  search = typeof window === 'undefined' ? '' : window.location.search,
+): CameraView | null {
+  const params = new URLSearchParams(search);
+  const x = params.get('x');
+  const y = params.get('y');
+  const z = params.get('z');
+  // A missing or blank value is a no-camera, not a zero. Number('') is 0, which
+  // would silently place the camera at the equator or prime meridian, so reject
+  // any empty or whitespace-only parameter before coercing.
+  if (x === null || y === null || z === null) return null;
+  if (x.trim() === '' || y.trim() === '' || z.trim() === '') return null;
+  const lng = Number(x);
+  const lat = Number(y);
+  const zoom = Number(z);
+  if (!Number.isFinite(lng) || !Number.isFinite(lat) || !Number.isFinite(zoom)) return null;
+  if (lng < -180 || lng > 180 || lat < -85.06 || lat > 85.06) return null;
+  if (zoom < 0 || zoom > 28) return null;
+  return { lng, lat, zoom };
+}

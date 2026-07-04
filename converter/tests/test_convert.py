@@ -93,12 +93,37 @@ def test_convert_writes_overviews_footer(tmp_path):
     assert b"geo" in meta
     assert b"overviews" in meta
     ov = json.loads(meta[b"overviews"])
-    assert ov["version"] == "0.1.0"
+    assert ov["version"] == "0.2.0"
     assert ov["overview_column"] == "geom_overview"
     # Levels are ordered and the last level ends at the last row group.
     ends = [lvl["row_group_end"] for lvl in ov["levels"]]
     assert ends == sorted(ends)
     assert ends[-1] == summary["row_groups"] - 1
+
+
+def test_levels_carry_bytes_and_extent(tmp_path):
+    src = tmp_path / "src.parquet"
+    dst = tmp_path / "dst.parquet"
+    pq.write_table(_poly_table(), src)
+    convert(str(src), str(dst), ConvertOptions(bands=2))
+    pf = pq.ParquetFile(dst)
+    import json as _json
+    ov = _json.loads(pf.metadata.metadata[b"overviews"])
+    assert ov["version"] == "0.2.0"
+    levels = ov["levels"]
+    prev_end = 4  # after the PAR1 magic
+    for lvl in levels:
+        start, end = lvl["bytes"]
+        assert start >= prev_end and end > start
+        prev_end = end
+        ext = lvl["extent"]
+        assert len(ext) == 4 and ext[0] <= ext[2] and ext[1] <= ext[3]
+    # The ranges tile the data section, level 0 starts at the first row group.
+    assert levels[0]["bytes"][0] == 4
+    # And the end of the last level matches the last row group boundary, which
+    # must sit before the footer.
+    import os
+    assert levels[-1]["bytes"][1] < os.path.getsize(dst)
 
 
 def test_row_count_and_geometry_preserved(tmp_path):
@@ -297,6 +322,20 @@ def test_reconvert_is_idempotent(tmp_path):
     assert sorted(b.column_names) == sorted(set(b.column_names))
     # Exact geometry is stable across the re-convert.
     assert Counter(a.column("geometry").to_pylist()) == Counter(b.column("geometry").to_pylist())
+
+
+def test_reconvert_native_output_is_idempotent(tmp_path):
+    """Re-converting a 0.2.0 output with extension-typed geometry columns
+    must not break the read/decode stage, and must reproduce the same bytes."""
+    src = tmp_path / "src.parquet"
+    once = tmp_path / "once.parquet"
+    twice = tmp_path / "twice.parquet"
+    pq.write_table(_poly_table(), src)
+    convert(str(src), str(once), ConvertOptions(bands=2))
+    convert(str(once), str(twice), ConvertOptions(bands=2))
+    a, b = pq.read_table(once), pq.read_table(twice)
+    assert a.column_names == b.column_names
+    assert a.column("geometry").combine_chunks() == b.column("geometry").combine_chunks()
 
 
 def test_sorting_columns_declares_band_leaf(tmp_path):
@@ -673,3 +712,165 @@ def test_reconvert_overview_has_no_covering(tmp_path):
     geo_twice = json.loads(pq.read_metadata(twice).metadata[b"geo"])
     assert "covering" in geo_twice["columns"]["geometry"]
     assert "covering" not in geo_twice["columns"]["geom_overview"]
+
+
+def _poly_table(n=40):
+    import shapely
+
+    geoms = [shapely.box(i % 8, i // 8, i % 8 + 0.9, i // 8 + 0.9) for i in range(n)]
+    wkb = [shapely.to_wkb(g) for g in geoms]
+    return pa.table({"name": [f"f{i}" for i in range(n)], "geometry": pa.array(wkb, type=pa.binary())})
+
+
+def test_native_geo_types_and_stats(tmp_path):
+    src = tmp_path / "src.parquet"
+    dst = tmp_path / "dst.parquet"
+    pq.write_table(_poly_table(), src)
+    convert(str(src), str(dst), ConvertOptions(bands=2))
+    pf = pq.ParquetFile(dst)
+    # The geometry columns carry the Parquet GEOMETRY logical type.
+    schema = pf.schema_arrow
+    assert "geoarrow.wkb" in str(schema.field("geometry").type)
+    # Every row group chunk of the primary geometry column has geospatial statistics.
+    geom_idx = [c.path_in_schema for c in
+                [pf.metadata.row_group(0).column(i) for i in range(pf.metadata.num_columns)]].index("geometry")
+    for rg in range(pf.metadata.num_row_groups):
+        col = pf.metadata.row_group(rg).column(geom_idx)
+        assert col.is_geo_stats_set, f"row group {rg} missing geospatial statistics"
+        assert col.geo_statistics is not None
+    # bands=2 produces a coarse band, so a geom_overview column exists, and the
+    # same `_write` stats change applies to it too.
+    overview_idx = [c.path_in_schema for c in
+                     [pf.metadata.row_group(0).column(i) for i in range(pf.metadata.num_columns)]].index(
+        "geom_overview"
+    )
+    for rg in range(pf.metadata.num_row_groups):
+        col = pf.metadata.row_group(rg).column(overview_idx)
+        assert col.is_geo_stats_set, f"row group {rg} geom_overview missing geospatial statistics"
+    # The geo key is still there, dual-write.
+    kv = pf.metadata.metadata
+    assert b"geo" in kv and b"overviews" in kv
+
+
+def test_native_geo_crs_round_trips_and_has_stats(tmp_path):
+    """C6 for native types, a projected CRS on the source column survives onto
+    the geoarrow.wkb extension type of the written `geometry` column, and that
+    column still gets geospatial statistics with the CRS present."""
+    src = tmp_path / "proj.parquet"
+    dst = tmp_path / "out.parquet"
+    rng = np.random.default_rng(3)
+    geoms = []
+    for _ in range(200):
+        cx, cy = rng.uniform(0, 100000, 2)
+        r = rng.uniform(50, 2000)
+        angles = np.linspace(0, 2 * np.pi, 80, endpoint=False)
+        geoms.append(shapely.Polygon(np.column_stack([cx + np.cos(angles) * r, cy + np.sin(angles) * r])))
+    _write_gpq(src, geoms, crs="EPSG:3067")
+
+    convert(str(src), str(dst), ConvertOptions(row_group_mb=0.02))
+    pf = pq.ParquetFile(dst)
+
+    # The written geometry column is extension typed (native GEOMETRY), not
+    # plain binary WKB.
+    geom_type = pf.schema_arrow.field("geometry").type
+    assert isinstance(geom_type, pa.ExtensionType)
+    assert geom_type.extension_name == "geoarrow.wkb"
+
+    # The extension type carries the source CRS, round-tripped through
+    # `with_crs`, not silently dropped or replaced with a default.
+    assert geom_type.crs is not None
+    assert geom_type.crs.__geoarrow_crs_json_values__()["crs"] == "EPSG:3067"
+
+    # Every row group of the primary geometry column has geospatial statistics
+    # with the CRS present, not just when the source is CRS84 default.
+    geom_idx = [c.path_in_schema for c in
+                [pf.metadata.row_group(0).column(i) for i in range(pf.metadata.num_columns)]].index("geometry")
+    for rg in range(pf.metadata.num_row_groups):
+        col = pf.metadata.row_group(rg).column(geom_idx)
+        assert col.is_geo_stats_set, f"row group {rg} missing geospatial statistics"
+
+
+def test_no_native_geo_flag(tmp_path):
+    src = tmp_path / "src.parquet"
+    dst = tmp_path / "dst.parquet"
+    pq.write_table(_poly_table(), src)
+    convert(str(src), str(dst), ConvertOptions(bands=2, native_geo=False))
+    pf = pq.ParquetFile(dst)
+    assert str(pf.schema_arrow.field("geometry").type) == "binary"
+
+
+def test_no_bbox_profile(tmp_path):
+    src = tmp_path / "src.parquet"
+    dst = tmp_path / "dst.parquet"
+    pq.write_table(_poly_table(), src)
+    convert(str(src), str(dst), ConvertOptions(bands=2, bbox=False))
+    pf = pq.ParquetFile(dst)
+    assert "bbox" not in pf.schema_arrow.names
+    import json as _json
+    geo = _json.loads(pf.metadata.metadata[b"geo"])
+    assert "covering" not in geo["columns"]["geometry"]
+    ov = _json.loads(pf.metadata.metadata[b"overviews"])
+    assert "covering" not in ov
+    # Native stats still there, they are the only pruning surface now.
+    names = [pf.metadata.row_group(0).column(i).path_in_schema for i in range(pf.metadata.num_columns)]
+    col = pf.metadata.row_group(0).column(names.index("geometry"))
+    assert col.is_geo_stats_set
+
+
+def test_no_bbox_requires_native_geo(tmp_path):
+    with pytest.raises(ValueError, match="native"):
+        convert("x", "y", ConvertOptions(bbox=False, native_geo=False))
+
+
+def test_reconvert_with_no_bbox_drops_stale_covering(tmp_path):
+    """A prior converter output already carries a `covering` on `geometry`.
+    Re-converting it with `--no-bbox` (Profile B) must not leak that covering
+    forward, the output has no `bbox` column for it to point at."""
+    src = tmp_path / "src.parquet"
+    with_bbox = tmp_path / "with_bbox.parquet"
+    no_bbox = tmp_path / "no_bbox.parquet"
+    pq.write_table(_poly_table(), src)
+
+    # Profile A: a normal output, which carries a covering.
+    convert(str(src), str(with_bbox), ConvertOptions(bands=2))
+    geo_with_bbox = json.loads(pq.read_metadata(with_bbox).metadata[b"geo"])
+    assert "covering" in geo_with_bbox["columns"]["geometry"]
+
+    # Profile B reconversion of that output must strip the inherited covering.
+    convert(str(with_bbox), str(no_bbox), ConvertOptions(bands=2, bbox=False))
+    pf = pq.ParquetFile(no_bbox)
+    assert "bbox" not in pf.schema_arrow.names
+    geo = json.loads(pf.metadata.metadata[b"geo"])
+    assert "covering" not in geo["columns"]["geometry"]
+    ov = json.loads(pf.metadata.metadata[b"overviews"])
+    assert "covering" not in ov
+    # Native geospatial statistics remain the pruning surface.
+    names = [pf.metadata.row_group(0).column(i).path_in_schema for i in range(pf.metadata.num_columns)]
+    col = pf.metadata.row_group(0).column(names.index("geometry"))
+    assert col.is_geo_stats_set
+
+
+def test_reconvert_with_bbox_has_valid_covering(tmp_path):
+    """Re-converting a Profile B output with `--bbox` (Profile A) must produce
+    a valid covering that points at a `bbox` column actually present in the
+    output schema, no dangling reference."""
+    src = tmp_path / "src.parquet"
+    no_bbox = tmp_path / "no_bbox.parquet"
+    with_bbox = tmp_path / "with_bbox.parquet"
+    pq.write_table(_poly_table(), src)
+
+    convert(str(src), str(no_bbox), ConvertOptions(bands=2, bbox=False))
+    convert(str(no_bbox), str(with_bbox), ConvertOptions(bands=2, bbox=True))
+
+    pf = pq.ParquetFile(with_bbox)
+    assert "bbox" in pf.schema_arrow.names
+    geo = json.loads(pf.metadata.metadata[b"geo"])
+    covering = geo["columns"]["geometry"]["covering"]
+    assert covering == {
+        "bbox": {
+            "xmin": ["bbox", "xmin"],
+            "ymin": ["bbox", "ymin"],
+            "xmax": ["bbox", "xmax"],
+            "ymax": ["bbox", "ymax"],
+        }
+    }

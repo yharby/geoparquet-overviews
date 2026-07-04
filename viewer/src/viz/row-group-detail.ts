@@ -151,7 +151,7 @@ export class RowGroupDetail extends LitElement {
           <div class="legend">
             <span><i style="background: var(--clay)"></i>this row group</span>
             <span><i style="background: #3a4756"></i>other row groups</span>
-            ${this.aoi ? html`<span><i style="background: transparent; border: 1px dashed var(--amber)"></i>AOI</span>` : ''}
+            ${this.aoi ? html`<span><i style="background: transparent; border: 1px dashed var(--amber)"></i>view</span>` : ''}
           </div>
         </div>
       </div>
@@ -189,7 +189,7 @@ export class RowGroupDetail extends LitElement {
         <div class="band-line">
           <span class="band-chip" style="background: ${bandColor(band)}"></span>
           <span class="band-role">
-            <b>Band ${band} · ${role.isExact ? 'exact' : 'overview'}</b> · reads <code>${role.column}</code>
+            <b>Level ${band} · ${role.isExact ? 'exact' : 'overview'}</b> · reads <code>${role.column}</code>
           </span>
         </div>
         <div class="band-note">${detail}${bytes !== null ? ` · ${role.isExact ? 'geometry' : 'overview'} in this group ${bytesStr(bytes)}` : ''}</div>
@@ -199,7 +199,7 @@ export class RowGroupDetail extends LitElement {
                 const isExact = i === all.length - 1;
                 return html`<span class="band-tick ${l.level === band ? 'on' : ''}">
                   <span class="band-chip" style="background: ${bandColor(l.level)}"></span>
-                  b${l.level} ${isExact ? 'exact' : `≤z${l.maxZoom}`}
+                  L${l.level} ${isExact ? 'exact' : `≤z${l.maxZoom}`}
                 </span>`;
               })}
             </div>`

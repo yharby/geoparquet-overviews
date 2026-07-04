@@ -85,7 +85,7 @@ export class LayoutHeatmap extends LitElement {
   render() {
     if (!this.metadata) {
       return html`<div class="panel">
-        <div class="panel-head"><span class="n">◆</span><h2>File layout</h2></div>
+        <div class="panel-head"><span class="n">◆</span><h2>Row-group bytes</h2></div>
         <div class="empty">No file loaded.</div>
       </div>`;
     }
@@ -95,7 +95,7 @@ export class LayoutHeatmap extends LitElement {
       <div class="panel">
         <div class="panel-head">
           <span class="n">◆</span>
-          <h2>File layout</h2>
+          <h2>Row-group bytes</h2>
           <span class="note">${this.metadata.rowGroups.length} row groups</span>
         </div>
         <div class="heatmap-summary">

@@ -23,12 +23,35 @@ Node >= 24, pnpm 11.9.0.
 ## Data flow
 
 - `src/ui/app-root.ts` drives everything, debounced moveend fetches, a
-  superseding token per view, progressive paint per row group.
+  superseding token per view, progressive paint per row group. It also mirrors
+  the loaded file into the `url` query parameter and the live camera into `x`
+  (lng), `y` (lat), `z` (zoom) via `replaceState` on every settle, and restores
+  a deep-linked camera on first open through `initialView` (in `data/presets.ts`,
+  applied with `MapView.jumpTo` instead of the default extent fit).
+- `src/data/manifest.ts` fetches the hosted `versions.json` catalog
+  (`fetchManifest`, `MANIFEST_URL`), parses it (`parseManifest`), derives a
+  version's preset list (`presetsForVersion`), and maps a dataset across
+  versions by preset id (`resolveVersionTwin`). `src/ui/load-control.ts` wires
+  the version dropdown, defaulting to the manifest's `latest`, switching the
+  preset list on `onVersionChange`, and falling back to the built-in
+  `FILE_PRESETS` whenever the manifest is unreachable (`fetchManifest` resolves
+  null and the dropdown stays hidden). `versions.json` is published at the
+  bucket root and lists 0.1.0 and 0.2.0, so the dropdown is live.
 - `src/data/metadata.ts` fetches the footer, parses `geo` and `overviews`,
-  stamps the band ordinal on each row group, interprets the CRS.
+  stamps the band ordinal on each row group, interprets the CRS. Each row
+  group's bbox comes from the physical `bbox` covering column when present, else
+  from native Parquet GeospatialStatistics (`findGeospatialStatsBbox`,
+  `isUsableGeoStatsBbox`) for Profile B (`--no-bbox`) files, preferring the
+  `geom_overview` column's stats over the primary geometry's so coarse pruning
+  matches the grid-snapped geometry actually painted. It also parses the 0.2.0
+  per-level `bytes` (`[start, end)` file byte range) and `extent` (padded
+  band bbox) fields onto `OverviewLevel`.
 - `src/data/layout.ts` picks the read strategy, `overviews` (band per zoom,
   `geom_overview` for coarse levels) or `flat-wkb`, and returns a ReadPlan of
-  bbox-pruned row-group indices plus the column to read.
+  bbox-pruned row-group indices plus the column to read. `flatStrategy.prunable`
+  is true when any row group carries a usable bbox from either source, so
+  Profile B files still prune to the viewport at row-group granularity (the
+  page-level path below still needs the physical covering column).
 - `src/data/pageindex.ts` prunes below row-group granularity, reads the
   `bbox` covering column's ColumnIndex and OffsetIndex and maps the view to
   overlapping page row ranges. Returns null on any problem so the caller
@@ -145,3 +168,10 @@ Vitest, run with `pnpm test`. Tests are colocated with sources as
 `*.test.ts` files (for example `src/data/pageindex.test.ts`,
 `src/geo/wkb-flatten.test.ts`). Large local fixtures go in `public/`,
 gitignored except `sample.parquet`.
+
+`pnpm bench` runs a separate network suite (`bench/compare.bench.ts`, config
+`vitest.bench.config.ts`, results written to `bench/RESULTS.md`) that plans
+reads for a viewport ladder per dataset per data version and sums the
+compressed bytes of the planned geometry chunks. It hits real hosted files
+over the network, so it is deliberately excluded from `pnpm test` by living
+under a separate config with its own `bench/**/*.bench.ts` include.

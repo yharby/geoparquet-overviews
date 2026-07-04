@@ -1,6 +1,6 @@
 # GeoParquet Overviews Specification
 
-Status, draft 0.1.0. License, Apache-2.0.
+Status, draft 0.2.0. License, Apache-2.0.
 
 This document defines a convention for a single GeoParquet file that a web map
 can preview instantly and a SQL engine can read in full, with no duplicated
@@ -60,7 +60,7 @@ major component of `version` is one they do not support.
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "spatial_key": "hilbert",
   "importance": "area_desc",
   "covering": {
@@ -74,9 +74,12 @@ major component of `version` is one they do not support.
   "overview_column": "geom_overview",
   "overview_method": "simplify_snap",
   "levels": [
-    { "level": 0, "row_group_end": 0,  "max_zoom": 8,  "gsd": 0.005 },
-    { "level": 1, "row_group_end": 6,  "max_zoom": 10, "gsd": 0.00125 },
-    { "level": 2, "row_group_end": 22, "max_zoom": 24, "gsd": 0.0 }
+    { "level": 0, "row_group_end": 0,  "max_zoom": 8,  "gsd": 0.005,
+      "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [4096, 428112] },
+    { "level": 1, "row_group_end": 6,  "max_zoom": 10, "gsd": 0.00125,
+      "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [428112, 9532048] },
+    { "level": 2, "row_group_end": 22, "max_zoom": 24, "gsd": 0.0,
+      "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [9532048, 62004224] }
   ]
 }
 ```
@@ -85,7 +88,7 @@ major component of `version` is one they do not support.
 
 | Field | Type | Requirement | Meaning |
 | --- | --- | --- | --- |
-| `version` | string | REQUIRED | The version of this convention the file was written against, `"0.1.0"` for this draft. |
+| `version` | string | REQUIRED | The version of this convention the file was written against, `"0.2.0"` for this draft. |
 | `levels` | array | REQUIRED | One entry per band, sorted ascending by `level`, coarsest first. MUST contain at least one entry. See the level fields below. |
 | `overview_method` | string | REQUIRED | How the reduced level of detail was produced. See the defined values below. |
 | `overview_column` | string | Conditionally REQUIRED | Name of the overview geometry column, `"geom_overview"` in the reference implementation. MUST be present when the file carries an overview geometry column and MUST be absent when it does not. |
@@ -101,6 +104,8 @@ major component of `version` is one they do not support.
 | `row_group_end` | integer | REQUIRED | Index of the last row group belonging to this band, inclusive. The band's rows together with all coarser bands occupy the row-group prefix from 0 through this index. MUST be strictly increasing across levels. |
 | `max_zoom` | integer | REQUIRED | The highest web zoom this band is intended to paint. MUST be strictly increasing across levels. Advisory only, see the zoom model below. |
 | `gsd` | number | REQUIRED | Ground sample distance the band's overview geometry was simplified to, in CRS units per pixel. MUST be 0 on the final level and MUST be greater than 0 on every coarse level. `gsd` is the authoritative resolution signal. |
+| `extent` | array or null | OPTIONAL | Four numbers `[xmin, ymin, xmax, ymax]` in the file's CRS units, the padded extent of the band's own features. MUST be null when the band has no valid geometry. When present it MUST enclose every covering value in the band, including the padding described in the covering section below. |
+| `bytes` | array | OPTIONAL | Two integers `[start, end)`, the file byte offsets spanning this level's own row groups, exclusive of any coarser level's row groups. Because bands are written in band-major order the row-group byte ranges are contiguous across levels, so a reader MAY price and issue a single prefix read for level k as `[levels[0].bytes[0], levels[k].bytes[1])`, without parsing row-group offsets from elsewhere in the footer. |
 
 ### The zoom model
 
@@ -193,28 +198,60 @@ layout is fully determined by `levels[].row_group_end`.
 
 ### The bbox covering column and the Page Index
 
-The file SHOULD carry a physical bounding-box covering column, a struct of
-four doubles, declared in the `covering` object of the primary geometry
-column's `geo` entry. The reference implementation names it `bbox` with
-children `xmin`, `ymin`, `xmax`, and `ymax`.
+This convention defines two writer profiles for row-group and page pruning.
+A writer MUST pick one, and a reader MUST be able to tell which from the file
+alone, by whether the `bbox` column and its `geo` covering entry are present.
 
-An overviews file MUST keep this physical covering column even when the file
-otherwise targets GeoParquet 2.0, which drops the covering in favor of native
-row-group geospatial statistics. Those native statistics exist only at
-row-group granularity. The covering column's Parquet ColumnIndex and
-OffsetIndex are the only mechanism a client has to prune reads below a row
-group, so removing the column removes page-level spatial pruning entirely.
+**Profile A, the covering column.** A writer SHOULD write a physical
+bounding-box covering column, a struct of four doubles, declared in the
+`covering` object of the primary geometry column's `geo` entry. The reference
+implementation names it `bbox` with children `xmin`, `ymin`, `xmax`, and
+`ymax`. A writer SHOULD also write the Parquet Page Index (ColumnIndex and
+OffsetIndex) so that page-level pruning is possible, and SHOULD write column
+statistics for the covering column's leaves so row groups can be pruned from
+the footer alone. Profile A works with or without native Parquet geometry
+types.
 
-A writer SHOULD write the Parquet Page Index (ColumnIndex and OffsetIndex) so
-that page-level pruning is possible, and SHOULD write column statistics for
-the covering column's leaves so row groups can be pruned from the footer
-alone.
+**Profile B, native statistics only.** A writer MAY omit the physical bbox
+covering column and its `geo` covering entry entirely, relying solely on the
+Parquet GEOMETRY logical type's per-row-group GeospatialStatistics for
+row-group pruning. A writer MUST NOT choose Profile B unless both geometry
+columns carry native Parquet GEOMETRY logical types with GeospatialStatistics,
+since there would otherwise be no pruning surface in the file at all.
 
-For a row in a coarse band, the covering value MUST enclose both the exact
-geometry and the row's overview geometry. Grid snapping can move overview
-vertices outward, so the reference implementation pads coarse-band covering
-values by half the snap grid. A reader pruning by covering must never drop a
-feature that the overview still paints.
+Profile B has no page-level pruning of any kind, because the Parquet format
+has no page-level geospatial statistics. Native GeospatialStatistics, like all
+Parquet column statistics, exist only at row-group granularity. A reader that
+needs sub-row-group precision MUST use Profile A.
+
+Under Profile A, for a row in a coarse band, the covering value MUST enclose
+both the exact geometry and the row's overview geometry. Grid snapping can
+move overview vertices outward, so the reference implementation pads
+coarse-band covering values by half the snap grid. A reader pruning by
+covering must never drop a feature that the overview still paints. A level's
+`extent` field carries the same padding, so it too encloses both the exact
+and overview geometry of a coarse band. Under Profile B a reader instead
+relies on the overview column's own native GeospatialStatistics, which are
+computed from the overview geometry actually written and so need no separate
+padding.
+
+## Native Parquet geometry types
+
+A 0.2.0 writer SHOULD write the primary `geometry` column and, when present,
+`geom_overview` as the Parquet GEOMETRY logical type, so that a native reader
+gets per-row-group GeospatialStatistics on both columns for free. This is a
+dual write, not a replacement. The writer MUST still write the `geo` footer
+key at version `"1.1.0"` describing both columns as WKB-encoded geometry
+columns, exactly as required elsewhere in this document. A file conforming to
+this convention is therefore simultaneously a valid GeoParquet 1.1 file and a
+file a GeoParquet 2.0-aware or plain Parquet-geometry-aware reader can use
+natively, without a second copy of any geometry.
+
+Readers MUST NOT require native Parquet geometry types to read a conforming
+file. A reader that does not recognize the GEOMETRY logical type MUST still
+be able to read the column as its WKB binary storage, per ordinary Parquet
+extension-type fallback, and interpret it through the `geo` key exactly as it
+would a plain GeoParquet 1.1 file.
 
 ## Overview geometry semantics per geometry type
 
@@ -299,6 +336,12 @@ Normative requirements on a conforming reader.
 - **SQL engines.** Ignore the `overviews` key entirely and scan the exact
   primary geometry column with ordinary predicate pushdown. The file is a
   valid GeoParquet file with two extra columns and one extra footer key.
+- **Pricing a prefix read up front.** When a level carries `bytes`, a reader
+  can decide whether a level 0 through k prefix read is worth issuing, and
+  issue it as one range request `[levels[0].bytes[0], levels[k].bytes[1])`,
+  before looking at anything but the `overviews` key itself. When a level
+  carries `extent`, a reader can also skip a level entirely when it does not
+  intersect the viewport, without opening the file's row groups at all.
 
 ## Writer behavior
 
@@ -325,14 +368,18 @@ Normative requirements on a conforming writer, beyond the layout section.
 - **GeoParquet 1.1.** The overview column is an ordinary additional geometry
   column, listed in `geo.columns` with WKB encoding, its own recomputed
   `geometry_types`, and the preserved source CRS. The `geo` block is valid
-  GeoParquet 1.1 with or without the `overviews` key. This draft defines the
+  GeoParquet 1.1 with or without the `overviews` key, and stays at version
+  `"1.1.0"` even on a file that also writes native Parquet GEOMETRY logical
+  types, per the native types section above. This draft defines the
   convention for WKB-encoded geometry columns only. Native GeoArrow
-  encodings are out of scope.
+  encodings, distinct from the Parquet GEOMETRY logical type, are out of
+  scope.
 - **GeoParquet 2.0.** The convention is independent of the `geo` version. It
-  requires only a primary geometry column, plus the bbox covering column and
-  the Page Index when sub-row-group pruning is wanted. An overviews file
-  keeps the physical covering column even under GeoParquet 2.0, as required
-  in the covering section above.
+  requires only a primary geometry column, plus, under Profile A, the bbox
+  covering column and the Page Index when sub-row-group pruning is wanted.
+  An overviews file using Profile A keeps the physical covering column even
+  when it also writes native Parquet GEOMETRY logical types, per the profile
+  section above.
 - **Plain Parquet readers.** Everything is additive. A reader that knows
   nothing of `geo` or `overviews` sees a normal Parquet file with a binary
   geometry column, a binary overview column, an int16 `band` column, and a
@@ -347,3 +394,10 @@ Normative requirements on a conforming writer, beyond the layout section.
 - **0.1.0.** Initial draft. Band-major layout, `geom_overview` column,
   `overviews` footer key with `levels`, `importance`, `overview_method`, and
   per-geometry-type overview semantics.
+- **0.2.0.** `overviews.version` bumped to `"0.2.0"`. `levels[]` gained the
+  OPTIONAL `extent` and `bytes` fields. The bbox covering column moved from a
+  MUST to profile language, Profile A writes it, Profile B omits it and
+  relies on native GeospatialStatistics, with no page-level pruning. Added
+  the native Parquet geometry types section describing the dual write of
+  native GEOMETRY logical types alongside the unchanged `geo` version
+  `"1.1.0"`.

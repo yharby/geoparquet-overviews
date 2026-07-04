@@ -6,6 +6,10 @@ const rg = (index: number, xmin: number, xmax: number): RowGroupInfo => ({
   index, rowCount: 100, totalByteSize: 1000, bbox: { xmin, ymin: 0, xmax, ymax: 1 }, band: null,
 });
 
+const rgNoBbox = (index: number): RowGroupInfo => ({
+  index, rowCount: 100, totalByteSize: 1000, bbox: null, band: null,
+});
+
 function baseMeta(over: Partial<GeoParquetMetadata>): GeoParquetMetadata {
   return {
     rowGroups: [rg(0, 0, 1), rg(1, 1, 2), rg(2, 2, 3)],
@@ -27,8 +31,8 @@ describe('detectLayout', () => {
         version: '0.1.0', spatialKey: 'hilbert', overviewColumn: 'geom_overview',
         overviewMethod: 'simplify_snap', importance: 'area_desc',
         levels: [
-          { level: 0, rowGroupEnd: 1, maxZoom: 8, gsd: 0.005 },
-          { level: 1, rowGroupEnd: 2, maxZoom: 24, gsd: 0 },
+          { level: 0, rowGroupEnd: 1, maxZoom: 8, gsd: 0.005, bytes: null, extent: null },
+          { level: 1, rowGroupEnd: 2, maxZoom: 24, gsd: 0, bytes: null, extent: null },
         ],
       },
     });
@@ -53,10 +57,22 @@ describe('detectLayout', () => {
     expect(plan.indices).toEqual([0, 1]); // bbox prune only
   });
 
-  it('reads every row group when a flat file has no covering (V5)', () => {
-    // With no covering there is nothing to prune against, so every row group is
-    // a candidate rather than none, and the strategy reports it is not prunable.
+  it('prunes by the native-stats bbox even without a covering column (Profile B, V5)', () => {
+    // Profile B files have no covering, but readGeoParquetMetadata falls back to
+    // the geometry chunk's native GeospatialStatistics, so rowGroups still carry
+    // a bbox and pruning works identically, and the strategy reports prunable.
     const s = detectLayout(baseMeta({ coveringPaths: null }));
+    expect(s.kind).toBe('flat-wkb');
+    expect(s.prunable).toBe(true);
+    const plan = s.planRead({ xmin: 0.5, ymin: 0, xmax: 1.5, ymax: 1 }, 10);
+    expect(plan.indices).toEqual([0, 1]); // bbox prune still applies
+  });
+
+  it('reads every row group when no row group has any bbox at all', () => {
+    // Neither a covering column nor native geospatial statistics resolved a
+    // bbox, so there is nothing to prune against and every row group is a
+    // candidate, and the strategy reports it is not prunable.
+    const s = detectLayout(baseMeta({ coveringPaths: null, rowGroups: [rgNoBbox(0), rgNoBbox(1), rgNoBbox(2)] }));
     expect(s.kind).toBe('flat-wkb');
     expect(s.prunable).toBe(false);
     const plan = s.planRead({ xmin: 0.5, ymin: 0, xmax: 1.5, ymax: 1 }, 10);

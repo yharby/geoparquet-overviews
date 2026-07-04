@@ -9,6 +9,7 @@ import {
   parseOverviews,
   hasRenderableGeometry,
   attributeColumns,
+  readGeoParquetMetadata,
   type OverviewsInfo,
   type RowGroupInfo,
   type GeoParquetMetadata,
@@ -22,9 +23,9 @@ const INFO: OverviewsInfo = {
   overviewMethod: 'simplify_snap',
   importance: 'area_desc',
   levels: [
-    { level: 0, rowGroupEnd: 19, maxZoom: 8, gsd: 0.005 },
-    { level: 1, rowGroupEnd: 53, maxZoom: 10, gsd: 0.00125 },
-    { level: 2, rowGroupEnd: 80, maxZoom: 24, gsd: 0.0 },
+    { level: 0, rowGroupEnd: 19, maxZoom: 8, gsd: 0.005, bytes: null, extent: null },
+    { level: 1, rowGroupEnd: 53, maxZoom: 10, gsd: 0.00125, bytes: null, extent: null },
+    { level: 2, rowGroupEnd: 80, maxZoom: 24, gsd: 0.0, bytes: null, extent: null },
   ],
 };
 
@@ -86,6 +87,20 @@ describe('parseOverviews', () => {
     expect(parseOverviews(null)).toBeNull();
     expect(parseOverviews({ version: '0.1.0' })).toBeNull();
     expect(parseOverviews({ levels: [] })).toBeNull();
+  });
+
+  it('parses optional level bytes and extent', () => {
+    const info = parseOverviews({
+      version: '0.2.0',
+      levels: [
+        { level: 0, row_group_end: 1, max_zoom: 8, gsd: 100, bytes: [4, 9000], extent: [0, 0, 10, 10] },
+        { level: 1, row_group_end: 5, max_zoom: 22, gsd: 0 },
+      ],
+    });
+    expect(info!.levels[0].bytes).toEqual([4, 9000]);
+    expect(info!.levels[0].extent).toEqual([0, 0, 10, 10]);
+    expect(info!.levels[1].bytes).toBeNull();
+    expect(info!.levels[1].extent).toBeNull();
   });
 });
 
@@ -372,5 +387,108 @@ describe('coarseColumnIntervals', () => {
   it('returns nothing when there is no overview column', () => {
     const flat = { ...meta, overviewsInfo: { ...meta.overviewsInfo!, overviewColumn: null } } as GeoParquetMetadata;
     expect(coarseColumnIntervals(flat)).toEqual([]);
+  });
+});
+
+describe('readGeoParquetMetadata', () => {
+  it('falls back to native geospatial statistics when there is no covering', () => {
+    const meta = {
+      num_rows: 10n,
+      schema: [],
+      key_value_metadata: [
+        { key: 'geo', value: JSON.stringify({ version: '1.1.0', primary_column: 'geometry', columns: { geometry: { encoding: 'WKB' } } }) },
+      ],
+      row_groups: [
+        {
+          num_rows: 10n,
+          total_byte_size: 1000n,
+          columns: [
+            {
+              meta_data: {
+                path_in_schema: ['geometry'],
+                geospatial_statistics: { bbox: { xmin: 1, xmax: 2, ymin: 3, ymax: 4 } },
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = readGeoParquetMetadata(meta as never);
+    expect(parsed.rowGroups[0].bbox).toEqual({ xmin: 1, ymin: 3, xmax: 2, ymax: 4 });
+  });
+
+  it('prefers the geom_overview column native stats over the exact geometry column at coarse zoom', () => {
+    // Profile B, no covering column. The row group is coarse (band 0, per the
+    // overviews footer below), so the viewer paints geom_overview, not
+    // geometry. geom_overview's stats are deliberately the larger box, since
+    // grid snapping can push overview vertices outward past the exact bbox,
+    // and pruning by the tighter exact-geometry box could drop a row group
+    // whose overview still paints (the bug this fallback preference fixes).
+    const meta = {
+      num_rows: 10n,
+      schema: [],
+      key_value_metadata: [
+        { key: 'geo', value: JSON.stringify({ version: '1.1.0', primary_column: 'geometry', columns: { geometry: { encoding: 'WKB' } } }) },
+        {
+          key: 'overviews',
+          value: JSON.stringify({
+            version: '0.2.0',
+            spatial_key: 'hilbert',
+            overview_column: 'geom_overview',
+            levels: [
+              { level: 0, row_group_end: 0, max_zoom: 8, gsd: 0.005 },
+              { level: 1, row_group_end: 1, max_zoom: 24, gsd: 0 },
+            ],
+          }),
+        },
+      ],
+      row_groups: [
+        {
+          num_rows: 10n,
+          total_byte_size: 1000n,
+          columns: [
+            {
+              meta_data: {
+                path_in_schema: ['geometry'],
+                geospatial_statistics: { bbox: { xmin: 1, xmax: 2, ymin: 3, ymax: 4 } },
+              },
+            },
+            {
+              meta_data: {
+                path_in_schema: ['geom_overview'],
+                geospatial_statistics: { bbox: { xmin: 0.5, xmax: 2.5, ymin: 2.5, ymax: 4.5 } },
+              },
+            },
+          ],
+        },
+        {
+          num_rows: 10n,
+          total_byte_size: 1000n,
+          columns: [
+            {
+              meta_data: {
+                path_in_schema: ['geometry'],
+                geospatial_statistics: { bbox: { xmin: 10, xmax: 20, ymin: 30, ymax: 40 } },
+              },
+            },
+            {
+              // The finest band's geom_overview chunk is all null, so pyarrow
+              // still sets geospatial_statistics but with null bounds. This
+              // must be rejected in favor of the exact geometry stats.
+              meta_data: {
+                path_in_schema: ['geom_overview'],
+                geospatial_statistics: { bbox: { xmin: null, xmax: null, ymin: null, ymax: null } as never },
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = readGeoParquetMetadata(meta as never);
+    // Row group 0 (coarse, band 0): the overview column's larger bbox wins.
+    expect(parsed.rowGroups[0].bbox).toEqual({ xmin: 0.5, ymin: 2.5, xmax: 2.5, ymax: 4.5 });
+    // Row group 1 (exact, band 1): geom_overview stats are unusable (null
+    // bounds), so it falls back to the exact geometry column's stats.
+    expect(parsed.rowGroups[1].bbox).toEqual({ xmin: 10, ymin: 30, xmax: 20, ymax: 40 });
   });
 });

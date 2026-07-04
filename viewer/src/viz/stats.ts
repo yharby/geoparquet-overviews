@@ -197,7 +197,7 @@ export class LoadStats extends LitElement {
     const bandsStr =
       f.bands.length > 0
         ? f.bands
-            .map((b) => (b.isExact ? `b${b.level} exact` : `b${b.level}≤z${b.maxZoom}`))
+            .map((b) => (b.isExact ? `L${b.level} exact` : `L${b.level} ≤z${b.maxZoom}`))
             .join('  ')
         : 'no overview pyramid';
     return html`
@@ -216,7 +216,7 @@ export class LoadStats extends LitElement {
           <div class="v">${f.codec} <small>${f.compressionRatio > 0 ? `${f.compressionRatio.toFixed(1)}x` : ''}</small></div>
         </div>
         <div class="ro">
-          <div class="k">Bands</div>
+          <div class="k">Levels</div>
           <div class="v" style="font-size: 12px">${bandsStr}</div>
         </div>
         <div class="ro">
@@ -250,7 +250,7 @@ export class LoadStats extends LitElement {
       <div class="readouts">
         <div class="ro">
           <div class="k">Reading</div>
-          <div class="v" style="font-size: 12px">${reading} ${s.band !== null ? html`<small>band ${s.band}</small>` : ''}</div>
+          <div class="v" style="font-size: 12px">${reading} ${s.band !== null ? html`<small>Level ${s.band}</small>` : ''}</div>
         </div>
         <div class="ro">
           <div class="k">Row groups</div>

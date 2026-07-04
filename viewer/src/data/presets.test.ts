@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_PRESET, initialUrl } from './presets';
+import { DEFAULT_PRESET, initialUrl, initialView } from './presets';
 
 describe('initialUrl', () => {
   it('returns the default preset when there is no url parameter', () => {
@@ -32,5 +32,42 @@ describe('initialUrl', () => {
     expect(initialUrl('?url=javascript:alert(1)')).toBe(DEFAULT_PRESET.url);
     expect(initialUrl('?url=')).toBe(DEFAULT_PRESET.url);
     expect(initialUrl('?url=/local/path.parquet')).toBe(DEFAULT_PRESET.url);
+  });
+});
+
+describe('initialView', () => {
+  it('returns null when any of x, y, z is missing', () => {
+    expect(initialView('')).toBeNull();
+    expect(initialView('?x=10&y=20')).toBeNull();
+    expect(initialView('?x=10&z=5')).toBeNull();
+    expect(initialView('?y=20&z=5')).toBeNull();
+  });
+
+  it('parses x as lng, y as lat, z as zoom when all three are present', () => {
+    expect(initialView('?x=139.77&y=35.68&z=12.5')).toEqual({
+      lng: 139.77,
+      lat: 35.68,
+      zoom: 12.5,
+    });
+  });
+
+  it('reads x, y, z alongside a url parameter', () => {
+    expect(initialView('?url=https://example.com/d.parquet&x=-73.98&y=40.75&z=9')).toEqual({
+      lng: -73.98,
+      lat: 40.75,
+      zoom: 9,
+    });
+  });
+
+  it('returns null for non numeric values', () => {
+    expect(initialView('?x=abc&y=20&z=5')).toBeNull();
+    expect(initialView('?x=10&y=&z=5')).toBeNull();
+  });
+
+  it('returns null when out of range', () => {
+    expect(initialView('?x=200&y=20&z=5')).toBeNull();
+    expect(initialView('?x=10&y=95&z=5')).toBeNull();
+    expect(initialView('?x=10&y=20&z=-1')).toBeNull();
+    expect(initialView('?x=10&y=20&z=40')).toBeNull();
   });
 });
