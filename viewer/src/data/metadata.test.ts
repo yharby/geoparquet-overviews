@@ -9,6 +9,7 @@ import {
   parseOverviews,
   hasRenderableGeometry,
   attributeColumns,
+  readGeoParquetMetadata,
   type OverviewsInfo,
   type RowGroupInfo,
   type GeoParquetMetadata,
@@ -386,5 +387,33 @@ describe('coarseColumnIntervals', () => {
   it('returns nothing when there is no overview column', () => {
     const flat = { ...meta, overviewsInfo: { ...meta.overviewsInfo!, overviewColumn: null } } as GeoParquetMetadata;
     expect(coarseColumnIntervals(flat)).toEqual([]);
+  });
+});
+
+describe('readGeoParquetMetadata', () => {
+  it('falls back to native geospatial statistics when there is no covering', () => {
+    const meta = {
+      num_rows: 10n,
+      schema: [],
+      key_value_metadata: [
+        { key: 'geo', value: JSON.stringify({ version: '1.1.0', primary_column: 'geometry', columns: { geometry: { encoding: 'WKB' } } }) },
+      ],
+      row_groups: [
+        {
+          num_rows: 10n,
+          total_byte_size: 1000n,
+          columns: [
+            {
+              meta_data: {
+                path_in_schema: ['geometry'],
+                geospatial_statistics: { bbox: { xmin: 1, xmax: 2, ymin: 3, ymax: 4 } },
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = readGeoParquetMetadata(meta as never);
+    expect(parsed.rowGroups[0].bbox).toEqual({ xmin: 1, ymin: 3, xmax: 2, ymax: 4 });
   });
 });

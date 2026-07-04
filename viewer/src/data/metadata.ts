@@ -84,10 +84,20 @@ interface RawStatistics {
   max_value?: number;
 }
 
+interface RawGeoStatsBbox {
+  xmin: number;
+  xmax: number;
+  ymin: number;
+  ymax: number;
+}
+
 interface RawColumn {
   meta_data: {
     path_in_schema: string[];
     statistics?: RawStatistics;
+    // Native Parquet GeospatialStatistics (GEOMETRY logical type), the row
+    // group pruning surface for Profile B files with no covering column.
+    geospatial_statistics?: { bbox?: RawGeoStatsBbox };
   };
 }
 
@@ -231,6 +241,25 @@ export function readGeoParquetMetadata(rawMeta: FileMetaData): GeoParquetMetadat
           },
           projection.transform,
         );
+      }
+    }
+    if (!bbox) {
+      // Profile B files (converter --no-bbox) carry no physical covering
+      // column. Fall back to the native GeospatialStatistics on the primary
+      // geometry column chunk, hyparquet exposes it as `geospatial_statistics`
+      // on meta_data. Same reprojection as the covering path so pruning is
+      // identical either way.
+      const primary = (geo?.primary_column as string) ?? 'geometry';
+      const geomChunk = rowGroup.columns.find((c) => pathsEqual(c.meta_data.path_in_schema, [primary]));
+      const gs = geomChunk?.meta_data.geospatial_statistics?.bbox;
+      if (
+        gs &&
+        Number.isFinite(gs.xmin) &&
+        Number.isFinite(gs.ymin) &&
+        Number.isFinite(gs.xmax) &&
+        Number.isFinite(gs.ymax)
+      ) {
+        bbox = reprojectBbox({ xmin: gs.xmin, ymin: gs.ymin, xmax: gs.xmax, ymax: gs.ymax }, projection.transform);
       }
     }
     return {
@@ -488,8 +517,11 @@ export function coarseColumnIntervals(meta: GeoParquetMetadata): Array<[number, 
   return intervals;
 }
 
+// A null bbox means "unknown", not "empty", so it must never be pruned away.
+// Keep any row group whose bbox we could not determine, and prune only the
+// ones we can prove do not intersect the AOI.
 export function rowGroupsIntersecting(rowGroups: RowGroupInfo[], aoi: Bbox): number[] {
-  return rowGroups.filter((rg) => rg.bbox !== null && bboxIntersectsAoi(rg.bbox, aoi)).map((rg) => rg.index);
+  return rowGroups.filter((rg) => rg.bbox === null || bboxIntersectsAoi(rg.bbox, aoi)).map((rg) => rg.index);
 }
 
 // The overview level a web zoom should read. Picks the coarsest level whose
@@ -517,7 +549,7 @@ export function columnForLevel(info: OverviewsInfo, level: OverviewLevel): strin
 // that prefix the bbox covering prunes to the viewport.
 export function rowGroupsForLevel(rowGroups: RowGroupInfo[], level: OverviewLevel, aoi: Bbox): number[] {
   return rowGroups
-    .filter((rg) => rg.index <= level.rowGroupEnd && rg.bbox !== null && bboxIntersectsAoi(rg.bbox, aoi))
+    .filter((rg) => rg.index <= level.rowGroupEnd && (rg.bbox === null || bboxIntersectsAoi(rg.bbox, aoi)))
     .map((rg) => rg.index);
 }
 
