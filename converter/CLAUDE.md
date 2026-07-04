@@ -61,8 +61,11 @@ in order. Footer JSON builders live in `footer.py`, the CLI in `cli.py`.
     increasing. Overview geometry types recomputed via
     `_geometry_type_names_from_wkb`.
 11. Write. `_write`, zstd, `write_page_index=True`, BYTE_STREAM_SPLIT on
-    doubles, dictionary on strings, statistics on everything except the two
-    geometry columns, `sorting_columns` declaring `band`.
+    doubles, dictionary on strings, `sorting_columns` declaring `band`. When
+    native geo types are on (the default), `geometry` and `geom_overview` are
+    extension typed and get statistics too, so pyarrow computes per-row-group
+    GeospatialStatistics on them. With `--no-native-geo` they stay plain WKB
+    and are excluded from statistics like before.
 
 ## Invariants, do not break these
 

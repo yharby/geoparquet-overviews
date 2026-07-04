@@ -699,9 +699,56 @@ def test_native_geo_types_and_stats(tmp_path):
         col = pf.metadata.row_group(rg).column(geom_idx)
         assert col.is_geo_stats_set, f"row group {rg} missing geospatial statistics"
         assert col.geo_statistics is not None
+    # bands=2 produces a coarse band, so a geom_overview column exists, and the
+    # same `_write` stats change applies to it too.
+    overview_idx = [c.path_in_schema for c in
+                     [pf.metadata.row_group(0).column(i) for i in range(pf.metadata.num_columns)]].index(
+        "geom_overview"
+    )
+    for rg in range(pf.metadata.num_row_groups):
+        col = pf.metadata.row_group(rg).column(overview_idx)
+        assert col.is_geo_stats_set, f"row group {rg} geom_overview missing geospatial statistics"
     # The geo key is still there, dual-write.
     kv = pf.metadata.metadata
     assert b"geo" in kv and b"overviews" in kv
+
+
+def test_native_geo_crs_round_trips_and_has_stats(tmp_path):
+    """C6 for native types, a projected CRS on the source column survives onto
+    the geoarrow.wkb extension type of the written `geometry` column, and that
+    column still gets geospatial statistics with the CRS present."""
+    src = tmp_path / "proj.parquet"
+    dst = tmp_path / "out.parquet"
+    rng = np.random.default_rng(3)
+    geoms = []
+    for _ in range(200):
+        cx, cy = rng.uniform(0, 100000, 2)
+        r = rng.uniform(50, 2000)
+        angles = np.linspace(0, 2 * np.pi, 80, endpoint=False)
+        geoms.append(shapely.Polygon(np.column_stack([cx + np.cos(angles) * r, cy + np.sin(angles) * r])))
+    _write_gpq(src, geoms, crs="EPSG:3067")
+
+    convert(str(src), str(dst), ConvertOptions(row_group_mb=0.02))
+    pf = pq.ParquetFile(dst)
+
+    # The written geometry column is extension typed (native GEOMETRY), not
+    # plain binary WKB.
+    geom_type = pf.schema_arrow.field("geometry").type
+    assert isinstance(geom_type, pa.ExtensionType)
+    assert geom_type.extension_name == "geoarrow.wkb"
+
+    # The extension type carries the source CRS, round-tripped through
+    # `with_crs`, not silently dropped or replaced with a default.
+    assert geom_type.crs is not None
+    assert geom_type.crs.__geoarrow_crs_json_values__()["crs"] == "EPSG:3067"
+
+    # Every row group of the primary geometry column has geospatial statistics
+    # with the CRS present, not just when the source is CRS84 default.
+    geom_idx = [c.path_in_schema for c in
+                [pf.metadata.row_group(0).column(i) for i in range(pf.metadata.num_columns)]].index("geometry")
+    for rg in range(pf.metadata.num_row_groups):
+        col = pf.metadata.row_group(rg).column(geom_idx)
+        assert col.is_geo_stats_set, f"row group {rg} missing geospatial statistics"
 
 
 def test_no_native_geo_flag(tmp_path):
