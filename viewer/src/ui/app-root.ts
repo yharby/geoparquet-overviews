@@ -586,9 +586,26 @@ export class AppRoot extends LitElement {
           // these with the exact settled camera.
           this.viewBbox = extent;
           const targetZoom = this.mapView.zoomForBbox(extent);
-          if (targetZoom != null) this.currentZoom = targetZoom;
           this.loading = true;
-          this.mapView.flyToBbox(extent);
+          if (targetZoom != null) {
+            this.currentZoom = targetZoom;
+            this.mapView.flyToBbox(extent);
+          } else {
+            // zoomForBbox goes through the same cameraForBounds as fitBounds, so
+            // a null here means the map has no usable size yet (below ~80px) and
+            // flyToBbox would silently no-op with no moveend, leaving the spinner
+            // stuck on. jumpTo always emits moveend, so snap to the extent centre
+            // instead to drive the opening fetch and clear the spinner. trackResize
+            // refits once the container is sized.
+            const center = {
+              lng: (extent.xmin + extent.xmax) / 2,
+              lat: (extent.ymin + extent.ymax) / 2,
+              zoom: this.mapView.getZoom(),
+            };
+            this.mapView.jumpTo(center);
+            this.viewBbox = this.mapView.getBounds();
+            this.currentZoom = this.mapView.getZoom();
+          }
         }
         if (!proj.geographic) crsNote = ` Reprojected from ${proj.label} to lon/lat.`;
       }
