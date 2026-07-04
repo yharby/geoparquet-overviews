@@ -87,4 +87,42 @@ describe('native GEOMETRY column decode (real hyparquet, real file)', () => {
       expect([0x00, 0x01]).toContain(bytes[0]);
     }
   });
+
+  it('exposes geospatial_statistics.bbox on the real geometry column chunk, the shape metadata.ts assumes', async () => {
+    // metadata.ts's native-stats fallback (readGeoParquetMetadata, the
+    // `if (!bbox)` block) reads `meta_data.geospatial_statistics.bbox` off
+    // hyparquet's parsed column chunk and assumes it has finite
+    // xmin/ymin/xmax/ymax fields. Every other test that shape is checked
+    // against is a hand-built fixture, so nothing proves hyparquet 1.26.2
+    // actually emits that field for a real file. sample.parquet is written
+    // with native geo types on (Profile A), so its `geometry` column carries
+    // real GeospatialStatistics; this test reads it with the unmocked
+    // library and pins the shape.
+    const file = memoryBuffer(readFileSync(SAMPLE_PATH));
+    const metadata = await parquetMetadataAsync(file);
+
+    const rowGroup = metadata.row_groups[0];
+    const geometryColumn = rowGroup.columns.find((c) => c.meta_data?.path_in_schema.join('.') === 'geometry');
+    const geomBbox = geometryColumn?.meta_data?.geospatial_statistics?.bbox;
+    expect(geomBbox).toBeDefined();
+    expect(Number.isFinite(geomBbox!.xmin)).toBe(true);
+    expect(Number.isFinite(geomBbox!.ymin)).toBe(true);
+    expect(Number.isFinite(geomBbox!.xmax)).toBe(true);
+    expect(Number.isFinite(geomBbox!.ymax)).toBe(true);
+    expect(geomBbox!.xmin).toBeLessThanOrEqual(geomBbox!.xmax);
+    expect(geomBbox!.ymin).toBeLessThanOrEqual(geomBbox!.ymax);
+
+    // sample.parquet also carries a geom_overview column (the overviews
+    // convention's coarse-band column). If its chunk in this row group
+    // carries stats too, they must have the same shape.
+    const overviewColumn = rowGroup.columns.find((c) => c.meta_data?.path_in_schema.join('.') === 'geom_overview');
+    const overviewBbox = overviewColumn?.meta_data?.geospatial_statistics?.bbox;
+    if (overviewBbox && Number.isFinite(overviewBbox.xmin)) {
+      expect(Number.isFinite(overviewBbox.ymin)).toBe(true);
+      expect(Number.isFinite(overviewBbox.xmax)).toBe(true);
+      expect(Number.isFinite(overviewBbox.ymax)).toBe(true);
+      expect(overviewBbox.xmin).toBeLessThanOrEqual(overviewBbox.xmax);
+      expect(overviewBbox.ymin).toBeLessThanOrEqual(overviewBbox.ymax);
+    }
+  });
 });
