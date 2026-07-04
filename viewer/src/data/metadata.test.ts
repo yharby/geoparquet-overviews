@@ -22,9 +22,9 @@ const INFO: OverviewsInfo = {
   overviewMethod: 'simplify_snap',
   importance: 'area_desc',
   levels: [
-    { level: 0, rowGroupEnd: 19, maxZoom: 8, gsd: 0.005 },
-    { level: 1, rowGroupEnd: 53, maxZoom: 10, gsd: 0.00125 },
-    { level: 2, rowGroupEnd: 80, maxZoom: 24, gsd: 0.0 },
+    { level: 0, rowGroupEnd: 19, maxZoom: 8, gsd: 0.005, bytes: null, extent: null },
+    { level: 1, rowGroupEnd: 53, maxZoom: 10, gsd: 0.00125, bytes: null, extent: null },
+    { level: 2, rowGroupEnd: 80, maxZoom: 24, gsd: 0.0, bytes: null, extent: null },
   ],
 };
 
@@ -86,6 +86,20 @@ describe('parseOverviews', () => {
     expect(parseOverviews(null)).toBeNull();
     expect(parseOverviews({ version: '0.1.0' })).toBeNull();
     expect(parseOverviews({ levels: [] })).toBeNull();
+  });
+
+  it('parses optional level bytes and extent', () => {
+    const info = parseOverviews({
+      version: '0.2.0',
+      levels: [
+        { level: 0, row_group_end: 1, max_zoom: 8, gsd: 100, bytes: [4, 9000], extent: [0, 0, 10, 10] },
+        { level: 1, row_group_end: 5, max_zoom: 22, gsd: 0 },
+      ],
+    });
+    expect(info!.levels[0].bytes).toEqual([4, 9000]);
+    expect(info!.levels[0].extent).toEqual([0, 0, 10, 10]);
+    expect(info!.levels[1].bytes).toBeNull();
+    expect(info!.levels[1].extent).toBeNull();
   });
 });
 

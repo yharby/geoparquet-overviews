@@ -28,6 +28,10 @@ export interface OverviewLevel {
   rowGroupEnd: number;
   maxZoom: number;
   gsd: number;
+  // Optional 0.2.0 fields. The band's file byte range [start, end) so a reader
+  // can price a prefix read, and its padded extent in CRS units.
+  bytes: [number, number] | null;
+  extent: [number, number, number, number] | null;
 }
 
 export interface OverviewsInfo {
@@ -157,6 +161,14 @@ export function parseOverviews(raw: Record<string, unknown> | null): OverviewsIn
       rowGroupEnd: Number(l.row_group_end),
       maxZoom: Number(l.max_zoom),
       gsd: Number(l.gsd),
+      bytes:
+        Array.isArray(l.bytes) && l.bytes.length === 2
+          ? ([Number(l.bytes[0]), Number(l.bytes[1])] as [number, number])
+          : null,
+      extent:
+        Array.isArray(l.extent) && l.extent.length === 4
+          ? (l.extent.map(Number) as [number, number, number, number])
+          : null,
     }))
     .sort((a, b) => a.level - b.level);
   return {
