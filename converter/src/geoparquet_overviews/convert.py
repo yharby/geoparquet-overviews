@@ -76,6 +76,10 @@ class ConvertOptions:
     # Numeric column that ranks dimension-0 (point) features, descending. When
     # unset, points are ranked by grid thinning instead.
     importance_column: str | None = None
+    # Wrap the WKB columns in the geoarrow.wkb extension type so pyarrow writes
+    # the Parquet native GEOMETRY logical type with automatic per-row-group
+    # geospatial statistics. The `geo` key is still written, dual 1.1 plus 2.0.
+    native_geo: bool = True
 
 
 def _find_geometry_column(schema: pa.Schema) -> str:
@@ -570,6 +574,20 @@ def _bbox_struct(bounds: np.ndarray, valid: np.ndarray | None = None) -> pa.Arra
     )
 
 
+def _wkb_extension_type(native: bool, crs: object, crs_present: bool):
+    """The geoarrow.wkb extension type carrying the source CRS, or None when
+    native types are disabled. pyarrow 21+ converts this to the Parquet
+    GEOMETRY logical type and computes GeospatialStatistics on write."""
+    if not native:
+        return None
+    import geoarrow.pyarrow as ga
+
+    gtype = ga.wkb()
+    if crs_present and crs is not None:
+        gtype = gtype.with_crs(json.dumps(crs) if isinstance(crs, dict) else str(crs))
+    return gtype
+
+
 def _validate_options(opts: ConvertOptions) -> None:
     """Fail fast on option combinations that would otherwise crash deep in the
     pipeline or silently produce a broken layout."""
@@ -773,11 +791,17 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     bounds[coarse, 2] += pad
     bounds[coarse, 3] += pad
 
-    table = table.append_column("geometry", pa.array(geom_wkb, type=pa.binary()))
+    gtype = _wkb_extension_type(opts.native_geo, crs if crs_present else None, crs_present)
+
+    def _geom_array(values: np.ndarray) -> pa.Array:
+        storage = pa.array(values, type=pa.binary())
+        return gtype.wrap_array(storage) if gtype is not None else storage
+
+    table = table.append_column("geometry", _geom_array(geom_wkb))
     table = table.append_column("bbox", _bbox_struct(bounds, valid))
     table = table.append_column("band", pa.array(band, type=pa.int16()))
     if has_overview:
-        table = table.append_column("geom_overview", pa.array(overview_wkb, type=pa.binary()))
+        table = table.append_column("geom_overview", _geom_array(overview_wkb))
 
     levels = []
     prev_zoom = -1
@@ -904,8 +928,16 @@ def _write(table: pa.Table, dst: str, plan: list[int], kv: dict[str, str], opts:
         or pa.types.is_large_string(table.schema.field(n).type)
     ]
     # `bbox` is a struct parent, statistics are meaningful only on its four
-    # leaves (added via bbox_doubles), so exclude the parent name itself.
-    stats_cols = [n for n in names if n not in ("geometry", "geom_overview", "bbox")] + bbox_doubles
+    # leaves (added via bbox_doubles), so exclude the parent name itself. When
+    # the geometry columns are extension typed, include them here too, since
+    # geospatial statistics are only computed when the writer computes
+    # statistics for the column.
+    geo_native = any(
+        isinstance(table.schema.field(n).type, pa.ExtensionType)
+        for n in ("geometry", "geom_overview") if n in names
+    )
+    excluded = ("bbox",) if geo_native else ("geometry", "geom_overview", "bbox")
+    stats_cols = [n for n in names if n not in excluded] + bbox_doubles
     # Resolve `band` to its physical leaf index. The `bbox` struct flattens into
     # four leaves, so a top-level column index would point at the wrong column.
     sorting = (

@@ -10,6 +10,7 @@ dependencies = [
     "shapely>=2.1.2",
     "numpy>=2.5.0",
     "click>=8.4.2",
+    "geoarrow-pyarrow>=0.2",
 ]
 
 [project.scripts]

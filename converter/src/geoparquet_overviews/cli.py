@@ -68,6 +68,12 @@ def main() -> None:
     type=str,
     help="Numeric column that ranks point features, largest first. Points are ranked by grid thinning when unset.",
 )
+@click.option(
+    "--native-geo/--no-native-geo",
+    default=True,
+    show_default=True,
+    help="Write Parquet native GEOMETRY logical types with per-row-group geospatial statistics, alongside the geo key (dual GeoParquet 1.1 plus 2.0).",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Verbose (DEBUG) logging.")
 @click.option("-q", "--quiet", is_flag=True, help="Only print the JSON summary, no stage logs.")
 def convert_cmd(
@@ -80,6 +86,7 @@ def convert_cmd(
     compression_level: int,
     page_size_kb: int,
     importance_column: str | None,
+    native_geo: bool,
     verbose: bool,
     quiet: bool,
 ) -> None:
@@ -94,6 +101,7 @@ def convert_cmd(
         compression_level=compression_level,
         page_size_kb=page_size_kb,
         importance_column=importance_column,
+        native_geo=native_geo,
     )
     summary = convert(src, dst, opts)
     click.echo(json.dumps(summary, indent=2))

@@ -673,3 +673,41 @@ def test_reconvert_overview_has_no_covering(tmp_path):
     geo_twice = json.loads(pq.read_metadata(twice).metadata[b"geo"])
     assert "covering" in geo_twice["columns"]["geometry"]
     assert "covering" not in geo_twice["columns"]["geom_overview"]
+
+
+def _poly_table(n=40):
+    import shapely
+
+    geoms = [shapely.box(i % 8, i // 8, i % 8 + 0.9, i // 8 + 0.9) for i in range(n)]
+    wkb = [shapely.to_wkb(g) for g in geoms]
+    return pa.table({"name": [f"f{i}" for i in range(n)], "geometry": pa.array(wkb, type=pa.binary())})
+
+
+def test_native_geo_types_and_stats(tmp_path):
+    src = tmp_path / "src.parquet"
+    dst = tmp_path / "dst.parquet"
+    pq.write_table(_poly_table(), src)
+    convert(str(src), str(dst), ConvertOptions(bands=2))
+    pf = pq.ParquetFile(dst)
+    # The geometry columns carry the Parquet GEOMETRY logical type.
+    schema = pf.schema_arrow
+    assert "geoarrow.wkb" in str(schema.field("geometry").type)
+    # Every row group chunk of the primary geometry column has geospatial statistics.
+    geom_idx = [c.path_in_schema for c in
+                [pf.metadata.row_group(0).column(i) for i in range(pf.metadata.num_columns)]].index("geometry")
+    for rg in range(pf.metadata.num_row_groups):
+        col = pf.metadata.row_group(rg).column(geom_idx)
+        assert col.is_geo_stats_set, f"row group {rg} missing geospatial statistics"
+        assert col.geo_statistics is not None
+    # The geo key is still there, dual-write.
+    kv = pf.metadata.metadata
+    assert b"geo" in kv and b"overviews" in kv
+
+
+def test_no_native_geo_flag(tmp_path):
+    src = tmp_path / "src.parquet"
+    dst = tmp_path / "dst.parquet"
+    pq.write_table(_poly_table(), src)
+    convert(str(src), str(dst), ConvertOptions(bands=2, native_geo=False))
+    pf = pq.ParquetFile(dst)
+    assert str(pf.schema_arrow.field("geometry").type) == "binary"
