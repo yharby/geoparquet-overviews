@@ -408,7 +408,7 @@ export class AppRoot extends LitElement {
     const probe = this.viewBbox ?? { xmin: 0, ymin: 0, xmax: 0, ymax: 0 };
     const plan = this.strategy!.planRead(probe, this.currentZoom);
     const isOverview = plan.column !== 'geometry';
-    const bandName = isOverview ? 'overview' : 'exact';
+    const roleName = isOverview ? 'overview' : 'exact';
     const range = this.zoomRange();
     return html`
       <span class="sep"></span>
@@ -422,7 +422,7 @@ export class AppRoot extends LitElement {
         .value=${String(this.currentZoom)}
         @input=${this.onZoomSlider}
       />
-      <span class="zoom-read ${isOverview ? 'overview' : 'exact'}">z${this.currentZoom.toFixed(1)} · ${bandName}</span>
+      <span class="zoom-read ${isOverview ? 'overview' : 'exact'}">z${this.currentZoom.toFixed(1)} · ${roleName}</span>
     `;
   }
 
@@ -619,7 +619,7 @@ export class AppRoot extends LitElement {
       // Allow an immediate retry of the same view once data comes into range.
       this.lastFetchKey = null;
       this.status = prunable
-        ? 'No row groups intersect this area. Try a larger or different area.'
+        ? 'No row groups intersect this view. Try zooming out or panning.'
         : 'This file has no covering bbox, so pruning is unavailable, and it has no row groups to read.';
       return;
     }
@@ -668,7 +668,7 @@ export class AppRoot extends LitElement {
       this.flushVizNow(token);
       this.loading = false;
       this.lastFetchKey = null;
-      this.status = 'No data pages intersect this area. Try a larger or different area.';
+      this.status = 'No data pages intersect this view. Try zooming out or panning.';
       setActiveUrl(null);
       return;
     }

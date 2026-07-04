@@ -137,7 +137,7 @@ export class VizWaterfall extends LitElement {
     if (events.length === 0) {
       return html`<div class="panel">
         <div class="panel-head"><span class="n">◆</span><h2>Read path</h2></div>
-        <div class="empty">No requests yet. Load a file and fetch an area.</div>
+        <div class="empty">No requests yet. Load a file and pan or zoom to fetch.</div>
       </div>`;
     }
     // Anchor to the oldest event still retained, not the session's original
