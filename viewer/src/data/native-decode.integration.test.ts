@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { parquetMetadataAsync, parquetRead, type AsyncBuffer, type ParquetParsers } from 'hyparquet';
+import { parquetMetadataAsync, parquetRead, type AsyncBuffer } from 'hyparquet';
 import { compressors } from 'hyparquet-compressors';
+import { RAW_WKB_PARSERS } from './rowgroups';
 
 // This test deliberately does NOT mock hyparquet (contrast every other test in
 // this suite, e.g. rowgroups.test.ts). Every other test proves the viewer's
@@ -20,14 +21,8 @@ import { compressors } from 'hyparquet-compressors';
 // test builds the AsyncBuffer with hyparquet's own asyncBufferFromFile (a
 // legitimate, non-browser-only hyparquet API for local files) and then calls
 // parquetRead with the exact same options rowgroups.ts uses: the column
-// name, `compressors`, `utf8: false`, and a `parsers` override. RAW_WKB_PARSERS
-// itself is not exported from rowgroups.ts (and this task must not add
-// production-code changes to export it), so the identity override below is
-// replicated verbatim from rowgroups.ts to pin the same contract.
-const RAW_WKB_PARSERS = {
-  geometryFromBytes: (bytes: Uint8Array) => bytes,
-  geographyFromBytes: (bytes: Uint8Array) => bytes,
-} as unknown as ParquetParsers;
+// name, `compressors`, `utf8: false`, and the real RAW_WKB_PARSERS parser
+// override from production code.
 
 const SAMPLE_PATH = fileURLToPath(new URL('../../public/sample.parquet', import.meta.url));
 
