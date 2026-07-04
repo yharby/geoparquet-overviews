@@ -299,6 +299,20 @@ def test_reconvert_is_idempotent(tmp_path):
     assert Counter(a.column("geometry").to_pylist()) == Counter(b.column("geometry").to_pylist())
 
 
+def test_reconvert_native_output_is_idempotent(tmp_path):
+    """Re-converting a 0.2.0 output with extension-typed geometry columns
+    must not break the read/decode stage, and must reproduce the same bytes."""
+    src = tmp_path / "src.parquet"
+    once = tmp_path / "once.parquet"
+    twice = tmp_path / "twice.parquet"
+    pq.write_table(_poly_table(), src)
+    convert(str(src), str(once), ConvertOptions(bands=2))
+    convert(str(once), str(twice), ConvertOptions(bands=2))
+    a, b = pq.read_table(once), pq.read_table(twice)
+    assert a.column_names == b.column_names
+    assert a.column("geometry").combine_chunks() == b.column("geometry").combine_chunks()
+
+
 def test_sorting_columns_declares_band_leaf(tmp_path):
     """C4, sorting_columns points at the physical `band` leaf, not a bbox leaf."""
     src = tmp_path / "plain.parquet"
