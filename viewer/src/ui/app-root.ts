@@ -24,7 +24,7 @@ import { readColumnProgressive, getFileForUrl, type RowGroupRange } from '../dat
 import type { SchemaElement } from 'hyparquet';
 import { readRowAttributes } from '../data/feature-detail';
 import { featureLoadingHtml, featureAttributesHtml, featureErrorHtml } from './feature-popup';
-import type { PickingInfo } from '@deck.gl/core';
+import type { Layer, PickingInfo } from '@deck.gl/core';
 import { pageRangesForRowGroup, mergePageRanges } from '../data/pageindex';
 import { getPageRangeMemo, getFlatCache, isFilePrefetched } from '../data/file-cache';
 import { detectLayout, type LayoutStrategy } from '../data/layout';
@@ -121,6 +121,10 @@ export class AppRoot extends LitElement {
   // resolves to the same signature leaves the layers untouched.
   private renderedPlanSig: string | null = null;
   private renderedUrl: string | null = null;
+  // Built merged layer sets keyed by plan signature, so panning back to a prior
+  // large view reuses the same Layer objects by reference and deck.gl skips the
+  // GPU re-upload. Bounded, dropped on file switch.
+  private mergedLayerCache = new Map<string, Layer[]>();
   // The flattened buckets currently on the map, keyed by the layer-set id prefix
   // (`rg-batch-N` during progressive load, `rg-merged` once settled). A click
   // resolves `info.layer.id` to a prefix and a geometry kind, then reads the
@@ -526,6 +530,7 @@ export class AppRoot extends LitElement {
     this.lastFetchKey = null;
     this.renderedPlanSig = null;
     this.renderedUrl = null;
+    this.mergedLayerCache.clear();
     this.summary = null;
     this.fileFacts = null;
     this.busy = true;
@@ -916,8 +921,18 @@ export class AppRoot extends LitElement {
         // The merged layers are built first, then swapped in with a single
         // setLayers, so there is no frame where the map is empty.
         const merged = mergeFlatGeometries(batches);
+        let layers = this.mergedLayerCache.get(sig);
+        if (!layers) {
+          layers = buildLayers('rg-merged', merged);
+          this.mergedLayerCache.set(sig, layers);
+          // Bound the cache to a small recent window.
+          if (this.mergedLayerCache.size > 6) {
+            const oldest = this.mergedLayerCache.keys().next().value as string;
+            this.mergedLayerCache.delete(oldest);
+          }
+        }
         timeWork('gpu-upload', `${features.toLocaleString('en-US')} merged`, () =>
-          this.mapView!.setLayers(buildLayers('rg-merged', merged)),
+          this.mapView!.setLayers(layers!),
         );
         // The per-batch layers are gone, so their pick provenance is too.
         // Register the merged buckets under the merged id the new layers carry.
