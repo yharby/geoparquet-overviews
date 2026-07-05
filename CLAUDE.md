@@ -107,8 +107,18 @@ pnpm dev                                            # vite, port 5173+
   buckets are LRU-cached per row group (`data/flat-cache.ts`), and each settled
   view consolidates to single-digit deck.gl layers. Holed polygon fills must
   keep `positionFormat 'XY'` (deck.gl 9.3.6 binary fill ignores vertexValid,
-  see viewer/CLAUDE.md). Remaining open, worker decode, also tracked in
-  viewer/CLAUDE.md.
+  see viewer/CLAUDE.md).
+- Viewer decode runs off the main thread. WKB parsing and the proj4
+  reprojection, the CPU-bound half of the read path, run in a dedicated decode
+  worker (`geo/decode-worker.ts`), so a load no longer freezes map pan and
+  zoom. Input WKB is copied into one fresh buffer and transferred (the reader's
+  own views alias the byte cache, so they cannot be transferred), the worker's
+  fresh flat buffers transfer back, and the transform closure is rebuilt in the
+  worker from a serializable spec. Cancellation stays cooperative on the main
+  thread, and with no Worker the client falls back to inline decode. A
+  country-wide EPSG:3067 Finland load decodes all 32 batches in the worker and
+  blocks the main thread only ~73ms total. A worker pool for parallel decode
+  is a possible follow-up, tracked in viewer/CLAUDE.md.
 
 ## Hosted test data and its layout
 

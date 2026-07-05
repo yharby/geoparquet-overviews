@@ -1,5 +1,5 @@
 import type { CoordTransform } from './crs';
-import { FlatBuilders, finalizeBuckets, type FlatGeometries } from './geojson';
+import { FlatBuilders, finalizeBuckets, flattenGeoJson, type FlatGeometries } from './geojson';
 
 // A DataView-based WKB scanner. It consumes the array of raw WKB values hyparquet
 // yields when its geometry parser is overridden to identity (see rowgroups.ts),
@@ -208,4 +208,24 @@ export function flattenWkb(
     readGeometry(new WkbCursor(view), b);
   }
   return finalizeBuckets(b, transform);
+}
+
+// Decode a batch of geometry values into flat buckets, choosing the scanner by
+// what the reader handed over. With hyparquet's parser overridden to identity the
+// values arrive as raw WKB Uint8Arrays, so the zero-copy scanner runs; the GeoJSON
+// flattener stays as a fallback for any already-decoded object (belt and braces
+// during the transition). The probe skips leading nulls, which the finest band's
+// null geom_overview yields. Shared by the read path (layout.ts), the decode
+// worker, and the worker's main-thread fallback so all three decode identically.
+export function decodeFlat(
+  values: unknown[],
+  transform?: CoordTransform | null,
+  rows?: ArrayLike<number>,
+): FlatGeometries {
+  for (const v of values) {
+    if (v == null) continue;
+    if (v instanceof Uint8Array) return flattenWkb(values, transform, rows);
+    return flattenGeoJson(values, transform, rows);
+  }
+  return flattenWkb(values, transform, rows);
 }

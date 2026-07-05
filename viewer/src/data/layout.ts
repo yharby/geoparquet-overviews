@@ -1,7 +1,6 @@
 import type { Bbox } from '../geo/aoi';
-import { flattenGeoJson, type FlatGeometries } from '../geo/geojson';
-import { flattenWkb } from '../geo/wkb-flatten';
-import type { CoordTransform } from '../geo/crs';
+import type { FlatGeometries } from '../geo/geojson';
+import { decodeFlat } from '../geo/wkb-flatten';
 import {
   levelForZoom,
   columnForLevel,
@@ -30,24 +29,6 @@ export interface ReadPlan {
   // `rows` is the parallel absolute-parquet-row of each raw value, carried
   // through so a picked geometry resolves to its source row for the click popup.
   decode: (rawValues: unknown[], rows?: ArrayLike<number>) => FlatGeometries;
-}
-
-// Decode a batch of geometry values into flat buckets. With hyparquet's parser
-// overridden to identity the values arrive as raw WKB Uint8Arrays, so the
-// zero-copy scanner runs; the GeoJSON flattener is kept as a fallback in case any
-// value is already a decoded object (belt and braces during the transition). The
-// probe skips leading nulls, which the finest band's null geom_overview yields.
-function decodeGeometries(
-  values: unknown[],
-  transform: CoordTransform | null,
-  rows?: ArrayLike<number>,
-): FlatGeometries {
-  for (const v of values) {
-    if (v == null) continue;
-    if (v instanceof Uint8Array) return flattenWkb(values, transform, rows);
-    return flattenGeoJson(values, transform, rows);
-  }
-  return flattenWkb(values, transform, rows);
 }
 
 export interface LayoutStrategy {
@@ -82,7 +63,7 @@ function flatStrategy(metadata: GeoParquetMetadata): LayoutStrategy {
       column: 'geometry',
       lodKey: 'flat',
       band: null,
-      decode: (geometries, rows) => decodeGeometries(geometries, transform, rows),
+      decode: (geometries, rows) => decodeFlat(geometries, transform, rows),
     }),
   };
 }
@@ -103,7 +84,7 @@ function overviewsStrategy(metadata: GeoParquetMetadata): LayoutStrategy {
         column,
         lodKey: `L${level.level}:${column}`,
         band: level.level,
-        decode: (geometries, rows) => decodeGeometries(geometries, transform, rows),
+        decode: (geometries, rows) => decodeFlat(geometries, transform, rows),
       };
     },
   };

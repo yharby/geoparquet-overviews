@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseCrs, reprojectBbox } from './crs';
+import { parseCrs, reprojectBbox, crsTransformSpec, buildTransformFromSpec } from './crs';
 
 // A PROJJSON-ish stub for a projected CRS, only the fields parseCrs reads.
 const projected = (code: number) => ({
@@ -99,6 +99,43 @@ describe('parseCrs', () => {
     expect(c.geographic).toBe(false);
     expect(c.epsg).toBe(3067);
     expect(c.supported).toBe(true);
+  });
+});
+
+// The decode worker rebuilds the reprojection from a serializable spec, since the
+// transform closure cannot cross postMessage. A spec-built transform must match
+// the closure parseCrs produced, or the worker would reproject differently.
+describe('crsTransformSpec / buildTransformFromSpec', () => {
+  it('yields a null spec and null transform for geographic data', () => {
+    const spec = crsTransformSpec(parseCrs(geographic));
+    expect(spec).toBeNull();
+    expect(buildTransformFromSpec(spec)).toBeNull();
+  });
+
+  it('round-trips a locally-registered code (EPSG:3067) to the same transform', () => {
+    const info = parseCrs(projected(3067));
+    const spec = crsTransformSpec(info);
+    expect(spec).toEqual({ name: 'EPSG:3067', def: expect.stringContaining('+proj=utm') });
+    const rebuilt = buildTransformFromSpec(spec)!;
+    const [lon, lat] = rebuilt(385000, 6672000);
+    const [lon0, lat0] = info.transform!(385000, 6672000);
+    expect(lon).toBeCloseTo(lon0, 9);
+    expect(lat).toBeCloseTo(lat0, 9);
+  });
+
+  it('round-trips a proj4 built-in (EPSG:3857) with a null def', () => {
+    const info = parseCrs(projected(3857));
+    const spec = crsTransformSpec(info);
+    expect(spec).toEqual({ name: 'EPSG:3857', def: null });
+    const rebuilt = buildTransformFromSpec(spec)!;
+    const [lon, lat] = rebuilt(2000000, 8000000);
+    const [lon0, lat0] = info.transform!(2000000, 8000000);
+    expect(lon).toBeCloseTo(lon0, 9);
+    expect(lat).toBeCloseTo(lat0, 9);
+  });
+
+  it('yields a null spec for an unsupported CRS (never reprojected)', () => {
+    expect(crsTransformSpec(parseCrs(projected(999999)))).toBeNull();
   });
 });
 

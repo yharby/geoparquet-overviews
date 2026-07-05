@@ -80,6 +80,34 @@ function projected(epsg: number, label: string): CrsInfo {
   return { geographic: false, epsg, supported: true, transform, label };
 }
 
+// A serializable description of a reprojection, so the decode worker can rebuild
+// the same proj4 transform the main thread uses without receiving the transform
+// closure (functions do not survive postMessage). Null means no reprojection
+// (geographic data, identity). `def` is the proj4 definition string for codes the
+// viewer registers itself, or null for a code proj4 already ships built in (for
+// example EPSG:3857), which resolves by name alone.
+export type TransformSpec = { name: string; def: string | null } | null;
+
+// Derive the serializable spec from a parsed CrsInfo. Geographic or unsupported
+// (transform-less) CRSes yield null, so the worker skips reprojection. A
+// supported projected CRS always carries an epsg (see `projected`), so the spec
+// names it and includes any local def the worker must register first.
+export function crsTransformSpec(info: CrsInfo): TransformSpec {
+  if (!info.transform || info.epsg == null) return null;
+  return { name: `EPSG:${info.epsg}`, def: PROJ_DEFS[info.epsg] ?? null };
+}
+
+// Rebuild a CoordTransform from a spec, registering the def when the code is not
+// a proj4 built-in. Returns null when the spec is null or the code cannot be
+// resolved (a case the read path never reaches, since unsupported CRSes are
+// never fetched), so the caller simply skips reprojection rather than throwing.
+export function buildTransformFromSpec(spec: TransformSpec): CoordTransform | null {
+  if (!spec) return null;
+  if (spec.def) proj4.defs(spec.name, spec.def);
+  if (!proj4.defs(spec.name)) return null;
+  return (x, y) => proj4(spec.name, 'EPSG:4326', [x, y]) as [number, number];
+}
+
 // Interpret the `crs` on the primary geometry column. An absent or null crs is
 // the CRS84 lon/lat default per the spec.
 export function parseCrs(geo: Record<string, unknown> | null): CrsInfo {

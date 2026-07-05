@@ -32,6 +32,8 @@ import { initialUrl, initialView, type CameraView } from '../data/presets';
 import { MapView } from '../map/map-view';
 import { buildLayers } from '../map/polygon-layer';
 import { vertexCount, mergeFlatGeometries, type FlatGeometries } from '../geo/geojson';
+import { decodeBatch } from '../geo/decode-client';
+import { crsTransformSpec } from '../geo/crs';
 import type { LayoutHeatmap } from '../viz/layout-heatmap';
 import type { VizWaterfall } from '../viz/waterfall';
 import type { LoadStats, LoadSummary } from '../viz/stats';
@@ -752,6 +754,11 @@ export class AppRoot extends LitElement {
     // though it owns the whole prefix and reads groups that span several levels.
     const viewBand = plan.band;
 
+    // The serializable reprojection spec for the decode worker. The worker cannot
+    // receive plan.decode's transform closure, so it rebuilds an equivalent one
+    // from this; plan.decode still serves the main-thread fallback unchanged.
+    const transformSpec = crsTransformSpec(metadata.projection);
+
     const tStart = performance.now();
     let features = 0;
     let vertices = 0;
@@ -857,21 +864,30 @@ export class AppRoot extends LitElement {
         // so a fast pan or zoom abandons the stale read instead of waiting it out.
         if (token !== this.fetchToken) return;
 
+        // Decode off the main thread so parsing WKB and reprojecting every vertex
+        // does not freeze map pan and zoom. plan.decode is the synchronous
+        // fallback used when no worker is available. tDecode spans the whole round
+        // trip (pack, transfer, worker decode, reply), which is the wall time the
+        // read-cost panel and waterfall should attribute to decode.
         const tDecode = performance.now();
-        const flat = timeWork('wkb-decode', `${geometries.length} geometries`, () => plan.decode(geometries, rows));
+        const flat = await decodeBatch(geometries, rows, transformSpec, plan.decode);
+        emitEvent({ kind: 'work', phase: 'wkb-decode', label: `${geometries.length} geometries`, t0: tDecode, t1: performance.now() });
         decodeMs += performance.now() - tDecode;
 
         // Cache the per-group decode before merging, so a repeat view reuses it.
         // Merging is per view, caching is per group, so the merged result is not
-        // cached.
+        // cached. Caching a correct decode is safe even if this view was
+        // superseded while the worker ran; the paint below is what must not run.
         const range = uncachedByIndex.get(batchIndices[0]);
         if (range) flatCache.set(cacheKey(range), { flat, features: geometries.length });
 
+        // Re-check after awaiting the worker: a pan or zoom may have superseded
+        // this view mid-decode, so drop the paint (the buckets stay cached above).
+        if (token !== this.fetchToken) return;
         paintBatch(flat, geometries.length, batchIndices);
 
-        // Yield a macrotask between row groups so the decode burst after a gesture
-        // cannot block the main thread for the whole read. Cancellation is checked
-        // at the next boundary by shouldStop below.
+        // Yield a macrotask between row groups so the read loop cannot starve the
+        // main thread. Cancellation is checked at the next boundary by shouldStop.
         await new Promise((resolve) => setTimeout(resolve, 0));
         },
         () => token !== this.fetchToken,
