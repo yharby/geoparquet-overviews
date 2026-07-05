@@ -144,6 +144,10 @@ uv run pytest
 ## Known limitations
 
 - The whole table is read into memory. Fine for tens of millions of features,
-  a few GB, but this is not a streaming converter.
+  a few GB, but this is not a streaming converter. The RAM footprint, not
+  Arrow's 2 GB binary offset, is the ceiling now. A WKB geometry column past
+  2 GB is handled, decoded chunk by chunk and written as `large_binary` when
+  it would overflow, so a whole-country file converts as one file.
 - The default zstd level 15 write is slow and small on disk. Pass a lower
-  `--compression-level` for faster conversions.
+  `--compression-level` for faster conversions. The overview build, the other
+  slow stage, threads over `--jobs` workers by default.

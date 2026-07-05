@@ -95,6 +95,18 @@ pnpm dev                                            # vite, port 5173+
   Index as before, Profile B (`--no-bbox`) omits them and relies solely on
   native GeospatialStatistics for row-group pruning, with no page-level
   pruning at all since Parquet has no page-level geospatial statistics.
+- Converter handles WKB geometry columns past 2 GB. Arrow's `binary` type
+  caps a contiguous array at 2 GB via its int32 offsets, so a whole-country
+  file used to crash with an offset overflow. It now decodes the column chunk
+  by chunk on read and, on write, switches the geometry column to
+  `large_binary` (paired with `ga.large_wkb()`) once the payload would
+  overflow, both physical `BYTE_ARRAY` in Parquet so readers are unaffected.
+  Small files stay on plain `binary` unchanged. See `converter/CLAUDE.md`.
+- Converter threads the overview build, its slowest stage, over `--jobs`
+  workers (default one per core). shapely 2.x releases the GIL on `simplify`,
+  `make_valid`, and `set_precision`, so threads parallelize them nearly
+  linearly with byte-identical output. Read and write already thread inside
+  pyarrow, and the WKB IO ops hold the GIL so they stay single-threaded.
 - Viewer supports click-to-inspect. Each rendered primitive carries a
   per-primitive `rowIds` provenance array back to its absolute parquet row,
   so a click resolves the feature, reads only that row's non-geometry columns
