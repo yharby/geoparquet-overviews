@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { installFetchInstrumentation, setActiveUrl, resetFetchInstrumentationForTests } from './phase';
+import {
+  installFetchInstrumentation,
+  setActiveUrl,
+  resetFetchInstrumentationForTests,
+  fetchWithRetry,
+} from './phase';
 import { onEvent, type ViewerEvent } from './events';
 
 const URL = 'https://example.test/file.parquet';
@@ -84,4 +89,68 @@ test('requests to a non-active URL are ignored', async () => {
   await globalThis.fetch('https://other.test/tile.png', { headers: { Range: 'bytes=0-1233' } });
 
   expect(events).toHaveLength(0);
+});
+
+// --- fetchWithRetry: transient-failure retry for the range-read path ---
+
+// No backoff wait in tests, so the retry loop runs fast. A real body so the
+// retry branch also exercises response.body.cancel() on the dropped response.
+const noWait = { delayForAttempt: () => 0 };
+function res(status: number): Response {
+  return new Response('x', { status });
+}
+
+test('returns the first response and does not retry a success', async () => {
+  const doFetch = vi.fn().mockResolvedValue(res(206));
+  const out = await fetchWithRetry(doFetch, noWait);
+  expect(out.status).toBe(206);
+  expect(doFetch).toHaveBeenCalledTimes(1);
+});
+
+test('does not retry a non-transient error status', async () => {
+  const doFetch = vi.fn().mockResolvedValue(res(404));
+  const out = await fetchWithRetry(doFetch, noWait);
+  expect(out.status).toBe(404);
+  expect(doFetch).toHaveBeenCalledTimes(1);
+});
+
+test('retries a transient 503 then returns the eventual success', async () => {
+  const doFetch = vi.fn().mockResolvedValueOnce(res(503)).mockResolvedValueOnce(res(206));
+  const out = await fetchWithRetry(doFetch, noWait);
+  expect(out.status).toBe(206);
+  expect(doFetch).toHaveBeenCalledTimes(2);
+});
+
+// A cross-origin 5xx arrives without a CORS header, so the browser rejects the
+// fetch as a TypeError rather than surfacing the status. That path must retry too.
+test('retries a thrown network/CORS rejection then succeeds', async () => {
+  const doFetch = vi
+    .fn()
+    .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    .mockResolvedValueOnce(res(206));
+  const out = await fetchWithRetry(doFetch, noWait);
+  expect(out.status).toBe(206);
+  expect(doFetch).toHaveBeenCalledTimes(2);
+});
+
+test('gives up after the attempt budget and returns the last transient response', async () => {
+  const doFetch = vi.fn().mockResolvedValue(res(500));
+  const out = await fetchWithRetry(doFetch, { ...noWait, attempts: 3 });
+  expect(out.status).toBe(500);
+  expect(doFetch).toHaveBeenCalledTimes(3);
+});
+
+test('gives up after the attempt budget and rethrows a persistent rejection', async () => {
+  const doFetch = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
+  await expect(fetchWithRetry(doFetch, { ...noWait, attempts: 3 })).rejects.toThrow('Failed to fetch');
+  expect(doFetch).toHaveBeenCalledTimes(3);
+});
+
+// A non-idempotent request must never be replayed, or a retry could double a
+// side effect. The app only issues GETs, but the guard keeps that contract.
+test('never retries a non-idempotent request, even on a transient status', async () => {
+  const doFetch = vi.fn().mockResolvedValue(res(503));
+  const out = await fetchWithRetry(doFetch, { ...noWait, idempotent: false });
+  expect(out.status).toBe(503);
+  expect(doFetch).toHaveBeenCalledTimes(1);
 });

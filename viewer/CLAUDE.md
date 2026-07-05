@@ -66,6 +66,13 @@ Node >= 24, pnpm 11.9.0.
   `parquetRead` with `onChunk` and an identity geometry parser
   (`RAW_WKB_PARSERS`), so geometry arrives as zero-copy WKB Uint8Array views.
   Up to 16 groups read concurrently, onBatch paints strictly serially.
+- `src/core/phase.ts` wraps the global `fetch` for byte instrumentation and
+  retries transient failures (`fetchWithRetry`), a few jittered-backoff attempts
+  on 429/5xx responses and on network/CORS-blocked rejections. A cross-origin
+  5xx from the hosted store returns with no `Access-Control-Allow-Origin`
+  header, so the browser rejects the fetch as a TypeError rather than exposing
+  the status, hence thrown rejections retry too. Only idempotent (GET/HEAD)
+  requests retry, so a replay can never double a side effect.
 - `src/geo/wkb-flatten.ts` scans WKB with a DataView straight into flat
   typed-array buckets, no GeoJSON intermediate. `src/geo/geojson.ts` keeps
   the GeoJSON flattener only as a fallback for already-decoded values.
