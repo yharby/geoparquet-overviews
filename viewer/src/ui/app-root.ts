@@ -40,6 +40,13 @@ import type { LoadStats, LoadSummary } from '../viz/stats';
 
 installFetchInstrumentation();
 
+// Below this many batches the per-batch layers already on screen are few enough
+// that collapsing them into one merged layer set is not worth re-allocating and
+// re-uploading every coordinate a second time. Above it, the draw-call and
+// layer-diff overhead of many batch layers wins, so the merge pays for itself.
+// Tunable, pinned empirically against the hosted datasets.
+const MERGE_LAYER_THRESHOLD = 8;
+
 export class AppRoot extends LitElement {
   static properties = {
     status: { state: true },
@@ -904,17 +911,21 @@ export class AppRoot extends LitElement {
       );
       if (token !== this.fetchToken) return;
       this.pendingWorking.clear();
-      // Atomically collapse the per-batch layers into one layer set per kind. The
-      // merged layers are built first, then swapped in with a single setLayers, so
-      // there is no frame where the map is empty.
-      const merged = mergeFlatGeometries(batches);
-      timeWork('gpu-upload', `${features.toLocaleString('en-US')} merged`, () =>
-        this.mapView!.setLayers(buildLayers('rg-merged', merged)),
-      );
-      // The per-batch layers are gone, so their pick provenance is too. Register
-      // the merged buckets under the merged id the new layers carry.
-      this.pickFlats.clear();
-      this.pickFlats.set('rg-merged', merged);
+      if (batches.length > MERGE_LAYER_THRESHOLD) {
+        // Many batches, collapse to one layer set per kind to cut draw calls.
+        // The merged layers are built first, then swapped in with a single
+        // setLayers, so there is no frame where the map is empty.
+        const merged = mergeFlatGeometries(batches);
+        timeWork('gpu-upload', `${features.toLocaleString('en-US')} merged`, () =>
+          this.mapView!.setLayers(buildLayers('rg-merged', merged)),
+        );
+        // The per-batch layers are gone, so their pick provenance is too.
+        // Register the merged buckets under the merged id the new layers carry.
+        this.pickFlats.clear();
+        this.pickFlats.set('rg-merged', merged);
+      }
+      // Small views keep their per-batch layers and per-batch pickFlats as is,
+      // already uploaded once during progressive paint. No second upload.
       this.renderedPlanSig = sig;
       this.renderedUrl = url;
       this.status = `Rendered ${features.toLocaleString('en-US')} features from ${total} row groups, ${readingLabel}.${pruneNote}`;
