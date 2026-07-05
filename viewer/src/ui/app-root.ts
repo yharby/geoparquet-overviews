@@ -24,7 +24,7 @@ import { readColumnProgressive, getFileForUrl, type RowGroupRange } from '../dat
 import type { SchemaElement } from 'hyparquet';
 import { readRowAttributes } from '../data/feature-detail';
 import { featureLoadingHtml, featureAttributesHtml, featureErrorHtml } from './feature-popup';
-import type { Layer, PickingInfo } from '@deck.gl/core';
+import type { PickingInfo } from '@deck.gl/core';
 import { pageRangesForRowGroup, mergePageRanges, keptPageRanges, type PageRange } from '../data/pageindex';
 import { getPageRangeMemo, getFlatCache, isFilePrefetched } from '../data/file-cache';
 import { detectLayout, type LayoutStrategy } from '../data/layout';
@@ -121,12 +121,14 @@ export class AppRoot extends LitElement {
   // resolves to the same signature leaves the layers untouched.
   private renderedPlanSig: string | null = null;
   private renderedUrl: string | null = null;
-  // Built merged layer sets keyed by plan signature, together with the merged
-  // buckets they were built from, so a recurring large view reuses the same
-  // Layer objects by reference (deck.gl skips the GPU re-upload) and resolves
-  // picks against the same merged buckets those layers were built from.
-  // Bounded, dropped on file switch.
-  private mergedLayerCache = new Map<string, { layers: Layer[]; merged: FlatGeometries }>();
+  // Merged flat buckets keyed by plan signature, so a recurring large view skips
+  // the re-decode and re-merge (the real cost) and resolves picks against the
+  // same buckets its layers were built from. We cache the geometry, not the
+  // deck.gl Layer instances: a Layer is a single-use lifecycle descriptor that
+  // deck.gl finalizes once replaced, and a finalized instance cannot be re-used
+  // (Layer._initialize asserts `!this.internalState`). Layers are rebuilt fresh
+  // each settle. Bounded, dropped on file switch.
+  private mergedGeomCache = new Map<string, FlatGeometries>();
   // The flattened buckets currently on the map, keyed by the layer-set id prefix
   // (`rg-batch-N` during progressive load, `rg-merged` once settled). A click
   // resolves `info.layer.id` to a prefix and a geometry kind, then reads the
@@ -532,7 +534,7 @@ export class AppRoot extends LitElement {
     this.lastFetchKey = null;
     this.renderedPlanSig = null;
     this.renderedUrl = null;
-    this.mergedLayerCache.clear();
+    this.mergedGeomCache.clear();
     this.summary = null;
     this.fileFacts = null;
     this.busy = true;
@@ -979,26 +981,28 @@ export class AppRoot extends LitElement {
         // Many batches, collapse to one layer set per kind to cut draw calls.
         // The merged layers are built first, then swapped in with a single
         // setLayers, so there is no frame where the map is empty.
-        let entry = this.mergedLayerCache.get(sig);
-        if (!entry) {
-          const merged = mergeFlatGeometries(batches);
-          const layers = buildLayers('rg-merged', merged);
-          entry = { layers, merged };
-          this.mergedLayerCache.set(sig, entry);
+        let merged = this.mergedGeomCache.get(sig);
+        if (!merged) {
+          merged = mergeFlatGeometries(batches);
+          this.mergedGeomCache.set(sig, merged);
           // Bound the cache to a small recent window.
-          if (this.mergedLayerCache.size > 6) {
-            const oldest = this.mergedLayerCache.keys().next().value as string;
-            this.mergedLayerCache.delete(oldest);
+          if (this.mergedGeomCache.size > 6) {
+            const oldest = this.mergedGeomCache.keys().next().value as string;
+            this.mergedGeomCache.delete(oldest);
           }
         }
+        // Fresh Layer instances every settle: deck.gl finalizes a replaced Layer
+        // and a finalized instance cannot be re-mounted. The merged geometry (the
+        // costly part) is what the cache reuses, not the layers.
+        const layers = buildLayers('rg-merged', merged);
         timeWork('gpu-upload', `${features.toLocaleString('en-US')} merged`, () =>
-          this.mapView!.setLayers(entry!.layers),
+          this.mapView!.setLayers(layers),
         );
         // The per-batch layers are gone, so their pick provenance is too. Register
         // the SAME merged buckets these layers were built from, so a picked ordinal
         // into the layers indexes the matching rowIds.
         this.pickFlats.clear();
-        this.pickFlats.set('rg-merged', entry.merged);
+        this.pickFlats.set('rg-merged', merged);
       }
       // Small views keep their per-batch layers and per-batch pickFlats as is,
       // already uploaded once during progressive paint. No second upload.
