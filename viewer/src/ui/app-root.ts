@@ -21,6 +21,7 @@ import {
   type FileFacts,
 } from '../data/metadata';
 import { readColumnProgressive, getFileForUrl, type RowGroupRange } from '../data/rowgroups';
+import type { SchemaElement } from 'hyparquet';
 import { readRowAttributes } from '../data/feature-detail';
 import { featureLoadingHtml, featureAttributesHtml, featureErrorHtml } from './feature-popup';
 import type { PickingInfo } from '@deck.gl/core';
@@ -103,6 +104,11 @@ export class AppRoot extends LitElement {
   // change) does not refetch the identical bbox and band.
   private lastFetchKey: string | null = null;
   private strategy: LayoutStrategy | null = null;
+  // File-invariant scratch, recomputed once per loadUrl and reused on every pan
+  // so the per-fetch path does not rebuild them. rowOffsets[i] is the absolute
+  // first row of row group i.
+  private rowOffsets: number[] = [];
+  private schemaLookupCache: Map<string, SchemaElement> | null = null;
   // The flattened buckets currently on the map, keyed by the layer-set id prefix
   // (`rg-batch-N` during progressive load, `rg-merged` once settled). A click
   // resolves `info.layer.id` to a prefix and a geometry kind, then reads the
@@ -523,6 +529,16 @@ export class AppRoot extends LitElement {
       this.metadata = metadata;
       this.attrColumns = attributeColumns(metadata);
       this.strategy = detectLayout(metadata);
+      // Precompute the file-invariant read scaffolding once, so runFetch and
+      // refineToPages do not rebuild it on every pan.
+      const offsets: number[] = [];
+      let acc = 0;
+      for (const rg of metadata.rowGroups) {
+        offsets.push(acc);
+        acc += rg.rowCount;
+      }
+      this.rowOffsets = offsets;
+      this.schemaLookupCache = schemaLookup(metadata.schema);
       await this.strategy.prepare(url);
       this.fileBytes = metadata.rowGroups.reduce((sum, rg) => sum + rg.totalByteSize, 0);
       this.fileFacts = computeFileFacts(metadata, this.fileBytes, isFilePrefetched(url));
@@ -700,16 +716,10 @@ export class AppRoot extends LitElement {
 
     // Map each selected row group to its absolute row range, so hyparquet reads
     // exactly that group's column chunk over a range request.
-    const offsets: number[] = [];
-    let acc = 0;
-    for (const rg of metadata.rowGroups) {
-      offsets.push(acc);
-      acc += rg.rowCount;
-    }
     const ranges: RowGroupRange[] = indices.map((i) => ({
       index: i,
-      rowStart: offsets[i],
-      rowEnd: offsets[i] + metadata.rowGroups[i].rowCount,
+      rowStart: this.rowOffsets[i],
+      rowEnd: this.rowOffsets[i] + metadata.rowGroups[i].rowCount,
     }));
 
     // Only claim the active URL if this fetch is still current, so a fetch
@@ -933,7 +943,7 @@ export class AppRoot extends LitElement {
     // A prefetched file is fully resident, so page pruning saves no bytes and
     // would only add index reads and decode work. Read whole groups from memory.
     if (isFilePrefetched(url)) return ranges;
-    const lookup = schemaLookup(metadata.schema);
+    const lookup = this.schemaLookupCache ?? schemaLookup(metadata.schema);
     const transform = metadata.projection.transform;
     const memo = getPageRangeMemo(url);
 
