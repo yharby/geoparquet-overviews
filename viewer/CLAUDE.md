@@ -65,7 +65,7 @@ Node >= 24, pnpm 11.9.0.
 - `src/data/rowgroups.ts` reads through hyparquet's columnar path,
   `parquetRead` with `onChunk` and an identity geometry parser
   (`RAW_WKB_PARSERS`), so geometry arrives as zero-copy WKB Uint8Array views.
-  Up to 6 groups read concurrently, onBatch paints strictly serially.
+  Up to 16 groups read concurrently, onBatch paints strictly serially.
 - `src/geo/wkb-flatten.ts` scans WKB with a DataView straight into flat
   typed-array buckets, no GeoJSON intermediate. `src/geo/geojson.ts` keeps
   the GeoJSON flattener only as a fallback for already-decoded values.

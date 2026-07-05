@@ -121,10 +121,12 @@ export class AppRoot extends LitElement {
   // resolves to the same signature leaves the layers untouched.
   private renderedPlanSig: string | null = null;
   private renderedUrl: string | null = null;
-  // Built merged layer sets keyed by plan signature, so panning back to a prior
-  // large view reuses the same Layer objects by reference and deck.gl skips the
-  // GPU re-upload. Bounded, dropped on file switch.
-  private mergedLayerCache = new Map<string, Layer[]>();
+  // Built merged layer sets keyed by plan signature, together with the merged
+  // buckets they were built from, so a recurring large view reuses the same
+  // Layer objects by reference (deck.gl skips the GPU re-upload) and resolves
+  // picks against the same merged buckets those layers were built from.
+  // Bounded, dropped on file switch.
+  private mergedLayerCache = new Map<string, { layers: Layer[]; merged: FlatGeometries }>();
   // The flattened buckets currently on the map, keyed by the layer-set id prefix
   // (`rg-batch-N` during progressive load, `rg-merged` once settled). A click
   // resolves `info.layer.id` to a prefix and a geometry kind, then reads the
@@ -711,6 +713,14 @@ export class AppRoot extends LitElement {
     // rather than imply the area was empty.
     const prunable = this.strategy!.prunable;
     if (indices.length === 0) {
+      // Tear down whatever is on screen, mirroring the changed-plan teardown
+      // below, so panning fully off-data blanks the map instead of leaving the
+      // previous view's geometry stuck under an empty-view status.
+      this.resetViz();
+      this.mapView.clearLayers();
+      this.pickFlats.clear();
+      this.mapView.closeFeaturePopup();
+      this.renderedPlanSig = null;
       this.pendingWorking.clear();
       this.flushVizNow(token);
       this.loading = false;
@@ -969,11 +979,12 @@ export class AppRoot extends LitElement {
         // Many batches, collapse to one layer set per kind to cut draw calls.
         // The merged layers are built first, then swapped in with a single
         // setLayers, so there is no frame where the map is empty.
-        const merged = mergeFlatGeometries(batches);
-        let layers = this.mergedLayerCache.get(sig);
-        if (!layers) {
-          layers = buildLayers('rg-merged', merged);
-          this.mergedLayerCache.set(sig, layers);
+        let entry = this.mergedLayerCache.get(sig);
+        if (!entry) {
+          const merged = mergeFlatGeometries(batches);
+          const layers = buildLayers('rg-merged', merged);
+          entry = { layers, merged };
+          this.mergedLayerCache.set(sig, entry);
           // Bound the cache to a small recent window.
           if (this.mergedLayerCache.size > 6) {
             const oldest = this.mergedLayerCache.keys().next().value as string;
@@ -981,12 +992,13 @@ export class AppRoot extends LitElement {
           }
         }
         timeWork('gpu-upload', `${features.toLocaleString('en-US')} merged`, () =>
-          this.mapView!.setLayers(layers!),
+          this.mapView!.setLayers(entry!.layers),
         );
-        // The per-batch layers are gone, so their pick provenance is too.
-        // Register the merged buckets under the merged id the new layers carry.
+        // The per-batch layers are gone, so their pick provenance is too. Register
+        // the SAME merged buckets these layers were built from, so a picked ordinal
+        // into the layers indexes the matching rowIds.
         this.pickFlats.clear();
-        this.pickFlats.set('rg-merged', merged);
+        this.pickFlats.set('rg-merged', entry.merged);
       }
       // Small views keep their per-batch layers and per-batch pickFlats as is,
       // already uploaded once during progressive paint. No second upload.
