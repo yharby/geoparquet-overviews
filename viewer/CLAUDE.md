@@ -155,6 +155,14 @@ Node >= 24, pnpm 11.9.0.
 - deck.gl shallow-compares layer `data` by reference. Keep stable
   `{length, attributes}` wrappers, a fresh wrapper per render forces a full
   GPU re-upload.
+- Never cache and re-supply deck.gl `Layer` instances across renders. A Layer
+  is a single-use lifecycle descriptor, and once a later `setLayers` replaces
+  it under the same id deck.gl finalizes it, so re-passing that instance trips
+  `assert(!this.internalState)` in `Layer._initialize` ("finalized layer cannot
+  be reused"). Build fresh Layer instances every settle; cache the geometry
+  (`mergedGeomCache` holds the merged `FlatGeometries`), which is the costly
+  part, not the layers. Fast zoom is what surfaces the crash, since only a
+  cache hit re-supplies a finalized instance.
 - Do not adopt Arrow JS or GeoArrow layer packages. The file is standard WKB
   by design, re-encoding to GeoArrow adds the copy the flat path removed.
 - Do not hand-roll coordinate origin offsetting, deck.gl's hybrid 32-bit
@@ -166,7 +174,7 @@ Node >= 24, pnpm 11.9.0.
 ## Open work
 
 The pan render-path performance pass has landed, the plan-signature short
-circuit, small-view merge skip plus merged-layer reuse, the per-page flat
+circuit, small-view merge skip plus merged-geometry reuse, the per-page flat
 cache, concurrent first-view page-index reads, no fetch draining, and read
 concurrency raised to 16 for HTTP/2. The design and plan live in
 `docs/superpowers/`. Worker decode is a separate, still-open effort, described
