@@ -100,14 +100,14 @@ export class AppRoot extends LitElement {
   // Coalesce bursts of moveend (e.g. a zoom that settles then an immediate pan)
   // into a single read, so fast camera moves do not each kick off a fetch.
   private fetchTimer: ReturnType<typeof setTimeout> | null = null;
-  // Fetches are serialized (one wasm read at a time) and superseded by token,
-  // so a pan mid-read cancels the stale read at the next row-group boundary and
-  // never paints stale results.
+  // Each fetch carries this token. A newer fetch bumps it and starts right
+  // away, superseding any fetch still in flight, so a pan mid-read cancels
+  // the stale read at the next row-group boundary and never paints stale
+  // results.
   private fetchToken = 0;
   // Bumped on every loadUrl so a load in flight for a superseded file does not
   // reset shared state (busy, the active URL) under a newer load.
   private loadToken = 0;
-  private fetchChain: Promise<void> = Promise.resolve();
   // Dedupe key of the last view fetched, so an idle moveend (no real camera
   // change) does not refetch the identical bbox and band.
   private lastFetchKey: string | null = null;
@@ -672,12 +672,14 @@ export class AppRoot extends LitElement {
     }
   }
 
-  // Queue a fetch for one area at one zoom. Fetches are serialized on a promise
-  // chain so only one wasm read runs at a time, and each carries a token so a
-  // newer request supersedes an in-flight one instead of racing it.
+  // Queue a fetch for one area at one zoom. Each fetch carries a token, so a
+  // newer request supersedes an in-flight one via the token gate rather than
+  // racing it, every paint checks it before touching shared state and a stale
+  // paint just no-ops. There is no promise chain, a new view starts right away
+  // instead of waiting for the superseded fetch's in-flight reads to drain.
   private fetchAoi(bbox: Bbox, zoom: number): void {
     const token = ++this.fetchToken;
-    this.fetchChain = this.fetchChain.then(() => this.runFetch(bbox, zoom, token));
+    void this.runFetch(bbox, zoom, token);
   }
 
   // Fetch and render one area at one zoom. The zoom picks the overview level
