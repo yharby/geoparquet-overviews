@@ -41,9 +41,17 @@ interface FileEntry {
 // One file resident at a time, matching the previous single-slot behavior.
 // Switching urls drops the prior entry and its byte cache, releasing memory.
 let entry: FileEntry | null = null;
+// The in-flight load of a not-yet-resident url. Concurrent callers for the same
+// url (e.g. the metadata read and the first view fetch overlapping under rapid
+// file switching) share this one download and parse instead of each doing the
+// full work and racing to overwrite `entry`, which would flap the flat cache,
+// page memo, and pinning. Cleared once the load settles.
+let pending: { url: string; promise: Promise<FileEntry> } | null = null;
 
-export async function getCachedFile(url: string): Promise<{ file: AsyncBuffer; metadata: FileMetaData }> {
-  if (entry && entry.url === url) return { file: entry.file, metadata: entry.metadata };
+// Download (or prefetch) a url and parse its footer into a fresh FileEntry. Does
+// not touch the shared `entry`, so it is safe to run under the single-flight
+// dedup in getCachedFile.
+async function loadFileEntry(url: string): Promise<FileEntry> {
   const base = await withPhase('footer', () => asyncBufferFromUrl({ url }));
 
   let file: AsyncBuffer;
@@ -63,16 +71,27 @@ export async function getCachedFile(url: string): Promise<{ file: AsyncBuffer; m
   }
 
   const metadata = await withPhase('metadata', () => parquetMetadataAsync(file));
-  entry = {
-    url,
-    file,
-    metadata,
-    cache,
-    prefetched,
-    pageRangeMemo: new Map(),
-    flatCache: createFlatCache(),
-  };
-  return { file: entry.file, metadata: entry.metadata };
+  return { url, file, metadata, cache, prefetched, pageRangeMemo: new Map(), flatCache: createFlatCache() };
+}
+
+export async function getCachedFile(url: string): Promise<{ file: AsyncBuffer; metadata: FileMetaData }> {
+  if (entry && entry.url === url) return { file: entry.file, metadata: entry.metadata };
+  // Share one in-flight load per url. A second caller arriving mid-load awaits
+  // the same promise rather than kicking off a duplicate download and parse.
+  if (!pending || pending.url !== url) {
+    pending = { url, promise: loadFileEntry(url) };
+  }
+  const load = pending;
+  try {
+    const loaded = await load.promise;
+    entry = loaded;
+    return { file: loaded.file, metadata: loaded.metadata };
+  } finally {
+    // Clear only our own in-flight marker, so a newer url's load (which replaced
+    // `pending`) is left intact, and a retry after a failure is not blocked by a
+    // settled rejected promise.
+    if (pending === load) pending = null;
+  }
 }
 
 // Wrap an already-downloaded ArrayBuffer as an AsyncBuffer. ArrayBuffer.slice
@@ -115,7 +134,9 @@ export function getFlatCache(url: string): FlatCache {
   return createFlatCache();
 }
 
-// Test seam. Drops the resident file so each test starts clean.
+// Test seam. Drops the resident file and any in-flight load so each test starts
+// clean.
 export function resetFileCache(): void {
   entry = null;
+  pending = null;
 }

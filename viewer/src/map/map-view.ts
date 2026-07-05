@@ -166,6 +166,22 @@ export class MapView {
     );
   }
 
+  // The zoom fitBounds would settle on for a bbox, computed without moving the
+  // map. flyToBbox animates for 600ms and only emits moveend at the end, so the
+  // app reads this up front to seed its zoom readout to the fly target instead
+  // of showing the pre-fly camera for the whole animation. Padding matches
+  // flyToBbox. Returns null before the map has a size or if MapLibre cannot fit.
+  zoomForBbox(bbox: Bbox): number | null {
+    const camera = this.map.cameraForBounds(
+      [
+        [bbox.xmin, bbox.ymin],
+        [bbox.xmax, bbox.ymax],
+      ],
+      { padding: 40 },
+    );
+    return camera && typeof camera.zoom === 'number' ? camera.zoom : null;
+  }
+
   // The current visible extent, used as the area to fetch for the map view.
   getBounds(): Bbox {
     const b = this.map.getBounds();

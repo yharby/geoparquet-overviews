@@ -76,6 +76,37 @@ describe('getCachedFile', () => {
     expect(parquetMetadataAsync).toHaveBeenCalledTimes(2);
   });
 
+  it('shares one in-flight load across concurrent same-url calls', async () => {
+    // Gate the download so both calls are in flight before either resolves,
+    // which is the race the single-flight dedup guards: without it each concurrent
+    // caller would download and parse, then flap the resident entry.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    asyncBufferFromUrl.mockImplementation(async () => {
+      await gate;
+      return { byteLength: 1000, slice: () => new ArrayBuffer(0) };
+    });
+    const p1 = getCachedFile('a.parquet');
+    const p2 = getCachedFile('a.parquet');
+    release();
+    const [a, b] = await Promise.all([p1, p2]);
+    expect(asyncBufferFromUrl).toHaveBeenCalledTimes(1);
+    expect(parquetMetadataAsync).toHaveBeenCalledTimes(1);
+    expect(a.metadata).toBe(b.metadata);
+  });
+
+  it('lets a retry re-attempt after a failed load', async () => {
+    // A failed load must clear the in-flight marker, so a retry actually
+    // re-downloads instead of awaiting the settled rejected promise forever.
+    asyncBufferFromUrl.mockImplementationOnce(async () => {
+      throw new Error('boom');
+    });
+    await expect(getCachedFile('a.parquet')).rejects.toThrow('boom');
+    await getCachedFile('a.parquet');
+    expect(asyncBufferFromUrl).toHaveBeenCalledTimes(2);
+    expect(parquetMetadataAsync).toHaveBeenCalledTimes(1);
+  });
+
   it('returns the same metadata object across same-url calls', async () => {
     const first = await getCachedFile('a.parquet');
     const second = await getCachedFile('a.parquet');
