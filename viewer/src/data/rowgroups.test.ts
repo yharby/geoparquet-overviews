@@ -37,7 +37,7 @@ describe('readColumnProgressive', () => {
     let painting = false;
     let overlapped = false;
     const painted: number[] = [];
-    await readColumnProgressive('u', ranges(8), 'geometry', async (_geoms, _rows, idx) => {
+    await readColumnProgressive('u', ranges(20), 'geometry', async (_geoms, _rows, idx) => {
       if (painting) overlapped = true; // two paints interleaved
       painting = true;
       await Promise.resolve();
@@ -46,9 +46,11 @@ describe('readColumnProgressive', () => {
     });
 
     expect(maxInFlight).toBeGreaterThan(1); // genuinely concurrent
-    expect(maxInFlight).toBeLessThanOrEqual(16); // capped at the pool size
+    expect(maxInFlight).toBeLessThanOrEqual(16); // capped at the pool size, and 20 ranges exceed it so the cap is exercised
     expect(overlapped).toBe(false); // paints never interleave
-    expect(painted.slice().sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]); // every group painted
+    expect(painted.slice().sort((a, b) => a - b)).toEqual(
+      Array.from({ length: 20 }, (_, i) => i),
+    ); // every group painted
   });
 
   it('reads each page sub-range of a group then paints the group once', async () => {
