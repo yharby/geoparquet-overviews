@@ -47,10 +47,11 @@ export async function getFileForUrl(url: string): Promise<AsyncBuffer> {
 // touch dozens of small coarse row groups, and reading them one at a time pays a
 // full network round trip per group, so a whole-extent preview stalls on latency
 // rather than bandwidth. Reading a bounded batch concurrently collapses those
-// round trips into a few waves. Kept at the HTTP/1.1 per-host connection ceiling
-// so it also helps servers without multiplexing, and small enough not to flood a
-// shared byte budget with many large exact chunks at once.
-const MAX_CONCURRENT_READS = 6;
+// round trips into a few waves. The hosted files are served over HTTP/2 which
+// multiplexes many requests over one connection, so the old HTTP/1.1 per-host
+// connection ceiling no longer bounds useful concurrency. The shared byte budget
+// still caps how many large chunks sit resident at once.
+const MAX_CONCURRENT_READS = 16;
 
 // Reads a single column of the given row groups over HTTP range requests,
 // concurrently up to MAX_CONCURRENT_READS, and hands each finished group to

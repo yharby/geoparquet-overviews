@@ -46,7 +46,7 @@ describe('readColumnProgressive', () => {
     });
 
     expect(maxInFlight).toBeGreaterThan(1); // genuinely concurrent
-    expect(maxInFlight).toBeLessThanOrEqual(6); // capped at the pool size
+    expect(maxInFlight).toBeLessThanOrEqual(16); // capped at the pool size
     expect(overlapped).toBe(false); // paints never interleave
     expect(painted.slice().sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]); // every group painted
   });
@@ -117,6 +117,6 @@ describe('readColumnProgressive', () => {
     });
     await expect(readColumnProgressive('u', ranges(20), 'geometry', () => {})).rejects.toThrow('boom');
     // Only the first wave of workers ran, no worker pulled a second group.
-    expect(calls).toBeLessThanOrEqual(6);
+    expect(calls).toBeLessThanOrEqual(16);
   });
 });
