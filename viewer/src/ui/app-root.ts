@@ -25,7 +25,7 @@ import type { SchemaElement } from 'hyparquet';
 import { readRowAttributes } from '../data/feature-detail';
 import { featureLoadingHtml, featureAttributesHtml, featureErrorHtml } from './feature-popup';
 import type { Layer, PickingInfo } from '@deck.gl/core';
-import { pageRangesForRowGroup, mergePageRanges, keptPageRanges } from '../data/pageindex';
+import { pageRangesForRowGroup, mergePageRanges, keptPageRanges, type PageRange } from '../data/pageindex';
 import { getPageRangeMemo, getFlatCache, isFilePrefetched } from '../data/file-cache';
 import { detectLayout, type LayoutStrategy } from '../data/layout';
 import { viewFetchKey } from './fetch-key';
@@ -1040,6 +1040,27 @@ export class AppRoot extends LitElement {
     const transform = metadata.projection.transform;
     const memo = getPageRangeMemo(url);
 
+    // First pass, find every wide group not yet memoized and kick off its page
+    // index read without awaiting, so a whole-extent view with many wide coarse
+    // groups fires its round trips together instead of one after another. Each
+    // probe is wrapped so a thrown error resolves to null, matching the
+    // whole-group fallback the serial try/catch used to give per group.
+    const pending: Array<{ index: number; promise: Promise<PageRange[] | null> }> = [];
+    for (const range of ranges) {
+      const rg = metadata.rowGroups[range.index];
+      const raw = metadata.rawRowGroups[range.index];
+      const wideEnough = rg?.bbox && raw && bboxArea(rg.bbox) >= 4 * aoiArea;
+      if (!wideEnough || memo.has(range.index)) continue;
+      const probe = pageRangesForRowGroup(file, raw!, covering, range.rowStart, rg!.rowCount, transform, lookup).catch(
+        () => null,
+      );
+      pending.push({ index: range.index, promise: probe });
+    }
+    if (pending.length > 0) {
+      const resolved = await withPhase('page-index', () => Promise.all(pending.map((p) => p.promise)));
+      pending.forEach((p, i) => memo.set(p.index, resolved[i]));
+    }
+
     const out: RowGroupRange[] = [];
     for (const range of ranges) {
       const rg = metadata.rowGroups[range.index];
@@ -1052,18 +1073,9 @@ export class AppRoot extends LitElement {
       // The page indexes are immutable for the file, and the per-page bboxes are
       // absolute, so the decoded pages are reused across every pan and zoom. Only
       // the AOI filter in mergePageRanges below is recomputed per view. A null
-      // memo value records a group that cannot be page pruned.
+      // memo value records a group that cannot be page pruned. The first pass
+      // above already populated the memo for every wide group, so this only reads.
       let pages = memo.get(range.index) ?? null;
-      if (!memo.has(range.index)) {
-        try {
-          pages = await withPhase('page-index', () =>
-            pageRangesForRowGroup(file, raw, covering, range.rowStart, rg.rowCount, transform, lookup),
-          );
-        } catch {
-          pages = null;
-        }
-        memo.set(range.index, pages);
-      }
       if (!pages) {
         out.push(range);
         continue;
