@@ -202,6 +202,16 @@ export function pairPageRanges(
   return pages;
 }
 
+// The AOI-intersecting pages as individual, unmerged [rowStart, rowEnd) ranges,
+// sorted by rowStart. Unlike mergePageRanges this keeps each page separate, so
+// each is a stable flat-cache unit whose key does not jitter as the AOI shifts.
+export function keptPageRanges(pages: PageRange[], aoi: Bbox): { rowStart: number; rowEnd: number }[] {
+  return pages
+    .filter((p) => bboxIntersectsAoi(p.bbox, aoi))
+    .sort((a, b) => a.rowStart - b.rowStart)
+    .map((p) => ({ rowStart: p.rowStart, rowEnd: p.rowEnd }));
+}
+
 // Keep pages whose bbox meets the AOI and merge adjacent or contiguous kept
 // pages into the fewest contiguous [rowStart, rowEnd) ranges. A gap between kept
 // pages (a dropped page in between) splits the ranges, so hyparquet skips the

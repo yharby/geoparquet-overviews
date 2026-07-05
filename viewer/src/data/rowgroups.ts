@@ -22,6 +22,10 @@ export interface RowGroupRange {
   // [rowStart, rowEnd) span. All sub-ranges of one group are read then painted
   // as a single batch, so the byte meter and panels still see one row group.
   subRanges?: { rowStart: number; rowEnd: number }[];
+  // The individual kept pages (unmerged), the stable per-page flat-cache units,
+  // set alongside subRanges for a page-pruned group. subRanges stays the
+  // coalesced fetch spans, pages is what the flat cache keys on.
+  pages?: { rowStart: number; rowEnd: number }[];
 }
 
 // One row group's read result: the kept geometry values and their absolute

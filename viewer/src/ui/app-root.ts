@@ -25,7 +25,7 @@ import type { SchemaElement } from 'hyparquet';
 import { readRowAttributes } from '../data/feature-detail';
 import { featureLoadingHtml, featureAttributesHtml, featureErrorHtml } from './feature-popup';
 import type { Layer, PickingInfo } from '@deck.gl/core';
-import { pageRangesForRowGroup, mergePageRanges } from '../data/pageindex';
+import { pageRangesForRowGroup, mergePageRanges, keptPageRanges } from '../data/pageindex';
 import { getPageRangeMemo, getFlatCache, isFilePrefetched } from '../data/file-cache';
 import { detectLayout, type LayoutStrategy } from '../data/layout';
 import { viewFetchKey } from './fetch-key';
@@ -796,7 +796,11 @@ export class AppRoot extends LitElement {
     let decodeMs = 0;
     let uploadMs = 0;
     let batchOrdinal = 0;
-    const arrived: number[] = [];
+    // Unique row-group indices that have painted at least one batch. A page-pruned
+    // group now paints as several batches (one per page) under one index, so the
+    // fetched-group count and the status must count distinct groups, not batches,
+    // or they would run past `total`.
+    const arrived = new Set<number>();
     // Every batch's flattened buckets, cached-hit and freshly decoded alike, are
     // collected here and merged into one layer set per kind at fetch completion,
     // so a settled view holds a handful of layers instead of one per row group.
@@ -807,9 +811,14 @@ export class AppRoot extends LitElement {
     // group read via a different column at another level of detail, otherwise a
     // partial decode could be served to a later full read.
     const flatCache = getFlatCache(url);
-    const rangeSignature = (range: RowGroupRange): string =>
-      range.subRanges ? range.subRanges.map((s) => `${s.rowStart}-${s.rowEnd}`).join(',') : 'full';
-    const cacheKey = (range: RowGroupRange): string => `${column}\u0000${range.index}\u0000${rangeSignature(range)}`;
+    // A page-pruned group caches each kept page under its own stable
+    // [rowStart, rowEnd) key, so an overlapping pan reuses the decoded page even
+    // as the merged fetch spans jitter. A whole-group read keeps the stable
+    // 'full' key, the same shape whole-group entries used before, so those
+    // entries survive across pans too. Both use the same null separator as before.
+    const pageKey = (index: number, rowStart: number, rowEnd: number): string =>
+      `${column}\u0000${index}\u0000${rowStart}-${rowEnd}`;
+    const groupKey = (index: number): string => `${column}\u0000${index}\u0000full`;
 
     // Paint one batch progressively and collect its buckets for the end-of-fetch
     // merge. Shared by the cache-hit and fresh-decode paths so both update the
@@ -830,7 +839,7 @@ export class AppRoot extends LitElement {
       uploadMs += performance.now() - tUpload;
       batchOrdinal += 1;
 
-      arrived.push(...batchIndices);
+      for (const i of batchIndices) arrived.add(i);
       // Mutate the working set and coalesce the reactive flush with a rAF, so
       // several batches arriving in the same frame (or the same macrotask,
       // before the next paint) collapse into one `pendingIndices` update
@@ -844,7 +853,7 @@ export class AppRoot extends LitElement {
       this.summary = {
         fileBytes: this.fileBytes,
         rowGroupsTotal: metadata.rowGroups.length,
-        rowGroupsFetched: arrived.length,
+        rowGroupsFetched: arrived.size,
         features,
         vertices,
         metadataMs: this.metadataMs,
@@ -861,28 +870,53 @@ export class AppRoot extends LitElement {
         pagePrunedGroups: pagePruned,
         wholeGroups: total - pagePruned,
       };
-      this.status = `Painted ${arrived.length}/${total} row groups (${features.toLocaleString('en-US')} features)…`;
+      this.status = `Painted ${arrived.size}/${total} row groups (${features.toLocaleString('en-US')} features)…`;
     };
 
     // Split the read ranges into cache hits (skip the byte fetch and the decode
     // entirely) and misses (read and decode). The hit's byte cost is zero, so no
-    // fetch event fires and the byte accounting stays coherent.
-    const cachedHits: { range: RowGroupRange; cached: { flat: FlatGeometries; features: number } }[] = [];
+    // fetch event fires and the byte accounting stays coherent. A page-pruned
+    // group is split at page granularity, each kept page probes and decodes on its
+    // own, so an overlapping pan repaints the warm pages and reads only the newly
+    // visible ones. A whole-group read probes and decodes as one unit.
+    const cachedHits: { index: number; cached: { flat: FlatGeometries; features: number } }[] = [];
     const uncachedRanges: RowGroupRange[] = [];
+    // Which pages each page-pruned group keeps, so onBatch can map a decoded batch
+    // back to the page it belongs to (all rows of a single-page range fall inside
+    // that page). A whole-group read is absent here and caches under its group key.
+    const pagesByIndex = new Map<number, { rowStart: number; rowEnd: number }[]>();
     for (const range of readRanges) {
-      const cached = flatCache.get(cacheKey(range));
-      if (cached) cachedHits.push({ range, cached });
-      else uncachedRanges.push(range);
+      if (range.pages) {
+        pagesByIndex.set(range.index, range.pages);
+        for (const p of range.pages) {
+          const cached = flatCache.get(pageKey(range.index, p.rowStart, p.rowEnd));
+          if (cached) {
+            cachedHits.push({ index: range.index, cached });
+          } else {
+            // One read range per missing page, so each decodes and caches alone.
+            // Several may share an index, that is intended.
+            uncachedRanges.push({
+              index: range.index,
+              rowStart: range.rowStart,
+              rowEnd: range.rowEnd,
+              subRanges: [p],
+            });
+          }
+        }
+      } else {
+        const cached = flatCache.get(groupKey(range.index));
+        if (cached) cachedHits.push({ index: range.index, cached });
+        else uncachedRanges.push(range);
+      }
     }
-    const uncachedByIndex = new Map(uncachedRanges.map((r) => [r.index, r]));
 
     try {
-      // Repaint the cached groups first, instantly, then stream the misses in.
-      for (const { range, cached } of cachedHits) {
+      // Repaint the cached units first, instantly, then stream the misses in.
+      for (const { index, cached } of cachedHits) {
         if (token !== this.fetchToken) return;
         const t0 = performance.now();
-        emitEvent({ kind: 'work', phase: 'flatten-cache', label: `rg ${range.index}`, t0, t1: performance.now() });
-        paintBatch(cached.flat, cached.features, [range.index]);
+        emitEvent({ kind: 'work', phase: 'flatten-cache', label: `rg ${index}`, t0, t1: performance.now() });
+        paintBatch(cached.flat, cached.features, [index]);
       }
 
       await readColumnProgressive(
@@ -899,11 +933,24 @@ export class AppRoot extends LitElement {
         const flat = timeWork('wkb-decode', `${geometries.length} geometries`, () => plan.decode(geometries, rows));
         decodeMs += performance.now() - tDecode;
 
-        // Cache the per-group decode before merging, so a repeat view reuses it.
-        // Merging is per view, caching is per group, so the merged result is not
-        // cached.
-        const range = uncachedByIndex.get(batchIndices[0]);
-        if (range) flatCache.set(cacheKey(range), { flat, features: geometries.length });
+        // Cache the decoded bucket before merging, so a repeat view reuses it.
+        // Merging is per view, caching is per unit, so the merged result is not
+        // cached. A page-pruned group caches each page under its own stable key,
+        // identified by which page the batch's rows fall in (each miss range is a
+        // single page, so every row is inside that one page). A whole-group read
+        // caches as one unit under its group key.
+        const index = batchIndices[0];
+        const pages = pagesByIndex.get(index);
+        if (pages) {
+          if (rows.length > 0) {
+            const p = pages.find((pg) => rows[0] >= pg.rowStart && rows[0] < pg.rowEnd);
+            if (p) flatCache.set(pageKey(index, p.rowStart, p.rowEnd), { flat, features: geometries.length });
+          }
+          // An all-null page yields rows.length === 0, so there is no page to key
+          // on. Skip caching it, it is cheap to re-read and rare.
+        } else {
+          flatCache.set(groupKey(index), { flat, features: geometries.length });
+        }
 
         paintBatch(flat, geometries.length, batchIndices);
 
@@ -1031,7 +1078,7 @@ export class AppRoot extends LitElement {
         out.push(range);
         continue;
       }
-      out.push({ ...range, subRanges });
+      out.push({ ...range, subRanges, pages: keptPageRanges(pages, aoi) });
     }
     return out;
   }

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   mergePageRanges,
+  keptPageRanges,
   pairPageRanges,
   type PageRange,
   type ColumnIndexLike,
@@ -60,6 +61,28 @@ describe('mergePageRanges', () => {
     const pages = [page(0, 0, 1)];
     const aoi: Bbox = { xmin: 1, ymin: 0, xmax: 2, ymax: 1 };
     expect(mergePageRanges(pages, aoi)).toEqual([{ rowStart: 0, rowEnd: 100 }]);
+  });
+});
+
+describe('keptPageRanges', () => {
+  const box = (xmin: number, xmax: number): PageRange['bbox'] => ({ xmin, ymin: 0, xmax, ymax: 1 });
+  const pages: PageRange[] = [
+    { rowStart: 0, rowEnd: 10, bbox: box(0, 1) },
+    { rowStart: 10, rowEnd: 20, bbox: box(1, 2) },
+    { rowStart: 20, rowEnd: 30, bbox: box(5, 6) },
+  ];
+
+  it('returns intersecting pages as individual unmerged ranges', () => {
+    const aoi = { xmin: 0.5, ymin: 0, xmax: 1.5, ymax: 1 };
+    expect(keptPageRanges(pages, aoi)).toEqual([
+      { rowStart: 0, rowEnd: 10 },
+      { rowStart: 10, rowEnd: 20 },
+    ]);
+  });
+
+  it('does not merge adjacent kept pages', () => {
+    const aoi = { xmin: 0, ymin: 0, xmax: 6, ymax: 1 };
+    expect(keptPageRanges(pages, aoi)).toHaveLength(3);
   });
 });
 
