@@ -26,6 +26,11 @@ interface CoveringPaths {
 export interface OverviewLevel {
   level: number;
   rowGroupEnd: number;
+  // First row group of the level's own slice. 0 for cumulative (banded)
+  // layouts, where level k's read is the whole prefix [0..rowGroupEnd];
+  // the previous level's rowGroupEnd + 1 for self-contained (duplicating)
+  // layouts, where each level is a complete rendering on its own.
+  rowGroupStart: number;
   maxZoom: number;
   gsd: number;
   // Optional 0.2.0 fields. The band's file byte range [start, end) so a reader
@@ -36,6 +41,12 @@ export interface OverviewLevel {
 
 export interface OverviewsInfo {
   version: string;
+  // How levels map to row groups. 'banded' is this spec's cumulative
+  // band-major layout (a level reads the row-group prefix). 'duplicating'
+  // is the gpq-tiles geo:overviews mode where every level is a complete,
+  // self-contained rendering and a reader fetches exactly one level's
+  // own row-group slice.
+  mode: 'banded' | 'duplicating';
   spatialKey: string;
   // Simplified-geometry column that coarse bands read instead of `geometry`,
   // or null when the file has no overview column (the flat variants).
@@ -188,13 +199,21 @@ function extractGeometryTypes(geo: Record<string, unknown> | null): string[] | n
 // Interpret the raw `overviews` block into a typed pyramid. Returns null when
 // the block is absent or carries no `levels` array (the flat sort variants),
 // in which case the viewer falls back to reading the full geometry column.
+//
+// Two dialects are accepted. This spec's `overviews` key writes per-level
+// `level` ordinals and `max_zoom`; the gpq-tiles `geo:overviews` key writes
+// `zoom` and no ordinal (levels are already sorted coarsest-first), plus a
+// `mode` field distinguishing its cumulative `partitioning` layout (same
+// prefix reads as this spec) from its self-contained `duplicating` layout.
 export function parseOverviews(raw: Record<string, unknown> | null): OverviewsInfo | null {
   if (!raw || !Array.isArray(raw.levels) || raw.levels.length === 0) return null;
+  const mode = raw.mode === 'duplicating' ? 'duplicating' : 'banded';
   const levels: OverviewLevel[] = (raw.levels as Record<string, unknown>[])
-    .map((l) => ({
-      level: Number(l.level),
+    .map((l, i) => ({
+      level: l.level !== undefined ? Number(l.level) : i,
       rowGroupEnd: Number(l.row_group_end),
-      maxZoom: Number(l.max_zoom),
+      rowGroupStart: 0, // stamped after the sort, from the previous level
+      maxZoom: l.max_zoom !== undefined ? Number(l.max_zoom) : Number(l.zoom),
       gsd: Number(l.gsd),
       bytes:
         Array.isArray(l.bytes) && l.bytes.length === 2
@@ -206,8 +225,14 @@ export function parseOverviews(raw: Record<string, unknown> | null): OverviewsIn
           : null,
     }))
     .sort((a, b) => a.level - b.level);
+  if (mode === 'duplicating') {
+    for (let i = 1; i < levels.length; i++) {
+      levels[i].rowGroupStart = levels[i - 1].rowGroupEnd + 1;
+    }
+  }
   return {
     version: String(raw.version ?? ''),
+    mode,
     spatialKey: String(raw.spatial_key ?? ''),
     overviewColumn: typeof raw.overview_column === 'string' ? raw.overview_column : null,
     overviewMethod: typeof raw.overview_method === 'string' ? raw.overview_method : null,
@@ -237,7 +262,9 @@ export function readGeoParquetMetadata(rawMeta: FileMetaData): GeoParquetMetadat
 
   const geoRaw = findKeyValue(metadata, 'geo');
   const geo = geoRaw ? (JSON.parse(geoRaw) as Record<string, unknown>) : null;
-  const overviewsRaw = findKeyValue(metadata, 'overviews');
+  // `overviews` is this spec's key; `geo:overviews` is the gpq-tiles
+  // incubation key for the same idea. When both are present the spec key wins.
+  const overviewsRaw = findKeyValue(metadata, 'overviews') ?? findKeyValue(metadata, 'geo:overviews');
   const overviews = overviewsRaw ? (JSON.parse(overviewsRaw) as Record<string, unknown>) : null;
   const overviewsInfo = parseOverviews(overviews);
   const coveringPaths = extractCoveringPaths(geo);
@@ -573,12 +600,19 @@ export function columnForLevel(info: OverviewsInfo, level: OverviewLevel): strin
   return 'geometry';
 }
 
-// Row groups a level covers, intersected with the AOI. Because the file is
-// band-major, a level owns the cumulative prefix [0..rowGroupEnd], and within
-// that prefix the bbox covering prunes to the viewport.
+// Row groups a level covers, intersected with the AOI. In the banded layout
+// a level owns the cumulative prefix [0..rowGroupEnd]; in the duplicating
+// layout it owns only its own slice [rowGroupStart..rowGroupEnd], a complete
+// self-contained rendering. Within that range the bbox covering prunes to
+// the viewport.
 export function rowGroupsForLevel(rowGroups: RowGroupInfo[], level: OverviewLevel, aoi: Bbox): number[] {
   return rowGroups
-    .filter((rg) => rg.index <= level.rowGroupEnd && (rg.bbox === null || bboxIntersectsAoi(rg.bbox, aoi)))
+    .filter(
+      (rg) =>
+        rg.index >= level.rowGroupStart &&
+        rg.index <= level.rowGroupEnd &&
+        (rg.bbox === null || bboxIntersectsAoi(rg.bbox, aoi)),
+    )
     .map((rg) => rg.index);
 }
 

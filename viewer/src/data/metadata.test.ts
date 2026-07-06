@@ -18,14 +18,15 @@ import {
 // A three band overviews footer, band major with an overview column.
 const INFO: OverviewsInfo = {
   version: '0.1.0',
+  mode: 'banded',
   spatialKey: 'hilbert',
   overviewColumn: 'geom_overview',
   overviewMethod: 'simplify_snap',
   importance: 'area_desc',
   levels: [
-    { level: 0, rowGroupEnd: 19, maxZoom: 8, gsd: 0.005, bytes: null, extent: null },
-    { level: 1, rowGroupEnd: 53, maxZoom: 10, gsd: 0.00125, bytes: null, extent: null },
-    { level: 2, rowGroupEnd: 80, maxZoom: 24, gsd: 0.0, bytes: null, extent: null },
+    { level: 0, rowGroupEnd: 19, rowGroupStart: 0, maxZoom: 8, gsd: 0.005, bytes: null, extent: null },
+    { level: 1, rowGroupEnd: 53, rowGroupStart: 0, maxZoom: 10, gsd: 0.00125, bytes: null, extent: null },
+    { level: 2, rowGroupEnd: 80, rowGroupStart: 0, maxZoom: 24, gsd: 0.0, bytes: null, extent: null },
   ],
 };
 
@@ -490,5 +491,116 @@ describe('readGeoParquetMetadata', () => {
     // Row group 1 (exact, band 1): geom_overview stats are unusable (null
     // bounds), so it falls back to the exact geometry column's stats.
     expect(parsed.rowGroups[1].bbox).toEqual({ xmin: 10, ymin: 30, xmax: 20, ymax: 40 });
+  });
+});
+
+// The gpq-tiles `geo:overviews` dialect: same band-major row-group layout,
+// different key name and level field names (`zoom`, no `level` ordinal), plus
+// a `mode` field. `partitioning` reads like this spec's cumulative prefix;
+// `duplicating` levels are self-contained slices. Fixtures mirror the real
+// footers written by `gpq-tiles overview` 0.6.0 (buildings-de-central).
+describe('gpq-tiles geo:overviews dialect', () => {
+  const PART_RAW = {
+    version: '0.2.0',
+    mode: 'partitioning',
+    canonical_level: null,
+    levels: [
+      { row_group_end: 0, gsd: 305.7, zoom: 7 },
+      { row_group_end: 4, gsd: 38.2, zoom: 10 },
+      { row_group_end: 532, gsd: 2.4, zoom: 14 },
+    ],
+  };
+  const DUP_RAW = {
+    version: '0.2.0',
+    mode: 'duplicating',
+    canonical_level: 2,
+    levels: [
+      { row_group_end: 0, gsd: 305.7, zoom: 7 },
+      { row_group_end: 4, gsd: 38.2, zoom: 10 },
+      { row_group_end: 919, gsd: 2.4, zoom: 14 },
+    ],
+  };
+
+  it('parses a partitioning footer as a cumulative (banded) pyramid', () => {
+    const info = parseOverviews(PART_RAW as never)!;
+    expect(info.mode).toBe('banded');
+    expect(info.overviewColumn).toBeNull();
+    expect(info.levels.map((l) => l.level)).toEqual([0, 1, 2]);
+    expect(info.levels.map((l) => l.maxZoom)).toEqual([7, 10, 14]);
+    expect(info.levels.every((l) => l.rowGroupStart === 0)).toBe(true);
+  });
+
+  it('parses a duplicating footer with self-contained level slices', () => {
+    const info = parseOverviews(DUP_RAW as never)!;
+    expect(info.mode).toBe('duplicating');
+    expect(info.levels.map((l) => l.rowGroupStart)).toEqual([0, 1, 5]);
+    expect(info.levels.map((l) => l.rowGroupEnd)).toEqual([0, 4, 919]);
+  });
+
+  it('reads only the level slice for a duplicating file, not the prefix', () => {
+    const info = parseOverviews(DUP_RAW as never)!;
+    const rowGroups: RowGroupInfo[] = Array.from({ length: 920 }, (_, index) => ({
+      index,
+      rowCount: 10_000,
+      totalByteSize: 1_000_000,
+      bbox: { xmin: 0, ymin: 0, xmax: 1, ymax: 1 },
+      band: null,
+    }));
+    const aoi = { xmin: 0, ymin: 0, xmax: 1, ymax: 1 };
+    // level 1 (z10) owns row groups 1..4 only; the z7 slice must not leak in
+    expect(rowGroupsForLevel(rowGroups, info.levels[1], aoi)).toEqual([1, 2, 3, 4]);
+    // the finest level starts after the coarse slices
+    const finest = rowGroupsForLevel(rowGroups, info.levels[2], aoi);
+    expect(finest[0]).toBe(5);
+    expect(finest.length).toBe(915);
+  });
+
+  it('reads the cumulative prefix for a partitioning file', () => {
+    const info = parseOverviews(PART_RAW as never)!;
+    const rowGroups: RowGroupInfo[] = Array.from({ length: 533 }, (_, index) => ({
+      index,
+      rowCount: 10_000,
+      totalByteSize: 1_000_000,
+      bbox: { xmin: 0, ymin: 0, xmax: 1, ymax: 1 },
+      band: null,
+    }));
+    const aoi = { xmin: 0, ymin: 0, xmax: 1, ymax: 1 };
+    expect(rowGroupsForLevel(rowGroups, info.levels[1], aoi)).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it('renders the exact geometry column at every level (no overview column)', () => {
+    const info = parseOverviews(PART_RAW as never)!;
+    for (const level of info.levels) {
+      expect(columnForLevel(info, level)).toBe('geometry');
+    }
+  });
+
+  it('finds the pyramid under the geo:overviews key', () => {
+    const meta = {
+      num_rows: 100n,
+      schema: [],
+      key_value_metadata: [
+        {
+          key: 'geo',
+          value: JSON.stringify({
+            version: '1.1.0',
+            primary_column: 'geometry',
+            columns: { geometry: { encoding: 'WKB' } },
+          }),
+        },
+        { key: 'geo:overviews', value: JSON.stringify(PART_RAW) },
+      ],
+      row_groups: [
+        {
+          num_rows: 100n,
+          total_byte_size: 1000n,
+          columns: [{ meta_data: { path_in_schema: ['geometry'] } }],
+        },
+      ],
+    };
+    const parsed = readGeoParquetMetadata(meta as never);
+    expect(parsed.overviewsInfo).not.toBeNull();
+    expect(parsed.overviewsInfo!.levels.length).toBe(3);
+    expect(parsed.rowGroups[0].band).toBe(0);
   });
 });

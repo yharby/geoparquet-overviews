@@ -28,11 +28,11 @@ describe('detectLayout', () => {
   it('picks the overviews strategy when overview levels are present', () => {
     const meta = baseMeta({
       overviewsInfo: {
-        version: '0.1.0', spatialKey: 'hilbert', overviewColumn: 'geom_overview',
+        version: '0.1.0', mode: 'banded', spatialKey: 'hilbert', overviewColumn: 'geom_overview',
         overviewMethod: 'simplify_snap', importance: 'area_desc',
         levels: [
-          { level: 0, rowGroupEnd: 1, maxZoom: 8, gsd: 0.005, bytes: null, extent: null },
-          { level: 1, rowGroupEnd: 2, maxZoom: 24, gsd: 0, bytes: null, extent: null },
+          { level: 0, rowGroupEnd: 1, rowGroupStart: 0, maxZoom: 8, gsd: 0.005, bytes: null, extent: null },
+          { level: 1, rowGroupEnd: 2, rowGroupStart: 0, maxZoom: 24, gsd: 0, bytes: null, extent: null },
         ],
       },
     });
