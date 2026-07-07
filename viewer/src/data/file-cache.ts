@@ -16,6 +16,23 @@ export type FileMetaData = Awaited<ReturnType<typeof parquetMetadataAsync>>;
 // is the whole point of the convention.
 const PREFETCH_THRESHOLD_BYTES = 32 * 1024 * 1024;
 
+// Range reads bypass the browser HTTP cache. Chrome serializes concurrent
+// fetches of the same URL on a per-cache-entry lock, so a burst of parallel
+// range reads (page indexes, column chunks) executes one at a time, each
+// paying full latency — an observed 9s stall for ~1.3 KB of index data. The
+// disk cache also almost never re-hits viewport-dependent byte ranges, so
+// `no-store` trades a ~0% hit rate for real request parallelism. The
+// whole-file prefetch below deliberately keeps the default cache mode: a
+// single un-ranged GET has no concurrency to lose and re-serves from disk on
+// reload.
+const RANGE_REQUEST_INIT: RequestInit = { cache: 'no-store' };
+
+// Upper bound on the coalesced page-index region read. The region normally
+// measures a few hundred KB even for a country-scale file, so a size past this
+// cap means an unusual layout where one contiguous read would hurt more than
+// per-structure reads, and the wrapper is skipped.
+const INDEX_REGION_CAP_BYTES = 16 * 1024 * 1024;
+
 interface FileEntry {
   url: string;
   file: AsyncBuffer;
@@ -52,15 +69,23 @@ let pending: { url: string; promise: Promise<FileEntry> } | null = null;
 // not touch the shared `entry`, so it is safe to run under the single-flight
 // dedup in getCachedFile.
 async function loadFileEntry(url: string): Promise<FileEntry> {
-  const base = await withPhase('footer', () => asyncBufferFromUrl({ url }));
+  const base = await withPhase('footer', () =>
+    asyncBufferFromUrl({ url, requestInit: RANGE_REQUEST_INIT }),
+  );
 
   let file: AsyncBuffer;
   let cache: ByteCache | null;
   let prefetched: boolean;
   if (base.byteLength <= PREFETCH_THRESHOLD_BYTES) {
     // One contiguous GET of the whole file. Every later slice is a cheap
-    // in-memory copy, so there is no LRU and nothing to pin.
-    const whole = await withPhase('prefetch', async () => base.slice(0, base.byteLength));
+    // in-memory copy, so there is no LRU and nothing to pin. A plain un-ranged
+    // fetch, not base.slice, so the response stays browser-cacheable (the
+    // ranged buffer is no-store) and a reload re-serves it from disk.
+    const whole = await withPhase('prefetch', async () => {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`prefetch failed ${res.status}`);
+      return res.arrayBuffer();
+    });
     file = memoryBuffer(whole);
     cache = null;
     prefetched = true;
@@ -71,7 +96,65 @@ async function loadFileEntry(url: string): Promise<FileEntry> {
   }
 
   const metadata = await withPhase('metadata', () => parquetMetadataAsync(file));
+  if (!prefetched) {
+    // Page-index structures (ColumnIndex/OffsetIndex) are tiny and contiguous
+    // just before the footer, but are sliced one 15-100 byte structure at a
+    // time — by the page-prune path and by hyparquet's useOffsetIndex read —
+    // so a deep-zoom view was paying one round trip per structure. Serve them
+    // all from one coalesced read of the whole region instead.
+    const region = pageIndexRegion(metadata);
+    if (region) file = withCoalescedIndexRegion(file, region);
+  }
   return { url, file, metadata, cache, prefetched, pageRangeMemo: new Map(), flatCache: createFlatCache() };
+}
+
+// The contiguous byte region holding every ColumnIndex and OffsetIndex in the
+// file, [start, end), or null when the file carries none or the region is
+// implausibly large (see INDEX_REGION_CAP_BYTES).
+export function pageIndexRegion(metadata: FileMetaData): [number, number] | null {
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const rg of metadata.row_groups) {
+    for (const c of rg.columns) {
+      if (c.column_index_offset != null && c.column_index_length) {
+        const s = Number(c.column_index_offset);
+        lo = Math.min(lo, s);
+        hi = Math.max(hi, s + c.column_index_length);
+      }
+      if (c.offset_index_offset != null && c.offset_index_length) {
+        const s = Number(c.offset_index_offset);
+        lo = Math.min(lo, s);
+        hi = Math.max(hi, s + c.offset_index_length);
+      }
+    }
+  }
+  if (!Number.isFinite(lo) || hi <= lo || hi - lo > INDEX_REGION_CAP_BYTES) return null;
+  return [lo, hi];
+}
+
+// Wrap an AsyncBuffer so any slice falling entirely inside the page-index
+// region is served from a single lazily-fetched read of the whole region.
+// The region read itself goes through the underlying buffer, so it lands in
+// the byte cache like any other range. A failed region read clears the memo,
+// so one transient error does not poison every later index read.
+export function withCoalescedIndexRegion(base: AsyncBuffer, region: [number, number]): AsyncBuffer {
+  const [regionStart, regionEnd] = region;
+  let regionBytes: Promise<ArrayBuffer> | null = null;
+  return {
+    byteLength: base.byteLength,
+    slice(start, end) {
+      const e = end === undefined ? base.byteLength : end;
+      const s = start < 0 ? base.byteLength + start : start;
+      if (s < regionStart || e > regionEnd || e <= s) return base.slice(start, end);
+      if (!regionBytes) {
+        regionBytes = Promise.resolve(base.slice(regionStart, regionEnd)).catch((err) => {
+          regionBytes = null;
+          throw err;
+        });
+      }
+      return regionBytes.then((buf) => buf.slice(s - regionStart, e - regionStart));
+    },
+  };
 }
 
 export async function getCachedFile(url: string): Promise<{ file: AsyncBuffer; metadata: FileMetaData }> {

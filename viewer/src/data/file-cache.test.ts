@@ -9,9 +9,19 @@ vi.mock('hyparquet', () => ({
   parquetMetadataAsync: (...args: unknown[]) => parquetMetadataAsync(...args),
 }));
 
-import { getCachedFile, getPageRangeMemo, isFilePrefetched, resetFileCache } from './file-cache';
+import {
+  getCachedFile,
+  getPageRangeMemo,
+  isFilePrefetched,
+  pageIndexRegion,
+  resetFileCache,
+  withCoalescedIndexRegion,
+  type FileMetaData,
+} from './file-cache';
 
 const OVER_THRESHOLD = 40 * 1024 * 1024;
+
+const fetchMock = vi.fn();
 
 beforeEach(() => {
   resetFileCache();
@@ -19,6 +29,9 @@ beforeEach(() => {
   asyncBufferFromUrl.mockReset();
   asyncBufferFromUrl.mockImplementation(async () => ({ byteLength: 1000, slice: () => new ArrayBuffer(0) }));
   parquetMetadataAsync.mockImplementation(async () => ({ row_groups: [], schema: [] }));
+  fetchMock.mockReset();
+  fetchMock.mockImplementation(async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(1000) }));
+  vi.stubGlobal('fetch', fetchMock);
 });
 
 describe('getCachedFile', () => {
@@ -47,11 +60,25 @@ describe('getCachedFile', () => {
     const slice = vi.fn(async (s: number, e?: number) => new ArrayBuffer((e ?? 1000) - s));
     asyncBufferFromUrl.mockImplementation(async () => ({ byteLength: 1000, slice }));
     await getCachedFile('small.parquet');
-    // One contiguous GET of the whole file, then metadata read from memory.
-    expect(slice).toHaveBeenCalledWith(0, 1000);
+    // One plain un-ranged GET of the whole file (browser-cacheable, unlike the
+    // no-store ranged buffer), then metadata read from memory. The ranged
+    // buffer itself must stay untouched.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith('small.parquet');
+    expect(slice).not.toHaveBeenCalled();
     expect(isFilePrefetched('small.parquet')).toBe(true);
     const passed = parquetMetadataAsync.mock.calls[0][0] as { byteLength: number };
     expect(passed.byteLength).toBe(1000);
+  });
+
+  it('opens the ranged buffer with the browser HTTP cache bypassed', async () => {
+    // Chrome serializes concurrent same-url fetches on its cache-entry lock,
+    // so the ranged buffer must opt out of the disk cache or parallel range
+    // reads execute one at a time.
+    await getCachedFile('a.parquet');
+    expect(asyncBufferFromUrl).toHaveBeenCalledWith(
+      expect.objectContaining({ url: 'a.parquet', requestInit: { cache: 'no-store' } }),
+    );
   });
 
   it('keeps the range-request path above the threshold', async () => {
@@ -125,5 +152,89 @@ describe('getPageRangeMemo', () => {
 
   it('returns an empty throwaway map for an unknown url', () => {
     expect(getPageRangeMemo('missing.parquet').size).toBe(0);
+  });
+});
+
+// Build minimal metadata carrying page-index offsets. Offsets are bigint like
+// hyparquet's real thrift decode.
+function metaWithIndexes(
+  cols: Array<{ ci?: [number, number]; oi?: [number, number] }>,
+): FileMetaData {
+  return {
+    row_groups: [
+      {
+        columns: cols.map((c) => ({
+          column_index_offset: c.ci ? BigInt(c.ci[0]) : undefined,
+          column_index_length: c.ci ? c.ci[1] : undefined,
+          offset_index_offset: c.oi ? BigInt(c.oi[0]) : undefined,
+          offset_index_length: c.oi ? c.oi[1] : undefined,
+        })),
+      },
+    ],
+  } as unknown as FileMetaData;
+}
+
+describe('pageIndexRegion', () => {
+  it('spans the min column-index start to the max offset-index end', () => {
+    const meta = metaWithIndexes([
+      { ci: [1000, 40], oi: [2000, 60] },
+      { ci: [1040, 40], oi: [2060, 60] },
+    ]);
+    expect(pageIndexRegion(meta)).toEqual([1000, 2120]);
+  });
+
+  it('returns null when the file carries no page indexes', () => {
+    expect(pageIndexRegion(metaWithIndexes([{}, {}]))).toBeNull();
+  });
+
+  it('returns null past the size cap', () => {
+    const meta = metaWithIndexes([{ ci: [0, 10], oi: [64 * 1024 * 1024, 10] }]);
+    expect(pageIndexRegion(meta)).toBeNull();
+  });
+});
+
+describe('withCoalescedIndexRegion', () => {
+  // A base whose slices are identifiable: byte i of the file has value i % 251.
+  function countingBase(byteLength: number) {
+    const slice = vi.fn(async (start: number, end?: number) => {
+      const e = end ?? byteLength;
+      const buf = new Uint8Array(e - start);
+      for (let i = 0; i < buf.length; i++) buf[i] = (start + i) % 251;
+      return buf.buffer;
+    });
+    return { base: { byteLength, slice }, slice };
+  }
+
+  it('serves all in-region slices from one base read', async () => {
+    const { base, slice } = countingBase(10_000);
+    const wrapped = withCoalescedIndexRegion(base, [4000, 4500]);
+    const [a, b] = await Promise.all([wrapped.slice(4000, 4037), wrapped.slice(4400, 4415)]);
+    expect(slice).toHaveBeenCalledTimes(1);
+    expect(slice).toHaveBeenCalledWith(4000, 4500);
+    // Correct bytes, not just correct lengths.
+    expect(new Uint8Array(a)[0]).toBe(4000 % 251);
+    expect(new Uint8Array(b)[0]).toBe(4400 % 251);
+    expect(a.byteLength).toBe(37);
+    expect(b.byteLength).toBe(15);
+  });
+
+  it('passes slices outside or straddling the region to the base unchanged', async () => {
+    const { base, slice } = countingBase(10_000);
+    const wrapped = withCoalescedIndexRegion(base, [4000, 4500]);
+    await wrapped.slice(0, 100);
+    await wrapped.slice(3990, 4010);
+    expect(slice).toHaveBeenCalledWith(0, 100);
+    expect(slice).toHaveBeenCalledWith(3990, 4010);
+    expect(slice).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries the region read after a failure instead of staying poisoned', async () => {
+    const { base, slice } = countingBase(10_000);
+    slice.mockRejectedValueOnce(new Error('transient'));
+    const wrapped = withCoalescedIndexRegion(base, [4000, 4500]);
+    await expect(wrapped.slice(4000, 4010)).rejects.toThrow('transient');
+    const ok = await wrapped.slice(4000, 4010);
+    expect(ok.byteLength).toBe(10);
+    expect(slice).toHaveBeenCalledTimes(2);
   });
 });
