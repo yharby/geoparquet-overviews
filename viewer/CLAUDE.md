@@ -86,7 +86,18 @@ Node >= 24, pnpm 11.9.0.
   whole kept span as the viewport shifts. `src/data/byte-cache.ts` and
   `file-cache.ts` cache bytes and file handles one level down. `file-cache.ts`
   also memoizes each group's decoded page index, so pruning a group a second
-  time is free.
+  time is free. Two request-shaping constraints live there and must not be
+  undone. Ranged reads set `cache: 'no-store'`: Chrome serializes concurrent
+  same-url fetches on its disk-cache entry lock, so cacheable range reads
+  execute one at a time, each paying full latency (an observed 9s stall for
+  ~1.3 KB of page-index reads), while the viewport-dependent ranges near-never
+  re-hit the disk cache anyway. The whole-file prefetch (≤32 MB) deliberately
+  keeps the default cache mode, one un-ranged GET has no concurrency to lose
+  and re-serves from disk on reload. And every ColumnIndex/OffsetIndex slice
+  is served from one lazily-fetched coalesced read of the whole page-index
+  region (`pageIndexRegion` + `withCoalescedIndexRegion`), because the
+  structures are 15-100 bytes each and contiguous before the footer, so
+  per-structure reads cost one round trip apiece at deep zoom.
 - `src/map/polygon-layer.ts` and `map-view.ts` build deck.gl layers.
   Batches paint progressively, then each settled view consolidates to
   single-digit layer counts. The fill, line, and point layers are pickable
