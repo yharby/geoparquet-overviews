@@ -49,10 +49,25 @@ interface FileEntry {
   // and zoom. A null value records that a group cannot be page pruned, so the
   // caller falls back to a whole-group read without re-reading the indexes.
   pageRangeMemo: Map<number, PageRange[] | null>;
+  // In-flight page-index reads keyed by row-group index. Two overlapping view
+  // fetches (e.g. two moveends settling before either's page-index round trip
+  // returns) can both see a group missing from pageRangeMemo and, without this,
+  // would each issue their own read for the same range. Single-flight per index,
+  // mirroring the whole-file `pending` dedup above. Cleared once the read settles
+  // and its result lands in pageRangeMemo.
+  pageRangePending: Map<number, Promise<PageRange[] | null>>;
   // Decoded, flattened, reprojected geometry keyed per row group and level of
   // detail, so a repeat view reuses the buckets instead of re-reading and
   // re-decoding. Dies with the file entry, so switching urls frees it.
   flatCache: FlatCache;
+  // Decoded density counts of the footer's count column, keyed by row-group
+  // index, aligned to the group's own rows. The column is immutable for the
+  // file, so each group is read once. A null value records a failed read, so
+  // styling falls back to constant without refetching on every view.
+  countsMemo: Map<number, Int32Array | null>;
+  // In-flight count reads keyed by row-group index, single-flight for the same
+  // reason as pageRangePending.
+  countsPending: Map<number, Promise<Int32Array | null>>;
 }
 
 // One file resident at a time, matching the previous single-slot behavior.
@@ -105,7 +120,18 @@ async function loadFileEntry(url: string): Promise<FileEntry> {
     const region = pageIndexRegion(metadata);
     if (region) file = withCoalescedIndexRegion(file, region);
   }
-  return { url, file, metadata, cache, prefetched, pageRangeMemo: new Map(), flatCache: createFlatCache() };
+  return {
+    url,
+    file,
+    metadata,
+    cache,
+    prefetched,
+    pageRangeMemo: new Map(),
+    pageRangePending: new Map(),
+    flatCache: createFlatCache(),
+    countsMemo: new Map(),
+    countsPending: new Map(),
+  };
 }
 
 // The contiguous byte region holding every ColumnIndex and OffsetIndex in the
@@ -206,6 +232,28 @@ export function pinCoarseRanges(url: string, intervals: Array<[number, number]>)
 
 export function getPageRangeMemo(url: string): Map<number, PageRange[] | null> {
   if (entry && entry.url === url) return entry.pageRangeMemo;
+  return new Map();
+}
+
+// The in-flight page-index read map for the resident file, see pageRangePending.
+// An unknown url gets a throwaway map, mirroring getPageRangeMemo.
+export function getPageRangePending(url: string): Map<number, Promise<PageRange[] | null>> {
+  if (entry && entry.url === url) return entry.pageRangePending;
+  return new Map();
+}
+
+// The density-count memo for the resident file, keyed by row-group index. An
+// unknown url gets a throwaway map, mirroring getPageRangeMemo, so a stray
+// caller cannot pollute the resident file's entry.
+export function getCountsMemo(url: string): Map<number, Int32Array | null> {
+  if (entry && entry.url === url) return entry.countsMemo;
+  return new Map();
+}
+
+// The in-flight count read map for the resident file, see countsPending. An
+// unknown url gets a throwaway map, mirroring getPageRangeMemo.
+export function getCountsPending(url: string): Map<number, Promise<Int32Array | null>> {
+  if (entry && entry.url === url) return entry.countsPending;
   return new Map();
 }
 

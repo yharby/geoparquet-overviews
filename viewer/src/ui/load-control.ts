@@ -55,8 +55,8 @@ export class LoadControl extends LitElement {
 
   // The presets to offer: the current manifest version's datasets when the
   // manifest loaded and that version has any, else the built-in FILE_PRESETS.
-  // This is the graceful-fallback path exercised today, since versions.json
-  // is not yet published, fetchManifest always resolves null.
+  // The manifest ships in `public/versions.json`, so it normally loads; the
+  // FILE_PRESETS fallback covers a missing or malformed file only.
   private presets(): FilePreset[] {
     if (this.manifest && this.version) {
       const fromManifest = presetsForVersion(this.manifest, this.version);

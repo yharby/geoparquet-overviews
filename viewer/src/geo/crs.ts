@@ -121,6 +121,22 @@ export function parseCrs(geo: Record<string, unknown> | null): CrsInfo {
   return GEOGRAPHIC;
 }
 
+// A degenerate source coordinate (out of a projection's domain, or already
+// non-finite in the source WKB) can make proj4 return NaN, Infinity, or a
+// wildly out-of-range value. deck.gl's WebMercator projection asserts every
+// vertex's latitude is within [-90, 90] and throws "invalid latitude"
+// otherwise, tearing down the whole layer, so one corrupt feature would blank
+// the entire map instead of just rendering wrong. Clamp to the valid lon/lat
+// range and fall back to (0, 0) for a non-finite value, the same
+// never-crash-the-overlay stance as the covering-box clamp in geo/aoi.ts.
+function sanitizeLon(x: number): number {
+  return Number.isFinite(x) ? Math.min(180, Math.max(-180, x)) : 0;
+}
+
+function sanitizeLat(y: number): number {
+  return Number.isFinite(y) ? Math.min(90, Math.max(-90, y)) : 0;
+}
+
 // Reproject an interleaved-xy positions array to lon/lat in place, reading two
 // scratch values and writing them back per vertex. This is the flat-buffer
 // counterpart of applying `transform` per GeoJSON vertex: it runs proj4 once per
@@ -129,28 +145,49 @@ export function parseCrs(geo: Record<string, unknown> | null): CrsInfo {
 export function transformPositionsInPlace(positions: Float64Array, transform: CoordTransform): void {
   for (let i = 0; i < positions.length; i += 2) {
     const [x, y] = transform(positions[i], positions[i + 1]);
-    positions[i] = x;
-    positions[i + 1] = y;
+    positions[i] = sanitizeLon(x);
+    positions[i + 1] = sanitizeLat(y);
   }
 }
 
-// Reproject a source-CRS bounding box to lon/lat by transforming its four
-// corners and taking the min/max. Good enough for row-group pruning and for
-// flying the map to the data. Returns the input unchanged when transform is null.
+// Samples per edge when reprojecting a bbox. A curved projection (transverse
+// Mercator, the EPSG:3067 datasets) bows a rectangle's edges out past its
+// corners, so corner-only sampling under-covers the true lon/lat envelope. That
+// is unsound for the whole-band skip, a band extent sampled at its corners can
+// fall short of a member row group's own reprojected bbox and drop an in-view
+// band. Sampling along the edges makes the result a conservative superset, which
+// can only ever keep a group that might be in view, never drop one. The extremes
+// of a smooth transform over a rectangle lie on its boundary, so the perimeter
+// is enough, no interior grid needed.
+const REPROJECT_EDGE_SAMPLES = 8;
+
+// Reproject a source-CRS bounding box to lon/lat and take the min/max. Samples
+// along every edge, not just the four corners, so the result is a conservative
+// superset of the true envelope under a curved projection. Good for row-group
+// pruning, the whole-band skip, and flying the map to the data. Returns the
+// input unchanged when transform is null.
 export function reprojectBbox(bbox: Bbox, transform: CoordTransform | null): Bbox {
   if (!transform) return bbox;
-  const corners: [number, number][] = [
-    transform(bbox.xmin, bbox.ymin),
-    transform(bbox.xmin, bbox.ymax),
-    transform(bbox.xmax, bbox.ymin),
-    transform(bbox.xmax, bbox.ymax),
-  ];
-  const xs = corners.map((c) => c[0]);
-  const ys = corners.map((c) => c[1]);
-  return {
-    xmin: Math.min(...xs),
-    ymin: Math.min(...ys),
-    xmax: Math.max(...xs),
-    ymax: Math.max(...ys),
+  const n = REPROJECT_EDGE_SAMPLES;
+  let xmin = Infinity;
+  let ymin = Infinity;
+  let xmax = -Infinity;
+  let ymax = -Infinity;
+  const add = (sx: number, sy: number) => {
+    const [x, y] = transform(sx, sy);
+    if (x < xmin) xmin = x;
+    if (x > xmax) xmax = x;
+    if (y < ymin) ymin = y;
+    if (y > ymax) ymax = y;
   };
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const sx = bbox.xmin + (bbox.xmax - bbox.xmin) * t;
+    const sy = bbox.ymin + (bbox.ymax - bbox.ymin) * t;
+    add(sx, bbox.ymin); // bottom edge
+    add(sx, bbox.ymax); // top edge
+    add(bbox.xmin, sy); // left edge
+    add(bbox.xmax, sy); // right edge
+  }
+  return { xmin, ymin, xmax, ymax };
 }

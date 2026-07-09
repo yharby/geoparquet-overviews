@@ -33,10 +33,22 @@ export interface OverviewLevel {
   rowGroupStart: number;
   maxZoom: number;
   gsd: number;
+  // The lowest web zoom this band serves. Present from 0.3.0 on. Older files
+  // lack it, so parseOverviews fills it from the ladder, level 0 starts at zoom
+  // 0 and each later band starts one past the previous band's maxZoom.
+  minZoom: number;
+  // The band's feature count from the footer, or null when the field is absent
+  // (pre 0.3.0). Surfaced so the panel can show the thinning payoff.
+  featureCount: number | null;
   // Optional 0.2.0 fields. The band's file byte range [start, end) so a reader
   // can price a prefix read, and its padded extent in CRS units.
   bytes: [number, number] | null;
   extent: [number, number, number, number] | null;
+  // The reprojected, viewport-comparable form of `extent`, filled in
+  // readGeoParquetMetadata where the CRS transform is in scope. Null when the
+  // band has no extent or parseOverviews built it with no projection. Drives the
+  // whole-band skip in bandsOutsideAoi.
+  extentBbox: Bbox | null;
 }
 
 export interface OverviewsInfo {
@@ -51,11 +63,18 @@ export interface OverviewsInfo {
   // Simplified-geometry column that coarse bands read instead of `geometry`,
   // or null when the file has no overview column (the flat variants).
   overviewColumn: string | null;
-  // How the overview geometry was derived (`simplify_snap`, `thin`) and how
-  // features were ranked into bands (`area_desc`, `length_desc`, ...). Purely
-  // descriptive footer fields, surfaced in the read-cost panel.
+  // How the overview geometry was derived (`simplify_snap`, `thin`, or `none`
+  // for a single-band file where nothing was reduced) and how features were
+  // ranked into bands (`area_desc`, `length_desc`, ...). Purely descriptive
+  // footer fields, surfaced in the read-cost panel.
   overviewMethod: string | null;
   importance: string | null;
+  // The per-row density count column (0.3.0 `count_column`, written as
+  // `overview_count` by density thinning), or null when absent. Each
+  // coarse-band row holds how many source features competed for that
+  // survivor's one-pixel thinning cell, itself included, null on the finest
+  // band and invalid rows. Drives the density-aware styling.
+  countColumn: string | null;
   levels: OverviewLevel[];
 }
 
@@ -215,6 +234,9 @@ export function parseOverviews(raw: Record<string, unknown> | null): OverviewsIn
       rowGroupStart: 0, // stamped after the sort, from the previous level
       maxZoom: l.max_zoom !== undefined ? Number(l.max_zoom) : Number(l.zoom),
       gsd: Number(l.gsd),
+      // NaN when absent, so the ladder post-pass below can fill it.
+      minZoom: l.min_zoom != null ? Number(l.min_zoom) : NaN,
+      featureCount: l.feature_count != null ? Number(l.feature_count) : null,
       bytes:
         Array.isArray(l.bytes) && l.bytes.length === 2
           ? ([Number(l.bytes[0]), Number(l.bytes[1])] as [number, number])
@@ -223,11 +245,24 @@ export function parseOverviews(raw: Record<string, unknown> | null): OverviewsIn
         Array.isArray(l.extent) && l.extent.length === 4
           ? (l.extent.map(Number) as [number, number, number, number])
           : null,
+      // parseOverviews has no projection, so the reprojected form is filled
+      // later in readGeoParquetMetadata.
+      extentBbox: null as Bbox | null,
     }))
     .sort((a, b) => a.level - b.level);
   if (mode === 'duplicating') {
     for (let i = 1; i < levels.length; i++) {
       levels[i].rowGroupStart = levels[i - 1].rowGroupEnd + 1;
+    }
+  }
+  // Fill any missing minZoom from the band ladder, so the field is robust
+  // whether or not the footer carries it. Level 0 starts at zoom 0, every later
+  // band starts one past the previous band's maxZoom.
+  for (let i = 0; i < levels.length; i++) {
+    if (!Number.isFinite(levels[i].minZoom)) {
+      // Never let the fill run past this band's own maxZoom, a non-monotonic
+      // older footer would otherwise print a backwards range like z25-10.
+      levels[i].minZoom = i === 0 ? 0 : Math.min(levels[i - 1].maxZoom + 1, levels[i].maxZoom);
     }
   }
   return {
@@ -237,6 +272,7 @@ export function parseOverviews(raw: Record<string, unknown> | null): OverviewsIn
     overviewColumn: typeof raw.overview_column === 'string' ? raw.overview_column : null,
     overviewMethod: typeof raw.overview_method === 'string' ? raw.overview_method : null,
     importance: typeof raw.importance === 'string' ? raw.importance : null,
+    countColumn: typeof raw.count_column === 'string' ? raw.count_column : null,
     levels,
   };
 }
@@ -270,6 +306,19 @@ export function readGeoParquetMetadata(rawMeta: FileMetaData): GeoParquetMetadat
   const coveringPaths = extractCoveringPaths(geo);
   const geometryTypes = extractGeometryTypes(geo);
   const projection = parseCrs(geo);
+
+  // Reproject each band's padded extent to lon/lat, the same transform applied
+  // to every row-group bbox below, so a band extent can be compared to a
+  // lon/lat AOI for the whole-band skip. A band with no extent keeps a null
+  // extentBbox and is never skipped.
+  if (overviewsInfo) {
+    for (const level of overviewsInfo.levels) {
+      if (level.extent) {
+        const [xmin, ymin, xmax, ymax] = level.extent;
+        level.extentBbox = reprojectBbox({ xmin, ymin, xmax, ymax }, projection.transform);
+      }
+    }
+  }
 
   const rowGroups: RowGroupInfo[] = metadata.row_groups.map((rowGroup, index) => {
     let bbox: Bbox | null = null;
@@ -600,17 +649,84 @@ export function columnForLevel(info: OverviewsInfo, level: OverviewLevel): strin
   return 'geometry';
 }
 
-// Row groups a level covers, intersected with the AOI. In the banded layout
-// a level owns the cumulative prefix [0..rowGroupEnd]; in the duplicating
-// layout it owns only its own slice [rowGroupStart..rowGroupEnd], a complete
-// self-contained rendering. Within that range the bbox covering prunes to
-// the viewport.
-export function rowGroupsForLevel(rowGroups: RowGroupInfo[], level: OverviewLevel, aoi: Bbox): number[] {
+// True when the footer's `version` string is at least major.minor, comparing
+// only the leading "MAJOR.MINOR" digits. A missing or unparsable version reads
+// as old, so behavior newer drafts opt into stays off for it.
+function overviewsVersionAtLeast(version: string, major: number, minor: number): boolean {
+  const m = /^(\d+)\.(\d+)/.exec(version.trim());
+  if (!m) return false;
+  const maj = Number(m[1]);
+  const min = Number(m[2]);
+  return maj > major || (maj === major && min >= minor);
+}
+
+// The geometry column to read for one row group within a cumulative-prefix read
+// at `level`. The target band reads its own column (its overview, or exact for
+// the finest band). On a banded 0.3.0+ file, a coarser band caught in the same
+// prefix reads its EXACT geometry instead of its own overview, because 0.3.0
+// snaps each band to its own per-band grid tied to that band's zoom, so its
+// overview painted at this finer zoom would show as an oversized block (a
+// band-2 building snapped to a ~0.6 km grid is a ~1 km triangle at z16).
+// Coarse bands hold few features there, so their exact geometry is cheap and
+// crisp. Pre-0.3.0 files snapped every band to one fine global grid, so their
+// coarse overviews render correctly at mid zoom, and their band 0 holds the
+// largest-area (heaviest WKB) features, so reading them exact would multiply
+// the mid-zoom read cost on every already-published dataset. Those files, and
+// any file with no parsable version, keep the plain per-level column. The
+// gpq-tiles duplicating layout reads only the target band's own slice, so the
+// fallback never applies there and columnForLevel serves it unchanged.
+export function columnForRowGroup(
+  info: OverviewsInfo,
+  level: OverviewLevel,
+  rgBand: number | null,
+): string {
+  if (
+    info.mode === 'banded' &&
+    overviewsVersionAtLeast(info.version, 0, 3) &&
+    rgBand !== null &&
+    rgBand < level.level
+  ) {
+    return 'geometry';
+  }
+  return columnForLevel(info, level);
+}
+
+// The band ordinals whose padded extent is known and does not intersect the
+// AOI. Every feature in such a band is outside the view, so all of its row
+// groups can be skipped, including the ones whose own bbox is null. A band with
+// an unknown (null) extentBbox is NEVER added, unknown extent means keep, the
+// same conservative rule as a null row-group bbox. This can only ever remove
+// row groups we can prove are outside the view.
+export function bandsOutsideAoi(levels: OverviewLevel[], aoi: Bbox): Set<number> {
+  const skip = new Set<number>();
+  for (const level of levels) {
+    if (level.extentBbox && !bboxIntersectsAoi(level.extentBbox, aoi)) {
+      skip.add(level.level);
+    }
+  }
+  return skip;
+}
+
+// Row groups a level covers, intersected with the AOI. In the banded (this
+// spec's cumulative) layout a level owns the prefix [0..rowGroupEnd]; in the
+// duplicating layout it owns only its own slice [rowGroupStart..rowGroupEnd], a
+// complete self-contained rendering. rowGroupStart is 0 for banded, so the same
+// lower bound serves both. Within that range the bbox covering prunes to the
+// viewport, and `skipBands` drops any row group whose whole band was proven
+// outside the view (see bandsOutsideAoi), including a band's null-bbox groups
+// the per-group bbox check would otherwise keep.
+export function rowGroupsForLevel(
+  rowGroups: RowGroupInfo[],
+  level: OverviewLevel,
+  aoi: Bbox,
+  skipBands: Set<number> = new Set(),
+): number[] {
   return rowGroups
     .filter(
       (rg) =>
         rg.index >= level.rowGroupStart &&
         rg.index <= level.rowGroupEnd &&
+        !(rg.band !== null && skipBands.has(rg.band)) &&
         (rg.bbox === null || bboxIntersectsAoi(rg.bbox, aoi)),
     )
     .map((rg) => rg.index);

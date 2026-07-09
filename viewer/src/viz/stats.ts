@@ -27,6 +27,13 @@ export interface LoadSummary {
   // prune counts split the fetched groups into page-pruned and whole reads.
   column: string;
   band: number | null;
+  // The selected band's feature count and the [minZoom, maxZoom] it serves,
+  // from the 0.3.0 footer. Null when the file predates the fields or the plan
+  // has no band (the flat path). Shown so the thinning payoff is visible, a
+  // coarse band can hold a few hundred million features.
+  bandFeatureCount: number | null;
+  bandMinZoom: number | null;
+  bandMaxZoom: number | null;
   pagePrunedGroups: number;
   wholeGroups: number;
 }
@@ -54,13 +61,14 @@ function addFetch(t: Totals, phase: FetchPhase, bytes: number): void {
   t.perPhase.set(phase, p);
 }
 
-const PHASE_ORDER: FetchPhase[] = ['footer', 'prefetch', 'metadata', 'page-index', 'row-group-fetch'];
+const PHASE_ORDER: FetchPhase[] = ['footer', 'prefetch', 'metadata', 'page-index', 'row-group-fetch', 'count-fetch'];
 const PHASE_LABEL: Record<FetchPhase, string> = {
   footer: 'footer',
   prefetch: 'whole-file prefetch',
   metadata: 'metadata',
   'page-index': 'page index',
   'row-group-fetch': 'row-group fetch',
+  'count-fetch': 'density counts',
 };
 
 function bytesStr(n: number): string {
@@ -250,8 +258,23 @@ export class LoadStats extends LitElement {
       <div class="readouts">
         <div class="ro">
           <div class="k">Reading</div>
-          <div class="v" style="font-size: 12px">${reading} ${s.band !== null ? html`<small>Level ${s.band}</small>` : ''}</div>
+          <div class="v" style="font-size: 12px">
+            ${reading}
+            ${s.band !== null
+              ? html`<small
+                  >Level ${s.band}${s.bandMinZoom !== null && s.bandMaxZoom !== null
+                    ? ` · z${s.bandMinZoom}-${s.bandMaxZoom}`
+                    : ''}</small
+                >`
+              : ''}
+          </div>
         </div>
+        ${s.bandFeatureCount !== null
+          ? html`<div class="ro">
+              <div class="k">Band features</div>
+              <div class="v">${fmtInt(s.bandFeatureCount)}</div>
+            </div>`
+          : ''}
         <div class="ro">
           <div class="k">Row groups</div>
           <div class="v">${s.rowGroupsFetched} <small>/ ${s.rowGroupsTotal} fetched</small></div>

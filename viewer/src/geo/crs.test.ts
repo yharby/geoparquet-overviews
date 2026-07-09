@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseCrs, reprojectBbox } from './crs';
+import { parseCrs, reprojectBbox, transformPositionsInPlace } from './crs';
 
 // A PROJJSON-ish stub for a projected CRS, only the fields parseCrs reads.
 const projected = (code: number) => ({
@@ -117,5 +117,59 @@ describe('reprojectBbox', () => {
     expect(b.ymax).toBeLessThan(61);
     expect(b.xmin).toBeLessThan(b.xmax);
     expect(b.ymin).toBeLessThan(b.ymax);
+  });
+
+  it('reprojects a sub-box within its parent under a curved projection (whole-band skip soundness)', () => {
+    // EPSG:3067 is transverse Mercator, so a rectangle's edges bow out past its
+    // corners. A member row group sits inside its band's CRS extent, so its
+    // reprojected bbox must stay inside the band extent's reprojected envelope,
+    // else the whole-band skip could drop a group that is actually in view.
+    const c = parseCrs(projected(3067));
+    const parent = { xmin: 100000, ymin: 6600000, xmax: 700000, ymax: 7700000 };
+    const child = { xmin: 380000, ymin: 7680000, xmax: 420000, ymax: 7700000 }; // top-center sliver
+    const P = reprojectBbox(parent, c.transform);
+    const C = reprojectBbox(child, c.transform);
+    const eps = 1e-9;
+    expect(C.xmin).toBeGreaterThanOrEqual(P.xmin - eps);
+    expect(C.ymin).toBeGreaterThanOrEqual(P.ymin - eps);
+    expect(C.xmax).toBeLessThanOrEqual(P.xmax + eps);
+    expect(C.ymax).toBeLessThanOrEqual(P.ymax + eps);
+  });
+});
+
+describe('transformPositionsInPlace', () => {
+  it('passes a well-behaved transform through unchanged', () => {
+    const positions = new Float64Array([1, 2, 3, 4]);
+    transformPositionsInPlace(positions, (x, y) => [x * 2, y * 2]);
+    expect(Array.from(positions)).toEqual([2, 4, 6, 8]);
+  });
+
+  // A degenerate source coordinate or a transform's domain edge can make
+  // proj4 return NaN/Infinity/out-of-range values. deck.gl's WebMercator
+  // projection throws "invalid latitude" and tears down the whole layer on
+  // any such vertex, so one corrupt feature must not be able to blank the
+  // entire map. See the sanitizeLon/sanitizeLat comment in crs.ts.
+  it('clamps an out-of-range result into the valid lon/lat envelope', () => {
+    const positions = new Float64Array([0, 0]);
+    transformPositionsInPlace(positions, () => [200, 95]);
+    expect(positions[0]).toBe(180);
+    expect(positions[1]).toBe(90);
+  });
+
+  it('clamps a negative out-of-range result', () => {
+    const positions = new Float64Array([0, 0]);
+    transformPositionsInPlace(positions, () => [-200, -95]);
+    expect(positions[0]).toBe(-180);
+    expect(positions[1]).toBe(-90);
+  });
+
+  it('replaces a non-finite result with (0, 0) instead of propagating NaN/Infinity', () => {
+    const positions = new Float64Array([0, 0, 0, 0]);
+    transformPositionsInPlace(positions.subarray(0, 2), () => [NaN, 45]);
+    transformPositionsInPlace(positions.subarray(2, 4), () => [10, Infinity]);
+    expect(positions[0]).toBe(0);
+    expect(positions[1]).toBe(45);
+    expect(positions[2]).toBe(10);
+    expect(positions[3]).toBe(0);
   });
 });

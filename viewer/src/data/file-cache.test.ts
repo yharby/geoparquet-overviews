@@ -12,6 +12,8 @@ vi.mock('hyparquet', () => ({
 import {
   getCachedFile,
   getPageRangeMemo,
+  getPageRangePending,
+  getCountsPending,
   isFilePrefetched,
   pageIndexRegion,
   resetFileCache,
@@ -152,6 +154,26 @@ describe('getPageRangeMemo', () => {
 
   it('returns an empty throwaway map for an unknown url', () => {
     expect(getPageRangeMemo('missing.parquet').size).toBe(0);
+  });
+});
+
+describe('getPageRangePending and getCountsPending', () => {
+  it('are stable per url, so a second overlapping caller sees the first one in flight', async () => {
+    await getCachedFile('a.parquet');
+    const pending = getPageRangePending('a.parquet');
+    const probe = Promise.resolve(null);
+    pending.set(5, probe);
+    expect(getPageRangePending('a.parquet').get(5)).toBe(probe);
+
+    const countsPending = getCountsPending('a.parquet');
+    const countsProbe = Promise.resolve(null);
+    countsPending.set(5, countsProbe);
+    expect(getCountsPending('a.parquet').get(5)).toBe(countsProbe);
+  });
+
+  it('return an empty throwaway map for an unknown url', () => {
+    expect(getPageRangePending('missing.parquet').size).toBe(0);
+    expect(getCountsPending('missing.parquet').size).toBe(0);
   });
 });
 

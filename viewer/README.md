@@ -33,6 +33,11 @@ the current view needs.
 - It picks a band per zoom level. Low zooms read the simplified
   `geom_overview` column from the coarse row-group prefix, high zooms read
   the exact `geometry` column.
+- When the file carries survivor counts (the 0.3.0 `count_column` footer
+  field), coarse-band features render density weighted, point radius and fill
+  opacity scale with how many source features each survivor stands for, so a
+  dense city reads as dense even though thinning keeps one feature per pixel.
+  Files without counts keep the constant styling.
 - It prunes row groups by bbox, so only groups intersecting the viewport are
   fetched. The bbox comes from the physical `bbox` covering column when the
   file carries one. For files written without it (Profile B, converter

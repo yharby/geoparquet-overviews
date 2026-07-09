@@ -17,6 +17,12 @@ export interface RowGroupRange {
   index: number;
   rowStart: number;
   rowEnd: number;
+  // The geometry column to read for this specific group. A cumulative-prefix
+  // read mixes columns (the target band's overview for its own groups, exact
+  // geometry for coarser bands), so each range names its own column. Falls back
+  // to the `column` argument of readColumnProgressive when absent (the flat
+  // path, and the tests, pass a single column for every group).
+  column?: string;
   // When present, the row group is read as these page-pruned sub-ranges (each an
   // absolute [rowStart, rowEnd)) with the offset index, instead of the whole
   // [rowStart, rowEnd) span. All sub-ranges of one group are read then painted
@@ -107,6 +113,9 @@ export async function readColumnProgressive(
     // group, so hyparquet reads the whole chunk) and only prunes pages for a
     // sub-range, so it is safe to set for every read.
     const spans = range.subRanges ?? [{ rowStart: range.rowStart, rowEnd: range.rowEnd }];
+    // The prefix read mixes overview and exact geometry across bands, so each
+    // group reads its own column when it names one, else the shared default.
+    const groupColumn = range.column ?? column;
     const geometries: unknown[] = [];
     // The absolute parquet row of each kept geometry, aligned with `geometries`.
     // Nulls are dropped so the array index is not the row ordinal, so the row is
@@ -118,7 +127,7 @@ export async function readColumnProgressive(
       await parquetRead({
         file,
         metadata,
-        columns: [column],
+        columns: [groupColumn],
         rowStart: span.rowStart,
         rowEnd: span.rowEnd,
         compressors,

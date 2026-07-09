@@ -23,7 +23,12 @@ export interface VersionManifest {
   versions: ManifestVersion[];
 }
 
-export const MANIFEST_URL = 'https://data.source.coop/youssef-harby/geoparquet-overviews/versions.json';
+// The manifest ships with the viewer in `public/versions.json`, resolved
+// against the app's base URL so it works under any static-host subpath (the
+// vite `base` is relative). The catalog's `base` field still points at the
+// hosted store, so the manifest only lists datasets, the parquet bytes are
+// fetched from source.coop as before.
+export const MANIFEST_URL = `${import.meta.env.BASE_URL}versions.json`;
 
 function isDataset(d: unknown): d is ManifestDataset {
   const x = d as ManifestDataset;

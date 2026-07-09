@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 import {
   levelForZoom,
   columnForLevel,
+  columnForRowGroup,
   rowGroupsForLevel,
+  bandsOutsideAoi,
   coarseColumnIntervals,
   computeFileFacts,
   columnChunkBytes,
@@ -23,10 +25,11 @@ const INFO: OverviewsInfo = {
   overviewColumn: 'geom_overview',
   overviewMethod: 'simplify_snap',
   importance: 'area_desc',
+  countColumn: null,
   levels: [
-    { level: 0, rowGroupEnd: 19, rowGroupStart: 0, maxZoom: 8, gsd: 0.005, bytes: null, extent: null },
-    { level: 1, rowGroupEnd: 53, rowGroupStart: 0, maxZoom: 10, gsd: 0.00125, bytes: null, extent: null },
-    { level: 2, rowGroupEnd: 80, rowGroupStart: 0, maxZoom: 24, gsd: 0.0, bytes: null, extent: null },
+    { level: 0, rowGroupEnd: 19, rowGroupStart: 0, maxZoom: 8, gsd: 0.005, minZoom: 0, featureCount: null, bytes: null, extent: null, extentBbox: null },
+    { level: 1, rowGroupEnd: 53, rowGroupStart: 0, maxZoom: 10, gsd: 0.00125, minZoom: 9, featureCount: null, bytes: null, extent: null, extentBbox: null },
+    { level: 2, rowGroupEnd: 80, rowGroupStart: 0, maxZoom: 24, gsd: 0.0, minZoom: 11, featureCount: null, bytes: null, extent: null, extentBbox: null },
   ],
 };
 
@@ -103,6 +106,93 @@ describe('parseOverviews', () => {
     expect(info!.levels[1].bytes).toBeNull();
     expect(info!.levels[1].extent).toBeNull();
   });
+
+  it('reads min_zoom when present (0.3.0 file)', () => {
+    const info = parseOverviews({
+      version: '0.3.0',
+      levels: [
+        { level: 0, row_group_end: 1, max_zoom: 8, gsd: 100, min_zoom: 0 },
+        { level: 1, row_group_end: 5, max_zoom: 12, gsd: 10, min_zoom: 9 },
+        { level: 2, row_group_end: 9, max_zoom: 22, gsd: 0, min_zoom: 13 },
+      ],
+    });
+    expect(info!.levels.map((l) => l.minZoom)).toEqual([0, 9, 13]);
+  });
+
+  it('fills min_zoom from the ladder when absent (old 0.2.0 file)', () => {
+    // No min_zoom on any level, so the ladder derives it, level 0 at zoom 0 and
+    // each later band one past the previous band's max_zoom.
+    const info = parseOverviews({
+      version: '0.2.0',
+      levels: [
+        { level: 0, row_group_end: 1, max_zoom: 8, gsd: 100 },
+        { level: 1, row_group_end: 5, max_zoom: 12, gsd: 10 },
+        { level: 2, row_group_end: 9, max_zoom: 22, gsd: 0 },
+      ],
+    });
+    expect(info!.levels.map((l) => l.minZoom)).toEqual([0, 9, 13]);
+  });
+
+  it('parses feature_count when present and is null when absent', () => {
+    const info = parseOverviews({
+      version: '0.3.0',
+      levels: [
+        { level: 0, row_group_end: 1, max_zoom: 8, gsd: 100, feature_count: 350_000_000 },
+        { level: 1, row_group_end: 5, max_zoom: 22, gsd: 0 },
+      ],
+    });
+    expect(info!.levels[0].featureCount).toBe(350_000_000);
+    expect(info!.levels[1].featureCount).toBeNull();
+  });
+
+  it('parses count_column when present and is null when absent', () => {
+    const levels = [
+      { level: 0, row_group_end: 1, max_zoom: 8, gsd: 100 },
+      { level: 1, row_group_end: 5, max_zoom: 22, gsd: 0 },
+    ];
+    const withCounts = parseOverviews({ version: '0.3.0', count_column: 'overview_count', levels });
+    expect(withCounts!.countColumn).toBe('overview_count');
+    // Absent (pre 0.3.0, or 0.3.0 with no thinning counts) reads as null.
+    expect(parseOverviews({ version: '0.2.0', levels })!.countColumn).toBeNull();
+    // A non-string value is ignored, not stringified.
+    expect(parseOverviews({ version: '0.3.0', count_column: 7, levels })!.countColumn).toBeNull();
+  });
+});
+
+describe('bandsOutsideAoi', () => {
+  // Band 0's extent sits far east of the AOI, band 1 overlaps it, band 2 has no
+  // extentBbox at all (unknown extent).
+  const level = (l: number, extentBbox: { xmin: number; ymin: number; xmax: number; ymax: number } | null) => ({
+    level: l,
+    rowGroupEnd: l,
+    rowGroupStart: 0,
+    maxZoom: 8,
+    gsd: 0,
+    minZoom: 0,
+    featureCount: null,
+    bytes: null,
+    extent: null,
+    extentBbox,
+  });
+  const levels = [
+    level(0, { xmin: 100, ymin: 0, xmax: 110, ymax: 10 }),
+    level(1, { xmin: 0, ymin: 0, xmax: 10, ymax: 10 }),
+    level(2, null),
+  ];
+  const aoi = { xmin: 1, ymin: 1, xmax: 5, ymax: 5 };
+
+  it('returns a band whose extent misses the AOI', () => {
+    const skip = bandsOutsideAoi(levels, aoi);
+    expect(skip.has(0)).toBe(true);
+  });
+
+  it('never returns a band whose extent intersects the AOI', () => {
+    expect(bandsOutsideAoi(levels, aoi).has(1)).toBe(false);
+  });
+
+  it('never returns a band with a null extentBbox (unknown extent means keep)', () => {
+    expect(bandsOutsideAoi(levels, aoi).has(2)).toBe(false);
+  });
 });
 
 describe('hasRenderableGeometry', () => {
@@ -146,6 +236,57 @@ describe('columnForLevel', () => {
   });
 });
 
+describe('columnForRowGroup', () => {
+  // The exact-geometry fallback for a coarser band caught in a finer band's
+  // prefix is version gated. 0.3.0 snaps each band to its own coarse grid, so
+  // painting a coarse overview at a finer zoom shows giant blocks and the
+  // fallback is required. 0.1.0/0.2.0 snapped every band to one fine global
+  // grid, so their coarse overviews are correct at mid zoom and their band 0
+  // holds the heaviest exact WKB, so the fallback would multiply the read cost.
+  const INFO_030: OverviewsInfo = { ...INFO, version: '0.3.0' };
+
+  it('reads exact geometry for a coarser band in the prefix on a 0.3.0 file', () => {
+    expect(columnForRowGroup(INFO_030, INFO_030.levels[1], 0)).toBe('geometry');
+    expect(columnForRowGroup(INFO_030, INFO_030.levels[2], 0)).toBe('geometry');
+    expect(columnForRowGroup(INFO_030, INFO_030.levels[2], 1)).toBe('geometry');
+  });
+
+  it('reads the level column for the target band and past 0.3.0', () => {
+    expect(columnForRowGroup(INFO_030, INFO_030.levels[1], 1)).toBe('geom_overview');
+    expect(columnForRowGroup(INFO_030, INFO_030.levels[2], 2)).toBe('geometry');
+    // A later draft keeps the fallback, the compare is >=, not ===.
+    const future: OverviewsInfo = { ...INFO, version: '1.0.0' };
+    expect(columnForRowGroup(future, future.levels[1], 0)).toBe('geometry');
+  });
+
+  it('keeps the overview column for a coarser prefix band on a pre-0.3.0 file', () => {
+    // INFO is 0.1.0, one fine global snap grid, so the coarse overview is
+    // correct at this zoom and stays the cheap read.
+    expect(columnForRowGroup(INFO, INFO.levels[1], 0)).toBe('geom_overview');
+    expect(columnForRowGroup(INFO, INFO.levels[2], 0)).toBe('geometry'); // finest level is exact anyway
+    const v020: OverviewsInfo = { ...INFO, version: '0.2.0' };
+    expect(columnForRowGroup(v020, v020.levels[1], 0)).toBe('geom_overview');
+  });
+
+  it('treats a missing or unparsable version as old (no fallback)', () => {
+    const noVersion: OverviewsInfo = { ...INFO, version: '' };
+    expect(columnForRowGroup(noVersion, noVersion.levels[1], 0)).toBe('geom_overview');
+    const junk: OverviewsInfo = { ...INFO, version: 'draft' };
+    expect(columnForRowGroup(junk, junk.levels[1], 0)).toBe('geom_overview');
+  });
+
+  it('leaves the duplicating dialect on the per-level column', () => {
+    // A duplicating level is self-contained, so a coarser band never appears in
+    // its read anyway; the gate keeps the behavior byte-identical regardless.
+    const dup: OverviewsInfo = { ...INFO, version: '0.3.0', mode: 'duplicating' };
+    expect(columnForRowGroup(dup, dup.levels[1], 0)).toBe('geom_overview');
+  });
+
+  it('keeps the level column for an unknown (null) band', () => {
+    expect(columnForRowGroup(INFO_030, INFO_030.levels[1], null)).toBe('geom_overview');
+  });
+});
+
 describe('rowGroupsForLevel', () => {
   const rg = (index: number, xmin: number, xmax: number): RowGroupInfo => ({
     index,
@@ -174,6 +315,30 @@ describe('rowGroupsForLevel', () => {
     // The exact band would include the row groups past 19.
     const level2 = rowGroupsForLevel(rowGroups, INFO.levels[2], aoi);
     expect(Math.max(...level2)).toBeGreaterThan(19);
+  });
+
+  it('drops a null-bbox row group belonging to a skipped band, keeps one in an intersecting band', () => {
+    // A skipped band's row groups drop even when their own bbox is null, since
+    // the whole band was proven outside the view. Row groups carry a band here,
+    // group 0 with a null bbox in skipped band 0, group 1 in band 1 kept.
+    const withBand = (index: number, band: number, bbox: RowGroupInfo['bbox']): RowGroupInfo => ({
+      index,
+      rowCount: 100,
+      totalByteSize: 1000,
+      bbox,
+      band,
+    });
+    const groups: RowGroupInfo[] = [
+      withBand(0, 0, null), // null bbox, band 0 (skipped)
+      withBand(1, 1, { xmin: 4, ymin: 0, xmax: 6, ymax: 1 }), // band 1, intersects
+    ];
+    const aoi = { xmin: 5, ymin: 0, xmax: 15, ymax: 1 };
+    const skip = new Set<number>([0]);
+    // The finest level owns the whole prefix, so both groups are in range by index.
+    const kept = rowGroupsForLevel(groups, INFO.levels[2], aoi, skip);
+    expect(kept).toEqual([1]);
+    // With no skip set, the null-bbox group 0 is conservatively kept.
+    expect(rowGroupsForLevel(groups, INFO.levels[2], aoi)).toEqual([0, 1]);
   });
 });
 

@@ -5,17 +5,28 @@ import type { CoordTransform } from '../geo/crs';
 import {
   levelForZoom,
   columnForLevel,
+  columnForRowGroup,
   rowGroupsForLevel,
   rowGroupsIntersecting,
+  bandsOutsideAoi,
   type GeoParquetMetadata,
 } from './metadata';
 
 export interface ReadPlan {
   // Row groups to read, already pruned to the viewport by bbox.
   indices: number[];
-  // The geometry column readColumnProgressive fetches, the flat exact
-  // `geometry` column, or the simplified `geom_overview` column at low zoom.
+  // The geometry column readColumnProgressive fetches for the level's own band,
+  // the flat exact `geometry` column, or the simplified `geom_overview` column
+  // at low zoom. A cumulative-prefix read can mix columns per row group, see
+  // columnForIndex; this is the target band's column, used for status and the
+  // read-cost panel.
   column: string;
+  // The geometry column to read for one specific row group index. In the
+  // overviews path on a banded 0.3.0+ file, a coarser band caught in the prefix
+  // reads exact `geometry` instead of its own too-coarse overview (version
+  // gated in columnForRowGroup), so the column varies per group. The flat path
+  // always returns 'geometry'.
+  columnForIndex: (index: number) => string;
   // A stable identity for the level of detail this plan reads, so a change in
   // level refetches even when the viewport is unchanged. It encodes the level
   // ordinal for the overviews path, since several coarse levels can share one
@@ -80,6 +91,7 @@ function flatStrategy(metadata: GeoParquetMetadata): LayoutStrategy {
         ? rowGroupsIntersecting(metadata.rowGroups, aoi)
         : metadata.rowGroups.map((rg) => rg.index),
       column: 'geometry',
+      columnForIndex: () => 'geometry',
       lodKey: 'flat',
       band: null,
       decode: (geometries, rows) => decodeGeometries(geometries, transform, rows),
@@ -98,9 +110,18 @@ function overviewsStrategy(metadata: GeoParquetMetadata): LayoutStrategy {
     planRead: (aoi, zoom) => {
       const level = levelForZoom(info, zoom);
       const column = columnForLevel(info, level);
+      // Skip whole coarse bands whose padded extent misses the view, so their
+      // row groups (null-bbox ones included) never read. The finest exact band
+      // spans the dataset, so it is never skipped, which is correct.
+      const skipBands = bandsOutsideAoi(info.levels, aoi);
       return {
-        indices: rowGroupsForLevel(metadata.rowGroups, level, aoi),
+        indices: rowGroupsForLevel(metadata.rowGroups, level, aoi, skipBands),
         column,
+        // A coarser band in the prefix reads exact geometry on 0.3.0+ files,
+        // the target band its own column. Keyed off the row group's stamped
+        // band ordinal, version gated in columnForRowGroup.
+        columnForIndex: (index) =>
+          columnForRowGroup(info, level, metadata.rowGroups[index]?.band ?? null),
         lodKey: `L${level.level}:${column}`,
         band: level.level,
         decode: (geometries, rows) => decodeGeometries(geometries, transform, rows),

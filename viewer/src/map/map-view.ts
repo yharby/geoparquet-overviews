@@ -1,7 +1,7 @@
 import maplibregl from 'maplibre-gl';
 import { MapboxOverlay } from '@deck.gl/mapbox';
 import type { Layer, PickingInfo } from '@deck.gl/core';
-import type { Bbox } from '../geo/aoi';
+import { clampGeographicBbox, type Bbox } from '../geo/aoi';
 
 // Dark basemap. The one external style the viewer loads, for context
 // under the polygons a range request pulls.
@@ -157,10 +157,11 @@ export class MapView {
   }
 
   flyToBbox(bbox: Bbox): void {
+    const b = clampGeographicBbox(bbox);
     this.map.fitBounds(
       [
-        [bbox.xmin, bbox.ymin],
-        [bbox.xmax, bbox.ymax],
+        [b.xmin, b.ymin],
+        [b.xmax, b.ymax],
       ],
       { padding: 40, duration: 600 },
     );
@@ -172,10 +173,11 @@ export class MapView {
   // of showing the pre-fly camera for the whole animation. Padding matches
   // flyToBbox. Returns null before the map has a size or if MapLibre cannot fit.
   zoomForBbox(bbox: Bbox): number | null {
+    const b = clampGeographicBbox(bbox);
     const camera = this.map.cameraForBounds(
       [
-        [bbox.xmin, bbox.ymin],
-        [bbox.xmax, bbox.ymax],
+        [b.xmin, b.ymin],
+        [b.xmax, b.ymax],
       ],
       { padding: 40 },
     );
