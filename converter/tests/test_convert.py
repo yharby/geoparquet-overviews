@@ -330,6 +330,15 @@ def test_overview_ladder_anchored_at_coarsest_zoom():
     assert three[1] == pytest.approx(three[0] / (2 ** _ZOOMS_PER_BAND))
 
 
+def test_overview_tolerances_geometric_ladder():
+    """The ladder is extent-relative, not zoom-anchored. Band 0 resolves at
+    `coarsest_rel` of the span, and each finer coarse band divides the
+    tolerance by `ladder_factor`."""
+    tol = _overview_tolerances(4, span=1000.0, coarsest_rel=0.01, ladder_factor=2.0)
+    assert tol == {0: 10.0, 1: 5.0, 2: 2.5}  # 3 coarse bands, band 3 is exact
+    assert set(tol) == {0, 1, 2}
+
+
 def test_band0_is_the_coarsest_zoom_pixel():
     """Band 0's tolerance equals the ground sample distance at `z_coarsest`, the
     zoom where the dataset extent fills the screen. A world dataset anchors at

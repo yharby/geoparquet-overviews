@@ -780,32 +780,31 @@ def _assign_bands(
     return band, importance, overview_method, score
 
 
-def _overview_tolerances(bands: int, world: float, z_coarsest: int) -> dict[int, float]:
+def _overview_tolerances(
+    bands: int, span: float,
+    coarsest_rel: float = _COARSEST_REL, ladder_factor: float = _LADDER_FACTOR,
+) -> dict[int, float]:
     """Simplify tolerance and thinning cell size per coarse band, in the data's
-    own units, anchored in absolute web zoom. Band b serves up to zoom
-    z_coarsest + _ZOOMS_PER_BAND * b, and its tolerance is the ground sample
-    distance at that zoom, world / (256 * 2 ** zoom). The coarsest band (b = 0) is
-    anchored at `z_coarsest`, the zoom where the dataset extent fills the screen,
-    not at world zoom, so a sub-world dataset does not emit coarse bands below its
-    own visible range where every feature would snap to null. A world dataset has
-    z_coarsest == _ZOOMS_PER_BAND, so band b serves _ZOOMS_PER_BAND * (b + 1)
-    exactly as the fixed ladder did and the tolerances are unchanged.
-    `_zoom_for_gsd` of a band's tolerance returns that band's zoom exactly."""
+    own units, extent relative rather than zoom anchored. Band 0 resolves at
+    `coarsest_rel` of `span`, the larger of the dataset's own x and y extent,
+    and each finer coarse band divides that tolerance by `ladder_factor`, one
+    geometric ladder for every band count."""
     return {
-        b: world / (256 * 2 ** (z_coarsest + _ZOOMS_PER_BAND * b))
+        b: span * coarsest_rel / (ladder_factor ** b)
         for b in range(bands - 1)
     }
 
 
 def _overview_grids(
-    bands: int, world: float, z_coarsest: int, override: float | None
+    bands: int, span: float, coarsest_rel: float, ladder_factor: float,
+    override: float | None,
 ) -> dict[int, float]:
     """Snap grid per coarse band, in the data's own units. Each band snaps to a
-    fraction of its own tolerance (a quarter pixel at the zoom it serves), so a
-    coarse band carries only the coordinate precision it actually paints, not the
-    global fine grid it never shows. A single `override` forces the same grid on
+    fraction of its own tolerance (a quarter of its pixel), so a coarse band
+    carries only the coordinate precision it actually paints, not the global
+    fine grid it never shows. A single `override` forces the same grid on
     every band, the escape hatch for `--overview-grid`."""
-    tol = _overview_tolerances(bands, world, z_coarsest)
+    tol = _overview_tolerances(bands, span, coarsest_rel, ladder_factor)
     if override is not None:
         return {b: override for b in tol}
     return {b: tol[b] / _GRID_SUBPIXEL for b in tol}
@@ -998,8 +997,8 @@ def _overview_band(
 
 def _build_overview(
     geoms: np.ndarray, band: np.ndarray, dimensions: np.ndarray, bands: int,
-    world: float, z_coarsest: int, grids: dict[int, float], geom_bytes: np.ndarray,
-    jobs: int = 1,
+    span: float, coarsest_rel: float, ladder_factor: float, grids: dict[int, float],
+    geom_bytes: np.ndarray, jobs: int = 1,
 ) -> tuple[np.ndarray, dict[int, float], dict[int, float]]:
     """Build the overview WKB for every coarse band feature, per its dimension,
     NULL for the finest band. Each coarse band snaps to its own grid from
@@ -1010,7 +1009,7 @@ def _build_overview(
     Invalid rings are repaired with `make_valid` on this overview path only, so
     one bowtie polygon cannot abort the conversion. The exact `geometry` column
     is never touched, which is the project invariant."""
-    tolerances = _overview_tolerances(bands, world, z_coarsest)
+    tolerances = _overview_tolerances(bands, span, coarsest_rel, ladder_factor)
     out = np.full(len(geoms), None, dtype=object)
     for b, tol in tolerances.items():
         mask = band == b
@@ -1251,6 +1250,10 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     )
     span_x = max(dataset_bbox[2] - dataset_bbox[0], 1e-12)
     span_y = max(dataset_bbox[3] - dataset_bbox[1], 1e-12)
+    # The single extent-relative span the tolerance ladder anchors to, the
+    # larger of the two axes, so a tall or wide extent still gets one
+    # consistent band 0 tolerance.
+    span = max(span_x, span_y)
     log.info("extent %.4g x %.4g units", span_x, span_y)
 
     # The coarsest band's anchor zoom, where the dataset extent fills the screen.
@@ -1339,7 +1342,7 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     if opts.thin:
         thin_mask = valid
         rx, ry = _representative_points(geoms, dimensions, bounds, thin_mask, jobs=opts.jobs)
-        tolerances = _overview_tolerances(bands, world, z_coarsest)
+        tolerances = _overview_tolerances(bands, span, opts.coarsest_rel, opts.ladder_factor)
         budgets = _band_budgets(n_valid, bands, opts.drop_rate)
         if budgets:
             log.info("per-band survivor budget (drop_rate %.2f): %s", opts.drop_rate, budgets)
@@ -1421,24 +1424,25 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     survivor_counts = survivor_counts[sort_idx]
     log.info("sorted band-major, Hilbert within each band")
 
-    # Per-band overview snap grid, a pure function of the final band count, the
-    # world span, and the extent-anchored coarsest zoom, so re-conversion stays
+    # Per-band overview snap grid, a pure function of the final band count and
+    # the extent-relative tolerance ladder, so re-conversion stays
     # byte-identical idempotent. Each coarse band snaps to a quarter of its own
     # pixel, unless `--overview-grid` forces a single grid on every band.
-    band_grids = _overview_grids(bands, world, z_coarsest, opts.overview_grid)
+    band_grids = _overview_grids(bands, span, opts.coarsest_rel, opts.ladder_factor, opts.overview_grid)
 
     # A pure-point dataset carries no overview column, its banding (thinning or
     # attribute rank) is the level of detail. Everything else builds an overview.
     if overview_method == "thin":
         log.info("point dataset, no overview column, banding is the level of detail")
         overview_wkb = np.full(len(geoms), None, dtype=object)
-        band_tol = _overview_tolerances(bands, world, z_coarsest)
+        band_tol = _overview_tolerances(bands, span, opts.coarsest_rel, opts.ladder_factor)
         has_overview = False
     else:
         jobs = opts.jobs if opts.jobs > 0 else (os.cpu_count() or 1)
         log.info("building overview column across %d thread(s)", jobs)
         overview_wkb, band_tol, band_grids = _build_overview(
-            geoms, band, dimensions, bands, world, z_coarsest, band_grids, geom_bytes, jobs
+            geoms, band, dimensions, bands, span, opts.coarsest_rel, opts.ladder_factor,
+            band_grids, geom_bytes, jobs,
         )
         has_overview = any(v is not None for v in overview_wkb)
 
