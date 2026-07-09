@@ -433,47 +433,21 @@ def _band_budgets(n_valid: int, bands: int, drop_rate: float) -> dict[int, int]:
     }
 
 
-def _derive_bands(
-    byte_density: float, span_x: float, span_y: float, world: float,
-    screen_budget_bytes: float,
-) -> int:
-    """Total band count derived from the dataset's decode cost per screen, coarse
-    bands plus one exact band. The coarse ladder covers the zoom where the dataset
-    extent fills the screen up to the zoom where a _SCREEN_PX square viewport
-    decodes at most screen_budget_bytes of exact geometry. `byte_density` is the
-    local density from `_local_byte_density`, bytes per CRS area unit where the
-    data actually sits, it tracks vertices, so dense small features hit the
-    budget by feature count and a few huge polygons hit it by vertex count, and
-    the same derivation gives each the band count it needs. Dense or vertex-heavy
-    data gets more bands, sparse light data fewer, at _ZOOMS_PER_BAND zooms per
-    band. The ladder spans only the dataset's own visible zoom range, so a
-    sub-world dataset never emits coarse bands below where its extent is a speck
-    (those would snap every feature to null), and a dataset whose exact geometry
-    already fits the budget at its coarsest zoom gets a single exact band with
-    no overview at all."""
+def _derive_bands(byte_density, span, coarsest_rel, ladder_factor, screen_budget_bytes):
+    """Total band count, coarse plus one exact, capped where exact geometry read
+    with page pruning already meets the per-screen byte budget. `gsd_fine` is the
+    ground sample distance at which a _SCREEN_PX square of exact geometry costs
+    screen_budget_bytes. Coarse bands are the ladder_factor halvings from the
+    coarsest tolerance (span * coarsest_rel) down to gsd_fine, so sparse light data
+    gets a single exact band and dense heavy data gets more, none past the cap."""
     if byte_density <= 0:
-        # No bytes anywhere, a single exact band is the honest answer. All-null
-        # input is rejected earlier, so this is a guard, not a real path.
         return 1
     gsd_fine = math.sqrt(screen_budget_bytes / byte_density) / _SCREEN_PX
-    # The exact band owns _FINE_MAX_ZOOM and beyond regardless of density, so the
-    # ladder never provisions overview bands past it.
-    z_fine = min(_zoom_for_gsd(gsd_fine, world), _FINE_MAX_ZOOM)
-    z_coarsest = _coarsest_zoom(span_x, span_y, world)
-    # The coarse ladder covers the zoom span [z_coarsest, z_fine) at
-    # _ZOOMS_PER_BAND zooms per band, so it needs ceil(steps / _ZOOMS_PER_BAND)
-    # coarse bands, plus one exact band. When the exact geometry is already
-    # affordable at the coarsest zoom (z_fine <= z_coarsest, steps 0) no coarse
-    # band is warranted and the dataset is a single exact band with no overview,
-    # which is the honest answer for sparse light data. A coarse band placed past
-    # z_fine would carry an overview barely coarser than exact geometry, so the
-    # count is capped there, never rounded up beyond it.
-    steps = max(0, z_fine - z_coarsest)
-    coarse = min(
-        _MAX_COARSE_BANDS,
-        _max_coarse_for_zoom(z_coarsest),
-        math.ceil(steps / _ZOOMS_PER_BAND),
-    )
+    coarsest_tol = span * coarsest_rel
+    if coarsest_tol <= gsd_fine or ladder_factor <= 1:
+        return 1
+    steps = math.floor(math.log(coarsest_tol / gsd_fine, ladder_factor)) + 1
+    coarse = min(_MAX_COARSE_BANDS, max(0, steps))
     return coarse + 1
 
 
@@ -1304,7 +1278,8 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
         byte_density, avg_density, byte_density / avg_density if avg_density > 0 else 0.0,
     )
     bands = opts.bands if opts.bands else _derive_bands(
-        byte_density, span_x, span_y, world, opts.screen_budget_mb * 1_000_000
+        byte_density, span, opts.coarsest_rel, opts.ladder_factor,
+        opts.screen_budget_mb * 1_000_000,
     )
     # A forced --bands is still held to the zoom ceiling, an overview band at or
     # past _FINE_MAX_ZOOM would just be exact geometry grid-snapped.

@@ -414,6 +414,21 @@ def test_derive_bands_scales_with_density():
     assert tighter >= dense
 
 
+def test_derive_bands_depth_cap():
+    """The depth-capped form. Coarse bands are ladder_factor halvings from
+    span * coarsest_rel down to the finest useful tolerance, capped so sparse
+    light data gets a single exact band and dense heavy data never runs away."""
+    # sparse/light: exact already fits the screen budget at the coarsest tol -> single exact band
+    assert _derive_bands(byte_density=1.0, span=1000.0, coarsest_rel=0.01,
+                          ladder_factor=2.0, screen_budget_bytes=1e12) == 1
+    # dense/heavy: many halvings warranted, but never unbounded
+    n = _derive_bands(byte_density=1e9, span=1_000_000.0, coarsest_rel=1/1500,
+                      ladder_factor=2.0, screen_budget_bytes=1e6)
+    assert 2 <= n <= 10
+    # denser data asks for at least as many bands as lighter data
+    assert _derive_bands(1e9, 1e6, 1/1500, 2.0, 1e6) >= _derive_bands(1e5, 1e6, 1/1500, 2.0, 1e6)
+
+
 def _polys_with_vertices(n, nverts, seed=1):
     """`n` regular polygons over the same 0..10 extent, each with `nverts`
     vertices, so two calls with the same n and seed but different nverts differ
