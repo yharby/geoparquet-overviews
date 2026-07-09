@@ -5,7 +5,7 @@
 `geoparquet-overviews` is a proposal for the GeoParquet community. It defines one
 GeoParquet file that a web map can preview instantly and a SQL engine can read in
 full, with no duplicated exact geometry. It is a draft convention plus a
-reference converter and a live viewer. Status draft 0.2.0, Apache-2.0. This is a
+reference converter and a live viewer. Status draft 0.3.0, Apache-2.0. This is a
 proposal repo, so keep everything vendor neutral, no commercial company names in
 code, docs, or the spec.
 
@@ -67,18 +67,23 @@ pnpm dev                                            # vite, port 5173+
   by bbox. The finest exact band still cuts by the byte budget, and a floor keeps
   tiny datasets from fragmenting.
 - Viewer prunes reads below row-group granularity. When a chosen row group covers
-  far more area than the view (about 4x or more) and the file carries the Parquet
+  more area than the view (1.5x or more) and the file carries the Parquet
   page indexes, it reads the `bbox` covering column's ColumnIndex and OffsetIndex,
   maps the view to the overlapping page row ranges, and reads geometry with
   hyparquet's offset-index option so only overlapping pages are fetched. Any
-  failure falls back to a whole-group read.
+  failure falls back to a whole-group read. The 1.5x threshold (was 4x) closes the
+  gap where a row group merely intersecting a corner of the viewport used to be
+  decoded in full with no page-level pruning at all.
 - Viewer reprojects projected files to lon and lat in the browser with proj4
   (v2.20.9, which ships its own types, do not add `@types/proj4`). Known
   projected CRS defs live in the `PROJ_DEFS` registry in `crs.ts`, seeded with
   EPSG:3067. Unknown projected codes show a notice instead of a broken render.
-- Validated end to end on a real 5.65M-row EPSG:3067 buildings dataset. A
-  whole-country preview reads ~9 MB (band 0 overview) vs ~620 MB exact geometry,
-  ~67x less. The viewer renders it correctly over Finland.
+- Validated end to end on a real 5.65M-row EPSG:3067 buildings dataset. Under
+  the density-thinned layout a whole-country preview reads the band 0 overview
+  column, ~2 MB on disk decoding ~13 MB of area-sized quads, vs ~620 MB exact
+  geometry, ~47x less decoded and ~90x less over the wire (the pre-0.3.0
+  fraction-banded figure was ~9 MB decoded, ~67x, with no density signal and
+  coverage stopping at z10). The viewer renders it correctly over Finland.
 - Converter ranks features per geometry dimension, area for polygons, length
   for lines, an attribute column or grid thinning for points, and writes the
   resulting `overview_method` into the footer. The viewer renders points,
@@ -95,6 +100,80 @@ pnpm dev                                            # vite, port 5173+
   Index as before, Profile B (`--no-bbox`) omits them and relies solely on
   native GeospatialStatistics for row-group pruning, with no page-level
   pruning at all since Parquet has no page-level geospatial statistics.
+- Draft 0.3.0 (branch `feat/v030-band-thinning`, not yet merged). Bands are now
+  formed by deterministic density thinning, not an importance fraction. Every
+  valid feature starts in band 0 and, coarsest band first, the converter keeps
+  one survivor per pixel per geometry dimension (the highest ranked feature
+  winning each cell, ties broken on a crc32 of the feature WKB so it stays
+  idempotent) and demotes the rest to the next finer band. No feature is
+  dropped, the finest band is exact and keeps everyone demoted into it. The old
+  fraction model (`_DEFAULT_BAND_FRACTIONS`, `_band_by_fraction`, `_thin_points`)
+  is deleted. The overview ladder runs in absolute web zoom, but its coarsest
+  band is anchored at the zoom where the dataset extent fills a screen
+  (`_coarsest_zoom`, extent span over `_SCREEN_PX`), not at whole-world zoom, so
+  a city-scale file never spends bands on zooms where its extent is a speck (band
+  b serves `z_coarsest + 2*b`, cell `world/(256*2**zoom)`). The band count is
+  derived from a decoded-bytes-per-screen budget (`--screen-budget-mb`, default
+  1.0), covering `z_coarsest` up to the zoom where exact geometry fits the
+  budget, so count-heavy and vertex-heavy data each get the band count they need
+  with no regime branch, and a sparse dataset that already fits the budget at its
+  coarsest zoom gets a single exact band and no overview. The budget solves
+  against local byte density (`_local_byte_density`, a byte-weighted 0.9
+  quantile over a 128x128 grid of bbox centroids), not the whole-extent
+  average, because clustered data (buildings in cities inside an empty bbox)
+  otherwise derives too few coarse bands and hands dense-city screens the
+  unthinned exact band far too early. No overview band may serve at or past
+  zoom 24 (`_max_coarse_for_zoom` clamps derived and forced counts), the exact
+  band owns z24 up. Each coarse-band survivor carries `overview_count`, its
+  cell population in the pass it won (band 0's counts sum to the full valid
+  total only when no per-band budget binds, see the budget bullet below),
+  the density signal one-per-pixel thinning would otherwise erase,
+  advertised by a top-level `count_column` footer field and written for
+  pure-point files too. A survivor whose shape collapses below its band's
+  pixel writes a small area-sized grid-aligned quad (`_quad_fallback`,
+  Tippecanoe's tiny-polygon-reduction idiom) and a collapsed line writes a
+  short oriented segment (`_segment_fallback`), never NULL, otherwise a
+  buildings dataset blanks its entire whole-country first paint. Each
+  geometry type keeps its kind in the overview, only point features paint as
+  points. Coarse-band coverings pad by half the band tolerance to enclose the
+  quad. A file that collapses to a single band writes `overview_method:
+  "none"`, never a false `simplify_snap`. Each coarse band
+  snaps its overview to its own per-band grid (a quarter of that band's pixel).
+  The giant-triangle bug (a coarse band's overview painting at a fine zoom via
+  the cumulative prefix) is fixed on both sides, the converter's fine
+  extent-anchored overviews plus the viewer reading exact geometry for a
+  coarser band caught in a finer band's prefix (`columnForRowGroup`, gated to
+  0.3.0+ files, pre-0.3.0 files snapped every band to one fine global grid so
+  their coarse overviews stay correct and cheap at mid zooms). The `overviews`
+  key is version `0.3.0`, `levels[]` gained `min_zoom`, `grid`, and
+  `feature_count`, and the block gained a descriptive `regime` label and
+  `count_column`. `--bands 0` derives, a positive value forces it (still zoom
+  clamped). SPEC.md and DESIGN.md are updated. Reconversion and republish of
+  the hosted `v0.3.0/` prefix with the current converter (count column, local
+  density ladder) is pending.
+- v0.3.0's `_thin_bands` also applies a per-band survivor budget
+  (`_band_budgets`, `--drop-rate`, default 2.0), gpq-tiles/tippecanoe style
+  geometric decay toward the coarsest band, with the last coarse band capped
+  too so real overflow reaches the exact band and skips its overview, fixing
+  the disproportionate mid-band weight a pure one-per-pixel ladder produced
+  on count-heavy data (validated against the real Tokyo buildings fixture,
+  see `docs/superpowers/specs/2026-07-09-band-budget-and-bbox-default-design.md`).
+  `--bbox` also stopped being a fixed always-on default, it now follows the
+  same count/vertex regime signal, on for count-heavy data where page pruning
+  earns its keep, off for vertex-heavy data where it was measured at a
+  rounding error of file size anyway.
+- Converter handles WKB geometry columns past 2 GB. Arrow's `binary` type
+  caps a contiguous array at 2 GB via its int32 offsets, so a whole-country
+  file used to crash with an offset overflow. It now decodes the column chunk
+  by chunk on read and, on write, switches the geometry column to
+  `large_binary` (paired with `ga.large_wkb()`) once the payload would
+  overflow, both physical `BYTE_ARRAY` in Parquet so readers are unaffected.
+  Small files stay on plain `binary` unchanged. See `converter/CLAUDE.md`.
+- Converter threads the overview build, its slowest stage, over `--jobs`
+  workers (default one per core). shapely 2.x releases the GIL on `simplify`,
+  `make_valid`, and `set_precision`, so threads parallelize them nearly
+  linearly with byte-identical output. Read and write already thread inside
+  pyarrow, and the WKB IO ops hold the GIL so they stay single-threaded.
 - Viewer supports click-to-inspect. Each rendered primitive carries a
   per-primitive `rowIds` provenance array back to its absolute parquet row,
   so a click resolves the feature, reads only that row's non-geometry columns
@@ -123,10 +202,13 @@ versioned by convention draft.
   dataset set reconverted with that draft's converter. `v0.2.0/` also carries
   `nls_rakennus_overviews.nobbox.parquet`, the Profile B (`--no-bbox`) twin of
   the Finland file.
-- `versions.json` at the base root is the manifest the viewer's version
-  dropdown reads (see `viewer/src/data/manifest.ts`, `MANIFEST_URL`). It lists
-  each version and its datasets, with `latest` pointing at the newest. Publish
-  it with content type `application/json`, parquet with `binary/octet-stream`.
+- The version dropdown reads its manifest from the viewer's bundled
+  `viewer/public/versions.json` (see `viewer/src/data/manifest.ts`,
+  `MANIFEST_URL`, resolved against `import.meta.env.BASE_URL`), not from the
+  hosted store. It lists each version and its datasets, with `latest` pointing
+  at the newest, and its `base` field points at the source.coop root so the
+  parquet bytes are still fetched there. Add a dataset by editing that file. Upload
+  parquet objects with content type `binary/octet-stream`.
 - The bucket is a real AWS S3 bucket, `us-west-2.opendata.source.coop` (the
   dots are part of the name), region `us-west-2`, no `--endpoint-url`. The
   write credentials and the exact `aws s3 cp` recipe are maintainer-local, not

@@ -46,11 +46,37 @@ in order. Footer JSON builders live in `footer.py`, the CLI in `cli.py`.
 4. Decode and measure. `shapely.from_wkb`, then `bounds`, `area`, `length`,
    `get_dimensions`. Null and empty geometries get a `valid` mask, the dataset
    extent and derived snap grid come from the valid bounds.
-5. Band assignment. `_assign_bands` ranks per dimension cohort, area for
-   polygons with cos latitude scaling, length for lines, `_importance_values`
-   or `_thin_points` for points, merged via `_percentile_desc` and cut by
-   `_band_by_fraction` with `_band_edges`. Null and empty rows are pinned to
-   the finest band, empty bands are merged and renumbered contiguously.
+5. Band count and assignment. The band count is derived from local byte
+   density by `_derive_bands` (a positive `--bands` overrides it), anchoring
+   the ladder in absolute web zoom so band 0 is a genuine zoomed-out pixel.
+   The density comes from `_local_byte_density`, a byte-weighted 0.9 quantile
+   over a 128x128 grid of bbox centroids, so clustered data derives the bands
+   its dense screens need instead of the whole-extent average. Both derived
+   and forced counts are clamped by `_max_coarse_for_zoom`, no overview band
+   serves at or past `_FINE_MAX_ZOOM`. `_assign_bands` ranks each dimension
+   cohort into a percentile `score` via `_percentile_desc`, area for polygons
+   with cos latitude scaling, length for lines, `_importance_values` or an
+   unscored spatial fallback for points, and starts every valid feature in
+   band 0. Density thinning (`_thin_bands`) is the sole banding mechanism, it
+   demotes the over-dense features down the ladder and returns each survivor's
+   cell population, which becomes the `overview_count` column (null on the
+   finest band, band 0's counts sum to the full valid total only when no
+   per-band budget binds, see below). Null and empty rows
+   are pinned to the finest band, empty bands are merged and renumbered
+   contiguously, and a file that collapses to a single band writes
+   `overview_method` `"none"`.
+
+   `_thin_bands` also applies an optional per-band survivor budget from
+   `_band_budgets`, `budget(b) = n_valid / drop_rate ** (finest - b + 1)`
+   (`--drop-rate`, default 2.0), a second demotion source on top of cell
+   contention. Unlike gpq-tiles' own formula the last coarse band is capped
+   too, so real overflow reaches the exact band and skips its overview
+   entirely, the only way the cap actually shrinks the file rather than
+   reshuffling bytes between coarse bands. A budget-demoted cell winner's
+   tally is cleared at the band it lost and recounted in the finer band it
+   falls into, so when the budget binds band 0, its survivor counts can sum
+   to less than the file's valid total. Each survivor's own count stays the
+   exact population of the cell it won.
 6. Hilbert sort. `_hilbert_distance` on quantized bbox centroids, then
    `np.lexsort((hilbert, band))`, band major, Hilbert minor.
 7. Overview build. `_build_overview` calls `_overview_band` per coarse band,
@@ -60,10 +86,12 @@ in order. Footer JSON builders live in `footer.py`, the CLI in `cli.py`.
 8. Row group planning. `_plan_row_groups`, coarse bands split into near equal
    chunks up to `coarse_row_groups`, the finest band cut by the exact geometry
    byte budget, every cut at a band boundary.
-9. Column assembly. Pre-existing `geometry`, `geom_overview`, `band`, `bbox`
-   columns are dropped so re-conversion is idempotent. Coarse band bboxes are
-   padded by grid/2 because snapping can move overview vertices outward.
-   `_bbox_struct` builds the covering with null structs for invalid rows.
+9. Column assembly. Pre-existing `geometry`, `geom_overview`, `band`, `bbox`,
+   and `overview_count` columns are dropped so re-conversion is idempotent.
+   Coarse band bboxes are padded by grid/2 because snapping can move overview
+   vertices outward. `_bbox_struct` builds the covering with null structs for
+   invalid rows. `overview_count` is written as int32 when thinning ran and
+   coarse bands exist, pure-point files included.
 10. Footer. `footer.geo_meta` and `footer.overviews_meta`, levels built from
     the real row group plan with `_zoom_for_gsd`, ladder kept strictly
     increasing. Overview geometry types recomputed via
@@ -90,18 +118,26 @@ them, via `_wkb_extension_type`. pyarrow 21+ turns that into the Parquet
 GEOMETRY logical type on write and computes GeospatialStatistics per row
 group. The `geo` footer key is written regardless, still WKB encoded, still
 version `"1.1.0"`, so the file is a dual write, valid GeoParquet 1.1 and
-native-2.0-capable at once. The `overviews` key's version is `"0.2.0"` for
+native-2.0-capable at once. The `overviews` key's version is `"0.3.0"` for
 this converter regardless of `--native-geo`, since `levels[].extent` and
-`levels[].bytes` are written either way.
+`levels[].bytes` are written either way. Draft 0.3.0 also enriches each level
+with `min_zoom` (the pair to `max_zoom`), `grid` (the band's per-band snap
+grid as a positional `origin` and `cell_size`, null on the finest exact band),
+and `feature_count`, and adds a top-level `regime` label (count-heavy versus
+vertex-heavy) alongside `importance` and a top-level `count_column` naming the
+`overview_count` survivor count column when thinning wrote one.
 
-`--bbox/--no-bbox` (default on = Profile A) controls whether the physical
-`bbox` covering struct column, its `geo` covering entry, and its page index
-and statistics get written at all. `--no-bbox` (Profile B) drops all of that
-and leans entirely on native GeospatialStatistics for row-group pruning.
-`_validate_options` raises if `--no-bbox` is combined with `--no-native-geo`,
-since that combination would leave the file with no pruning surface
-whatsoever. Profile B has no page-level pruning, Parquet has no page-level
-geospatial statistics, only row-group ones.
+`--bbox/--no-bbox` (default adaptive, follows the count/vertex regime,
+Profile A for count-heavy data, Profile B for vertex-heavy data) controls
+whether the physical `bbox` covering struct column, its `geo` covering entry,
+and its page index and statistics get written at all. `--no-bbox` (Profile B)
+drops all of that and leans entirely on native GeospatialStatistics for
+row-group pruning. `_validate_options` raises only on an *explicit*
+`--no-bbox` combined with `--no-native-geo`, since that combination would
+leave the file with no pruning surface whatsoever, an *adaptive* resolution
+that would land on bbox-off with `--no-native-geo` in effect is silently
+forced back to bbox-on instead. Profile B has no page-level pruning, Parquet
+has no page-level geospatial statistics, only row-group ones.
 
 ## Re-conversion of a native-typed file
 
@@ -122,8 +158,14 @@ geometry.
 - The exact `geometry` column is never modified. `make_valid` and `simplify`
   run only on the overview path in `_overview_values`.
 - The footer is honest. `importance` and `overview_method` record what was
-  actually done, never a hardcoded claim.
-- A degenerate overview result is NULL, never empty WKB.
+  actually done, never a hardcoded claim. A single-band file says `none`.
+- A coarse survivor whose shape collapses below its band pixel keeps its own
+  dimension, a polygon writes a small area-sized grid-aligned quad
+  (`_quad_fallback`) and a line writes a short oriented segment
+  (`_segment_fallback`), never NULL, so the preview never blanks and only
+  point features paint as points. Coarse coverings pad by half the band
+  tolerance to enclose the quad. NULL remains only for a feature whose
+  fallback also fails, and empty WKB is never written.
 - Row groups always cut at band boundaries, coarse bands land in a contiguous
   row group prefix.
 - Names are fixed by the convention. Footer key `overviews` parallel to `geo`,

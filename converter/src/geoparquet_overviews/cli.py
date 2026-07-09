@@ -28,7 +28,19 @@ def main() -> None:
 @main.command()
 @click.argument("src", type=click.Path(exists=True, dir_okay=False))
 @click.argument("dst", type=click.Path(dir_okay=False))
-@click.option("--bands", default=3, show_default=True, help="Number of importance bands.")
+@click.option(
+    "--bands",
+    default=0,
+    show_default=True,
+    help="Number of bands. 0 derives the count from byte density, a positive value forces it.",
+)
+@click.option(
+    "--screen-budget-mb",
+    default=1.0,
+    show_default=True,
+    type=float,
+    help="Decoded geometry a screen should target, in MB. The banding budget, lower asks for more coarse bands. Ignored when --bands is forced.",
+)
 @click.option(
     "--row-group-mb",
     default=16.0,
@@ -76,9 +88,8 @@ def main() -> None:
 )
 @click.option(
     "--bbox/--no-bbox",
-    default=True,
-    show_default=True,
-    help="Write the physical bbox covering column (Profile A). --no-bbox omits it and relies on native geospatial statistics only (Profile B), which disables page-level pruning.",
+    default=None,
+    help="Write the physical bbox covering column (Profile A) or omit it and rely on native geospatial statistics only (Profile B, disables page-level pruning). Default is adaptive: on for count-heavy data, off for vertex-heavy data. Either flag forces the choice explicitly.",
 )
 @click.option(
     "--jobs",
@@ -88,12 +99,26 @@ def main() -> None:
     type=int,
     help="Worker threads for the overview build, the slowest stage. 0 is one per core, 1 forces single-threaded.",
 )
+@click.option(
+    "--thin/--no-thin",
+    default=True,
+    show_default=True,
+    help="Density thin the coarse bands so each holds at most one feature per screen pixel per geometry dimension. --no-thin is a debug escape only.",
+)
+@click.option(
+    "--drop-rate",
+    default=2.0,
+    show_default=True,
+    type=float,
+    help="Geometric per-band survivor ceiling. Higher asks for a steeper falloff toward the coarsest band, and the last coarse band is capped too so genuine overflow reaches the exact band and skips its overview. A deeper derived band ladder compounds this cap on band 0, whose budget is n_valid divided by drop_rate raised to bands minus one. Must be greater than 1.0.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Verbose (DEBUG) logging.")
 @click.option("-q", "--quiet", is_flag=True, help="Only print the JSON summary, no stage logs.")
 def convert_cmd(
     src: str,
     dst: str,
     bands: int,
+    screen_budget_mb: float,
     row_group_mb: float,
     overview_grid: float | None,
     coarse_row_groups: int,
@@ -101,8 +126,10 @@ def convert_cmd(
     page_size_kb: int,
     importance_column: str | None,
     native_geo: bool,
-    bbox: bool,
+    bbox: bool | None,
     jobs: int,
+    thin: bool,
+    drop_rate: float,
     verbose: bool,
     quiet: bool,
 ) -> None:
@@ -111,6 +138,7 @@ def convert_cmd(
         _setup_logging(verbose)
     opts = ConvertOptions(
         bands=bands,
+        screen_budget_mb=screen_budget_mb,
         row_group_mb=row_group_mb,
         overview_grid=overview_grid,
         coarse_row_groups=coarse_row_groups,
@@ -120,6 +148,8 @@ def convert_cmd(
         native_geo=native_geo,
         bbox=bbox,
         jobs=jobs,
+        thin=thin,
+        drop_rate=drop_rate,
     )
     summary = convert(src, dst, opts)
     click.echo(json.dumps(summary, indent=2))

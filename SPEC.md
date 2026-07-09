@@ -1,6 +1,6 @@
 # GeoParquet Overviews Specification
 
-Status, draft 0.2.0. License, Apache-2.0.
+Status, draft 0.3.0. License, Apache-2.0.
 
 This document defines a convention for a single GeoParquet file that a web map
 can preview instantly and a SQL engine can read in full, with no duplicated
@@ -23,10 +23,12 @@ normative. Sections marked non-normative are informative only.
 
 ## Terminology
 
-- **Band.** One importance class of features. Band 0 holds the features that
-  matter most at low zoom, the last band holds everything else at exact
-  precision. Every feature belongs to exactly one band and is stored exactly
-  once.
+- **Band.** One level of detail. Bands are formed by density thinning, each
+  coarse band holds at most one feature per screen pixel per geometry dimension,
+  the highest ranked feature winning each cell, so band 0 is the sparsest and
+  carries the features that matter most at low zoom. The last band holds
+  everything else at exact precision. Every feature belongs to exactly one band
+  and is stored exactly once.
 - **Level.** The metadata description of one band, an entry in the
   `overviews.levels` array. Level ordinals and band ordinals are the same
   numbers.
@@ -38,7 +40,11 @@ normative. Sections marked non-normative are informative only.
   stored in a second geometry column. The exact primary geometry is never
   modified.
 - **gsd.** Ground sample distance, the resolution a band's overview geometry
-  was simplified to, expressed in CRS units per pixel.
+  was simplified to, expressed in CRS units per pixel. It is also the side of
+  the band's thinning cell, one pixel at the coarsest zoom the band serves.
+- **Regime.** A descriptive label for the dataset, count-heavy or vertex-heavy,
+  from the average geometry weight per feature. It records which kind of data
+  the file holds and never changes how a reader reads it.
 - **Prefix.** Because rows are band-major, the row groups of band k and all
   coarser bands form the contiguous row-group range from index 0 through band
   k's `row_group_end`.
@@ -60,9 +66,10 @@ major component of `version` is one they do not support.
 
 ```json
 {
-  "version": "0.2.0",
+  "version": "0.3.0",
   "spatial_key": "hilbert",
   "importance": "area_desc",
+  "regime": "count",
   "covering": {
     "bbox": {
       "xmin": ["bbox", "xmin"],
@@ -73,13 +80,17 @@ major component of `version` is one they do not support.
   },
   "overview_column": "geom_overview",
   "overview_method": "simplify_snap",
+  "count_column": "overview_count",
   "levels": [
-    { "level": 0, "row_group_end": 0,  "max_zoom": 8,  "gsd": 0.005,
-      "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [4096, 428112] },
-    { "level": 1, "row_group_end": 6,  "max_zoom": 10, "gsd": 0.00125,
-      "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [428112, 9532048] },
-    { "level": 2, "row_group_end": 22, "max_zoom": 24, "gsd": 0.0,
-      "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [9532048, 62004224] }
+    { "level": 0, "row_group_end": 0,  "min_zoom": 0, "max_zoom": 2,  "gsd": 0.3516,
+      "grid": { "origin": [0, 0], "cell_size": [0.0879, 0.0879] },
+      "feature_count": 512, "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [4096, 428112] },
+    { "level": 1, "row_group_end": 6,  "min_zoom": 3, "max_zoom": 4, "gsd": 0.0879,
+      "grid": { "origin": [0, 0], "cell_size": [0.0220, 0.0220] },
+      "feature_count": 8192, "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [428112, 9532048] },
+    { "level": 2, "row_group_end": 22, "min_zoom": 5, "max_zoom": 24, "gsd": 0.0,
+      "grid": null,
+      "feature_count": 5642000, "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [9532048, 62004224] }
   ]
 }
 ```
@@ -88,11 +99,13 @@ major component of `version` is one they do not support.
 
 | Field | Type | Requirement | Meaning |
 | --- | --- | --- | --- |
-| `version` | string | REQUIRED | The version of this convention the file was written against, `"0.2.0"` for this draft. |
+| `version` | string | REQUIRED | The version of this convention the file was written against, `"0.3.0"` for this draft. |
 | `levels` | array | REQUIRED | One entry per band, sorted ascending by `level`, coarsest first. MUST contain at least one entry. See the level fields below. |
 | `overview_method` | string | REQUIRED | How the reduced level of detail was produced. See the defined values below. |
 | `overview_column` | string | Conditionally REQUIRED | Name of the overview geometry column, `"geom_overview"` in the reference implementation. MUST be present when the file carries an overview geometry column and MUST be absent when it does not. |
-| `importance` | string | OPTIONAL | How features were ranked into bands. Descriptive only, see the defined values below. |
+| `count_column` | string | OPTIONAL | Name of the survivor count column, `"overview_count"` in the reference implementation. Present only when density thinning wrote one. Each coarse-band row's value is the number of source features, itself included, that competed for that survivor's thinning cell in the pass it won, and the value is null in the final band and on rows with null or empty geometry. It is the density signal thinning would otherwise erase, one survivor per cell makes a dense cluster and sparse coverage paint identically, and a reader MAY scale a survivor's symbol by this count so the cluster stays visible. A reader MUST NOT require it. |
+| `importance` | string | OPTIONAL | How features were ranked to decide which one wins each thinning cell. Descriptive only, see the defined values below. |
+| `regime` | string | OPTIONAL | A descriptive label for the dataset, `"count"` for many-feature data, `"vertex"` for few-heavy-geometry data, from the average bytes per feature. Descriptive only, a reader MUST NOT need to interpret it. |
 | `spatial_key` | string | OPTIONAL | The space-filling curve used for the within-band sort, `"hilbert"` in the reference implementation. Descriptive only. Readers MUST NOT depend on it. |
 | `covering` | object | OPTIONAL | Points at the bbox covering column, in the same shape as the GeoParquet `covering` object. If present it MUST be identical to the covering declared for the primary geometry column in `geo`. Readers SHOULD take the covering from `geo` and MAY ignore this copy. |
 
@@ -102,8 +115,11 @@ major component of `version` is one they do not support.
 | --- | --- | --- | --- |
 | `level` | integer | REQUIRED | Band ordinal. MUST start at 0 and MUST be contiguous, so the levels are numbered 0 through n minus 1. |
 | `row_group_end` | integer | REQUIRED | Index of the last row group belonging to this band, inclusive. The band's rows together with all coarser bands occupy the row-group prefix from 0 through this index. MUST be strictly increasing across levels. |
+| `min_zoom` | integer | REQUIRED | The lowest web zoom this band is intended to paint, the natural pair to `max_zoom`. It is 0 on level 0 and MUST equal the previous level's `max_zoom` plus 1 on every later level, so the levels tile the zoom range with no gap. Advisory only, see the zoom model below. |
 | `max_zoom` | integer | REQUIRED | The highest web zoom this band is intended to paint. MUST be strictly increasing across levels. Advisory only, see the zoom model below. |
-| `gsd` | number | REQUIRED | Ground sample distance the band's overview geometry was simplified to, in CRS units per pixel. MUST be 0 on the final level and MUST be greater than 0 on every coarse level. `gsd` is the authoritative resolution signal. |
+| `gsd` | number | REQUIRED | Ground sample distance the band's overview geometry was simplified to, in CRS units per pixel, which is also the side of the band's thinning cell. MUST be 0 on the final level and MUST be greater than 0 on every coarse level. `gsd` is the authoritative resolution signal. |
+| `grid` | object or null | OPTIONAL | The coordinate snap grid the band's overview was quantized to, `{ "origin": [x, y], "cell_size": [dx, dy] }` in the file's CRS units, both positional arrays. `origin` is the anchor of the snap lattice, the reference implementation snaps from coordinate zero so it is `[0, 0]`. A coordinate maps to the cell whose corner is `origin + n * cell_size`. A coarse level's grid is a sub-pixel fraction of its own `gsd`, so a coarse band carries only the precision it paints. MUST be null on the final level, which carries no overview. |
+| `feature_count` | integer | OPTIONAL | The number of features in this band. The values across all levels sum to the file's row count, so the footer itself attests that no feature was dropped, only moved to a finer band. It lets a reader price a level before reading it. |
 | `extent` | array or null | OPTIONAL | Four numbers `[xmin, ymin, xmax, ymax]` in the file's CRS units, the padded extent of the band's own features. MUST be null when the band has no valid geometry. When present it MUST enclose every covering value in the band, including the padding described in the covering section below. |
 | `bytes` | array | OPTIONAL | Two integers `[start, end)`, the file byte offsets spanning this level's own row groups, exclusive of any coarser level's row groups. Because bands are written in band-major order the row-group byte ranges are contiguous across levels, so a reader MAY price and issue a single prefix read for level k as `[levels[0].bytes[0], levels[k].bytes[1])`, without parsing row-group offsets from elsewhere in the footer. |
 
@@ -122,6 +138,19 @@ projected CRS in metres. A reader that needs the real resolution of a band
 MUST use `gsd`, which is exact and unit-safe, and MAY use `max_zoom` as a
 convenient default for band selection on a web map.
 
+The ladder is expressed in absolute web zoom, and its coarsest band is anchored
+at the zoom where the dataset's own extent fills a screen, not at whole-world
+zoom. Band 0 is therefore a genuine zoomed-out pixel of the dataset, and each
+finer band steps a fixed number of zooms toward exact geometry. A dataset whose
+exact geometry already fits the per-screen budget at that coarsest zoom carries
+no coarse band at all, only the exact band with no overview. `min_zoom` and
+`max_zoom` bracket each band's intended zoom range, and because band 0's
+`min_zoom` is 0 and every later level's `min_zoom` is one past the previous
+level's `max_zoom`, the levels tile the whole zoom range from 0 up with no gap
+and no overlap. A reader selecting a band for the current zoom z MAY pick the
+level whose `[min_zoom, max_zoom]` range contains z, which is equivalent to
+picking the coarsest level whose `max_zoom` is at least z.
+
 ### `importance` values
 
 `importance` is an open enumeration. It records how the writer ranked
@@ -134,8 +163,8 @@ here. The values defined by this draft, matching the reference converter, are
 | `area_desc` | Features ranked by area, largest first. Used for polygon datasets. |
 | `length_desc` | Features ranked by length, longest first. Used for line datasets. |
 | `attribute:<column>` | Features ranked by the named numeric attribute column, largest first. |
-| `grid_thin` | Point features stratified spatially, one representative per grid cell per band, coarsest grid first. |
-| `mixed_quantile_desc` | A mixed-dimension dataset where each dimension cohort was ranked within itself, converted to a descending percentile, and the cohorts were banded on the merged percentile. |
+| `grid_thin` | Point features with no attribute rank, where pure spatial thinning decides each cell's survivor. |
+| `mixed_quantile_desc` | A mixed-dimension dataset where each dimension cohort was ranked within itself and converted to a descending percentile, and that percentile is the thinning metric within each cohort's own cells. |
 
 ### `overview_method` values
 
@@ -144,8 +173,9 @@ values defined by this draft are
 
 | Value | Meaning |
 | --- | --- |
-| `simplify_snap` | Coarse bands carry a simplified, grid-snapped copy of their geometry in the overview column. `overview_column` MUST be present. |
+| `simplify_snap` | Coarse bands carry a simplified, grid-snapped copy of their geometry in the overview column. A shape that collapses below the band pixel falls back to a small quad or segment of its own dimension, see the per-type semantics. `overview_column` MUST be present. |
 | `thin` | The banding itself is the level of detail. A coarse band contains a representative subset of the features and no overview column exists, so `overview_column` MUST be absent. This is the mode for pure point datasets, whose exact geometry is already minimal. |
+| `none` | The file has a single band and no reduced level of detail at all. Nothing was simplified, snapped, or thinned, `overview_column` and `count_column` MUST be absent, and a reader treats the file as plain exact GeoParquet with the band-major sort and this footer key. This is the honest value for a sparse dataset whose exact geometry already fits the per-screen budget at its coarsest zoom. |
 
 The value `centroid`, meaning coarse bands collapse features to point
 centroids, is reserved for a future draft. It is not produced by the
@@ -171,7 +201,9 @@ These invariants are what a reader relies on. A writer producing an
    stay a similar size.
 3. **Level ladder.** `levels` MUST be sorted ascending by `level`, coarsest
    first, with strictly increasing `row_group_end` and strictly increasing
-   `max_zoom`. The final level is the exact band and MUST have `gsd` 0.
+   `max_zoom`. Each level's `min_zoom` MUST be 0 on level 0 and MUST equal the
+   previous level's `max_zoom` plus 1 on every later level. The final level is
+   the exact band and MUST have `gsd` 0 and a null `grid`.
 4. **Exact primary geometry.** The primary geometry column named by
    `geo.primary_column` MUST contain the exact source geometry for every row.
    A writer MUST NOT simplify, snap, or otherwise alter it.
@@ -226,8 +258,9 @@ needs sub-row-group precision MUST use Profile A.
 
 Under Profile A, for a row in a coarse band, the covering value MUST enclose
 both the exact geometry and the row's overview geometry. Grid snapping can
-move overview vertices outward, so the reference implementation pads
-coarse-band covering values by half the snap grid. A reader pruning by
+move overview vertices outward and the quad fallback can extend up to half a
+band pixel beyond the feature, so the reference implementation pads
+coarse-band covering values by half the band tolerance. A reader pruning by
 covering must never drop a feature that the overview still paints. A level's
 `extent` field carries the same padding, so it too encloses both the exact
 and overview geometry of a coarse band. Under Profile B a reader instead
@@ -237,7 +270,7 @@ padding.
 
 ## Native Parquet geometry types
 
-A 0.2.0 writer SHOULD write the primary `geometry` column and, when present,
+A 0.3.0 writer SHOULD write the primary `geometry` column and, when present,
 `geom_overview` as the Parquet GEOMETRY logical type, so that a native reader
 gets per-row-group GeospatialStatistics on both columns for free. This is a
 dual write, not a replacement. The writer MUST still write the `geo` footer
@@ -264,17 +297,27 @@ over its members, and the collection follows the rule for that dimension.
 The overview value MUST be produced by topology-preserving simplification at
 the band's tolerance followed by snapping to a coordinate grid. A writer
 SHOULD repair invalid input on the overview path before simplifying, without
-touching the exact column. When the result is empty or degenerate the
-overview value MUST be written as NULL, never as empty WKB. A subpixel
-feature therefore has a NULL overview, and a reader painting the overview
+touching the exact column. When the result is empty or degenerate, the shape
+has collapsed below the band's pixel, and the writer MUST fall back to a
+small grid-aligned quad centred on the feature's representative point, sized
+by the feature's own area and clamped between one snap-grid cell and one band
+pixel, so the survivor stays a polygon and larger features paint larger. This
+is the same idiom as Tippecanoe's tiny-polygon reduction, which replaces
+subpixel polygons with small squares rather than dropping them. Under density
+thinning each survivor stands for its whole cell, so a NULL here would erase
+the cell from the preview, and on a dataset of small features at a coarse
+zoom that blanks the entire first paint. Only when even the quad cannot be
+built is the value NULL, never empty WKB, and a reader painting the overview
 column MUST skip NULL values rather than fall back to the exact geometry.
 
 ### Lines and dimension-1 collections
 
 Lines follow the same simplify-plus-snap rule with a collapse guard. When
 snapping collapses a simplified line to empty, the writer MUST fall back to
-the simplified unsnapped geometry. When even that is empty the value MUST be
-NULL, never empty WKB.
+the simplified unsnapped geometry, and when even that is empty, to a short
+segment through the feature's centre along its own dominant direction, at
+least one snap-grid cell long, so a line survivor stays a line, never a
+point. Only a feature whose segment also fails is NULL, never empty WKB.
 
 ### Points
 
@@ -313,6 +356,14 @@ Normative requirements on a conforming reader.
   whose `max_zoom` is greater than or equal to the current zoom, falling back
   to the final level, and SHOULD read the overview column for coarse levels
   and the primary geometry column for the final level.
+- When reading level k's row-group prefix, the row groups of bands coarser
+  than k carry overviews snapped for lower zooms, and on a per-band-grid file
+  those overviews paint oversized blocks at level k's zooms. A reader SHOULD
+  therefore read the primary geometry column for row groups of bands coarser
+  than the selected level. Coarse bands are small under density thinning, so
+  the exact read stays cheap. On a pre-0.3.0 file, which snapped every band to
+  one fine global grid, the coarser bands' overviews are correct at finer
+  zooms and reading them is the cheaper choice.
 - A reader painting the overview column MUST skip NULL overview values. A
   NULL in a coarse band means the feature is below that band's resolution,
   it does not mean the reader should fetch the exact geometry instead.
@@ -351,14 +402,59 @@ Normative requirements on a conforming writer, beyond the layout section.
   requirement in this document.
 - `levels` MUST be computed from the real row-group layout of the written
   file, never authored independently of it.
-- `importance` and `overview_method` MUST describe what the writer actually
-  did. A writer MUST NOT, for example, write `area_desc` for a line dataset.
+- `importance`, `overview_method`, and `regime` MUST describe what the writer
+  actually did and what the data actually is. A writer MUST NOT, for example,
+  write `area_desc` for a line dataset.
 - A writer MUST NOT write empty WKB into the overview column. Degenerate
   results are NULL.
-- A writer SHOULD derive simplification tolerances, the snap grid, `gsd`, and
+- **Density thinning.** A writer SHOULD form bands by density thinning rather
+  than by a fixed feature share. Every feature starts in the coarsest band, and
+  for each band from coarsest to finest the writer keeps at most one feature per
+  thinning cell per geometry dimension, the highest ranked feature winning the
+  cell, and demotes the rest to the next finer band. No feature is ever dropped,
+  the final band keeps everyone demoted into it. The survivor of a cell MUST be
+  chosen by a total order that does not depend on input row order, so the output
+  is reproducible, the reference implementation breaks ties on a content hash of
+  the feature geometry.
+- **Survivor counts.** A thinning writer SHOULD record each survivor's cell
+  population in the column named by `count_column`, so the density signal
+  thinning removes from the geometry survives in the data. The count is the
+  number of features, the survivor included, that competed for the survivor's
+  cell in the pass it won. Without a binding per-band budget, every valid
+  feature falls into exactly one cell in the coarsest band, so the coarsest
+  band's counts sum to every valid feature in the file. A writer MAY also cap
+  a band's survivor count against a budget, in which case a cell winner
+  demoted for exceeding that budget has its tally cleared at that band and
+  recounted in the finer band it falls into instead. When the coarsest
+  band's own budget binds, its counts sum to less than the valid total
+  instead. A survivor's own count always stays the exact population of the cell
+  it won, whether or not a budget is in effect.
+- **Derived band count.** A writer SHOULD derive the number of bands from the
+  dataset rather than fix it. The reference implementation runs the coarse ladder
+  from the zoom where the dataset extent fills a screen up to the zoom where a
+  screen decodes an affordable amount of geometry, measured in bytes per screen
+  so that dense many-feature data and sparse heavy-geometry data each get the
+  band count they need, at a fixed number of zooms per band. The byte density
+  the budget solves against SHOULD be local, measured where the data actually
+  sits, not averaged over the whole bounding box. Real data clusters, and the
+  whole-extent average understates the density of the screens a user actually
+  zooms into, handing off to the unthinned exact band too early. The reference
+  implementation buckets feature bytes into a grid over the extent and solves
+  against a byte-weighted high quantile of the occupied cells' densities. A
+  dataset whose exact geometry already fits that per-screen budget at its
+  coarsest zoom gets a single exact band and no overview.
+- **Zoom ceiling.** No coarse band may serve past the zoom range the exact band
+  owns. A writer MUST NOT emit an overview band whose ladder zoom is at or past
+  the zoom model's finest zoom, 24 in the reference implementation, an overview
+  at that resolution would just be exact geometry grid-snapped. The reference
+  implementation clamps both the derived and the forced band count so the
+  coarsest band's anchor plus the ladder steps stay under the ceiling.
+- A writer SHOULD derive simplification tolerances, the snap grids, `gsd`, and
   `max_zoom` from the dataset extent in the data's own CRS units, so the same
-  rules hold for geographic degrees and projected metres. The source CRS
-  MUST be preserved on both geometry columns.
+  rules hold for geographic degrees and projected metres. Each coarse band
+  SHOULD snap its overview to its own grid, a sub-pixel fraction of that band's
+  `gsd`, so a coarse band carries only the coordinate precision it paints. The
+  source CRS MUST be preserved on both geometry columns.
 - A writer SHOULD write the Page Index, SHOULD declare `sorting_columns` for
   the `band` column, and MAY apply any standard Parquet encoding or
   compression, none of which affects conformance.
@@ -382,9 +478,9 @@ Normative requirements on a conforming writer, beyond the layout section.
   section above.
 - **Plain Parquet readers.** Everything is additive. A reader that knows
   nothing of `geo` or `overviews` sees a normal Parquet file with a binary
-  geometry column, a binary overview column, an int16 `band` column, and a
-  four-double `bbox` struct, and can still prune row groups on the `bbox`
-  statistics.
+  geometry column, a binary overview column, an int16 `band` column, an
+  optional int32 `overview_count` column, and a four-double `bbox` struct, and
+  can still prune row groups on the `bbox` statistics.
 - **Versioning.** The `overviews.version` field versions this convention
   alone. Readers MUST ignore unknown fields within a known major version and
   SHOULD fall back to plain GeoParquet reading on an unknown major version.
@@ -401,3 +497,23 @@ Normative requirements on a conforming writer, beyond the layout section.
   the native Parquet geometry types section describing the dual write of
   native GEOMETRY logical types alongside the unchanged `geo` version
   `"1.1.0"`.
+- **0.3.0.** `overviews.version` bumped to `"0.3.0"`. Bands are now formed by
+  density thinning, described in writer behavior, so a coarse band holds about
+  one feature per pixel per geometry dimension and coarse-band over-fetch is
+  gone. The band count is derived from the dataset rather than fixed, solved
+  against a local byte density so clustered data gets the coarse bands its
+  dense screens need, and the overview ladder's coarsest band is anchored at
+  the zoom where the dataset extent fills a screen, so a sparse dataset that
+  already fits the per-screen budget carries a single exact band and no
+  overview. No coarse band may serve at or past the zoom model's finest zoom.
+  `levels[]` gained the REQUIRED `min_zoom` and the OPTIONAL `grid` and
+  `feature_count` fields, and the block gained the OPTIONAL `regime` label and
+  the OPTIONAL `count_column` naming the survivor count column, the density
+  signal a reader can scale symbols by. `overview_method` gained the `none`
+  value for a single-band file. A survivor whose shape collapses below its
+  band's pixel now writes a small quad or segment of its own dimension
+  instead of NULL, so a coarse band of small features paints as shapes
+  rather than a blank, and each geometry type keeps its kind, only point
+  features paint as points. Each coarse band snaps its overview to its own
+  per-band grid. The exact-geometry, plain-reader, and profile guarantees
+  are unchanged.

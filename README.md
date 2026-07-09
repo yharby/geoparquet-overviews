@@ -2,20 +2,25 @@
 
 One GeoParquet file that a web map can preview instantly and a SQL engine can
 read in full, with no duplicated exact geometry. Measured on 5.65 million
-building polygons, a whole-country first paint reads about 9 MB instead of the
-620 MB exact geometry column, roughly 67x less, from one file that DuckDB
-still reads unchanged. Think COG overviews, for vectors.
+building polygons, a whole-country first paint reads about 2 MB from disk and
+decodes about 13 MB, instead of the 620 MB exact geometry column, roughly 47x
+less decoded and 90x less over the wire, from one file that DuckDB still
+reads unchanged. Think COG overviews, for vectors.
 
 ## The idea
 
 Three additions a plain reader safely ignores.
 
-- **Importance order.** Rank features by how much they matter at low zoom,
-  split them into a few bands, Hilbert-sort within each band. Every feature is
-  stored once, and the coarse bands land in a contiguous row-group prefix.
+- **Density-thinned bands.** Every feature starts in the coarsest band, and
+  band by band the writer keeps one survivor per screen pixel, the most
+  important feature winning each cell, demoting the rest toward the exact
+  finest band. Each survivor carries how many features it stands for, so a
+  dense cluster stays visible. Every feature is stored once, Hilbert-sorted
+  within its band, and the coarse bands land in a contiguous row-group prefix.
 - **An overview column.** Coarse bands carry a simplified, grid-snapped copy
-  of their shape in a second geometry column named `geom_overview`. The finest
-  band leaves it null. The primary `geometry` column is never touched.
+  of their shape in a second geometry column named `geom_overview`, each band
+  snapped to its own zoom-matched grid. The finest band leaves it null. The
+  primary `geometry` column is never touched.
 - **A footer note.** An `overviews` key next to the standard `geo` key records
   which row-group prefix belongs to which band and which zooms each band
   serves. Unknown keys are ignored, so every existing reader sees a valid
@@ -39,7 +44,7 @@ flowchart TB
 ## Links
 
 - **Live viewer**, https://yharby.github.io/geoparquet-overviews/
-- Status, draft 0.2.0. License, Apache-2.0. See [LICENSE](LICENSE).
+- Status, draft 0.3.0. License, Apache-2.0. See [LICENSE](LICENSE).
 
 ## Quickstart
 
