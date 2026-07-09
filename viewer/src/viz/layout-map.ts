@@ -4,7 +4,7 @@ import { MapboxOverlay } from '@deck.gl/mapbox';
 import { PolygonLayer, PathLayer, type PathLayerProps } from '@deck.gl/layers';
 import { PathStyleExtension, type PathStyleExtensionProps } from '@deck.gl/extensions';
 import type { Layer } from '@deck.gl/core';
-import type { Bbox } from '../geo/aoi';
+import { clampGeographicBbox, viewportRing, type Bbox } from '../geo/aoi';
 import { BASEMAP_STYLE } from '../map/map-view';
 import { fileExtent, type GeoParquetMetadata } from '../data/metadata';
 
@@ -38,16 +38,6 @@ interface RgGeometry {
   polygon: [number, number][];
   index: number;
   band: number;
-}
-
-function bboxRing(b: Bbox): [number, number][] {
-  return [
-    [b.xmin, b.ymin],
-    [b.xmax, b.ymin],
-    [b.xmax, b.ymax],
-    [b.xmin, b.ymax],
-    [b.xmin, b.ymin],
-  ];
 }
 
 // A real basemap overview of every row group's covering bbox. The basemap is
@@ -151,7 +141,7 @@ export class LayoutMap extends LitElement {
     this.features = meta.rowGroups
       .filter((rg) => rg.bbox)
       .map((rg) => ({
-        polygon: bboxRing(rg.bbox!),
+        polygon: viewportRing(rg.bbox!),
         index: rg.index,
         band: rg.band ?? -1,
       }));
@@ -276,7 +266,7 @@ export class LayoutMap extends LitElement {
       // property check on the literal.
       const viewportProps: PathLayerProps<ViewDatum> & PathStyleExtensionProps<ViewDatum> = {
         id: 'rg-viewport',
-        data: this.viewBbox ? [{ path: bboxRing(this.viewBbox) }] : [],
+        data: this.viewBbox ? [{ path: viewportRing(this.viewBbox) }] : [],
         getPath: (d) => d.path,
         getColor: AMBER,
         getWidth: 1.6,
@@ -302,10 +292,11 @@ export class LayoutMap extends LitElement {
     if (this.fittedFor !== key) {
       const ext = fileExtent(meta.rowGroups);
       if (ext) {
+        const b = clampGeographicBbox(ext);
         map.fitBounds(
           [
-            [ext.xmin, ext.ymin],
-            [ext.xmax, ext.ymax],
+            [b.xmin, b.ymin],
+            [b.xmax, b.ymax],
           ],
           { padding: 16, duration: 0 },
         );

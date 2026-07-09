@@ -7,6 +7,8 @@ import type {
   FlatPoints,
   FlatPolygons,
 } from '../geo/geojson';
+import type { CountForRow } from '../data/counts';
+import { perPrimitiveColors, perVertexColors, pointRadii, type Rgba } from './density-style';
 
 // deck.gl's "complex flat" polygon: a flat positions array plus the element
 // offsets where each interior ring (hole) begins. Returned straight from the
@@ -19,23 +21,29 @@ interface ComplexFlatPolygon {
 
 // One teal palette shared across every geometry type so a mixed dataset reads as
 // one layer. Polygons carry a translucent fill and a darker outline, points a
-// solid dot, lines a bright stroke.
-type Rgba = [number, number, number, number];
+// solid dot, lines a bright stroke. When a density count lookup is supplied
+// (0.3.0 count_column files at a coarse band), the fill and line alpha and the
+// point radius scale per feature via density-style.ts, built once as binary
+// attributes at layer-assembly time; without one, these constants apply.
 const POLYGON_FILL: Rgba = [53, 193, 193, 180];
 const POLYGON_LINE: Rgba = [16, 84, 84, 255];
 const POINT_FILL: Rgba = [102, 214, 214, 220];
 const LINE_COLOR: Rgba = [53, 193, 193, 230];
+const POINT_RADIUS = 2.5;
 
 // SolidPolygonLayer only paints fill, it has no stroke geometry, so on its own
 // the polygons blend into each other with no visible boundaries. We pair it
 // with a PathLayer that traces the same ring vertices to draw a distinct
 // outline. Both layers share the binary positions and startIndices, so the
-// outline costs no extra decode or upload of coordinates.
+// outline costs no extra decode or upload of coordinates. An optional
+// per-vertex fillColors array (density styling) rides along as a binary
+// attribute, overriding the constant fill; the outline stays constant.
 export function buildPolygonLayer(
   id: string,
   flat: FlatPolygons,
   fillColor: Rgba = POLYGON_FILL,
   lineColor: Rgba = POLYGON_LINE,
+  fillColors: Uint8ClampedArray | null = null,
 ): Layer[] {
   return [
     new SolidPolygonLayer({
@@ -45,6 +53,9 @@ export function buildPolygonLayer(
         startIndices: flat.startIndices,
         attributes: {
           getPolygon: { value: flat.positions, size: 2 },
+          // A binary attribute in `data.attributes` overrides the constant
+          // accessor below, so the constant remains the no-counts fallback.
+          ...(fillColors ? { getFillColor: { value: fillColors, size: 4 } } : {}),
         },
       },
       _normalize: false,
@@ -75,17 +86,25 @@ export function buildPolygonLayer(
 
 // Points as a binary-attribute ScatterplotLayer. Radius is in pixels with a
 // minimum so points stay visible at every zoom rather than shrinking to nothing.
-export function buildPointLayer(id: string, flat: FlatPoints, fillColor: Rgba = POINT_FILL): Layer {
+// An optional per-instance radii array (density styling) rides along as a
+// binary attribute, overriding the constant radius.
+export function buildPointLayer(
+  id: string,
+  flat: FlatPoints,
+  fillColor: Rgba = POINT_FILL,
+  radii: Float32Array | null = null,
+): Layer {
   return new ScatterplotLayer({
     id,
     data: {
       length: flat.positions.length / 2,
       attributes: {
         getPosition: { value: flat.positions, size: 2 },
+        ...(radii ? { getRadius: { value: radii, size: 1 } } : {}),
       },
     },
     radiusUnits: 'pixels',
-    getRadius: 2.5,
+    getRadius: POINT_RADIUS,
     radiusMinPixels: 1.5,
     getFillColor: fillColor,
     pickable: true,
@@ -93,8 +112,14 @@ export function buildPointLayer(id: string, flat: FlatPoints, fillColor: Rgba = 
 }
 
 // Lines as a binary-attribute open PathLayer. Width is in pixels with a minimum
-// so thin lines stay drawable at low zoom.
-export function buildLineLayer(id: string, flat: FlatPaths, lineColor: Rgba = LINE_COLOR): Layer {
+// so thin lines stay drawable at low zoom. An optional per-vertex colors array
+// (density styling) rides along as a binary attribute, overriding the constant.
+export function buildLineLayer(
+  id: string,
+  flat: FlatPaths,
+  lineColor: Rgba = LINE_COLOR,
+  colors: Uint8ClampedArray | null = null,
+): Layer {
   return new PathLayer({
     id,
     data: {
@@ -102,6 +127,7 @@ export function buildLineLayer(id: string, flat: FlatPaths, lineColor: Rgba = LI
       startIndices: flat.startIndices,
       attributes: {
         getPath: { value: flat.positions, size: 2 },
+        ...(colors ? { getColor: { value: colors, size: 4 } } : {}),
       },
     },
     _pathType: 'open',
@@ -122,11 +148,16 @@ export function buildLineLayer(id: string, flat: FlatPaths, lineColor: Rgba = LI
 // to keep holes correct while still storing the coordinates once, flat. The
 // outline is a fully binary PathLayer keyed on the per-ring startIndices, sharing
 // the same positions array, so it traces every ring (exterior and holes).
+// The optional fillColors array holds one RGBA per polygon (density styling);
+// the data here is already one object per polygon, so a by-ordinal accessor
+// into that precomputed array adds no row objects and no per-frame work
+// (deck.gl evaluates it once at attribute-fill time).
 export function buildHoledPolygonLayer(
   id: string,
   holed: FlatHoledPolygons,
   fillColor: Rgba = POLYGON_FILL,
   lineColor: Rgba = POLYGON_LINE,
+  fillColors: Uint8ClampedArray | null = null,
 ): Layer[] {
   const { positions, polygonStartIndices, ringStartIndices } = holed;
   const polygonCount = polygonStartIndices.length - 1;
@@ -158,7 +189,10 @@ export function buildHoledPolygonLayer(
       // {positions, holeIndices} data and yields zero triangles. Force 'XY' so
       // the fill actually tesselates.
       positionFormat: 'XY',
-      getFillColor: fillColor,
+      getFillColor: fillColors
+        ? (_, { index }) =>
+            [fillColors[index * 4], fillColors[index * 4 + 1], fillColors[index * 4 + 2], fillColors[index * 4 + 3]] as Rgba
+        : fillColor,
       // Pickable like the hole-free fill; info.index is the polygon ordinal in
       // fillData, aligned with holedPolygons.rowIds. The outline stays unpickable.
       pickable: true,
@@ -184,20 +218,28 @@ export function buildHoledPolygonLayer(
 
 // Build only the layers a batch actually needs, one pass over the flattened
 // buckets. A points-only file gets a single ScatterplotLayer, a polygon file the
-// fill/outline pair, and a mixed file all of them.
-export function buildLayers(id: string, flat: FlatGeometries): Layer[] {
+// fill/outline pair, and a mixed file all of them. When `countForRow` is given
+// (a 0.3.0 count_column file reading coarse bands), the density arrays are
+// built here, once per layer assembly, and passed down as binary attributes;
+// without it every builder keeps its constant style.
+export function buildLayers(id: string, flat: FlatGeometries, countForRow?: CountForRow | null): Layer[] {
+  const counts = countForRow ?? null;
   const layers: Layer[] = [];
   if (flat.polygons.startIndices.length > 1) {
-    layers.push(...buildPolygonLayer(`${id}-poly`, flat.polygons));
+    const fills = counts ? perVertexColors(flat.polygons, POLYGON_FILL, counts) : null;
+    layers.push(...buildPolygonLayer(`${id}-poly`, flat.polygons, POLYGON_FILL, POLYGON_LINE, fills));
   }
   if (flat.holedPolygons.polygonStartIndices.length > 1) {
-    layers.push(...buildHoledPolygonLayer(`${id}-holed`, flat.holedPolygons));
+    const fills = counts ? perPrimitiveColors(flat.holedPolygons.rowIds, POLYGON_FILL, counts) : null;
+    layers.push(...buildHoledPolygonLayer(`${id}-holed`, flat.holedPolygons, POLYGON_FILL, POLYGON_LINE, fills));
   }
   if (flat.paths.startIndices.length > 1) {
-    layers.push(buildLineLayer(`${id}-line`, flat.paths));
+    const colors = counts ? perVertexColors(flat.paths, LINE_COLOR, counts) : null;
+    layers.push(buildLineLayer(`${id}-line`, flat.paths, LINE_COLOR, colors));
   }
   if (flat.points.positions.length > 0) {
-    layers.push(buildPointLayer(`${id}-point`, flat.points));
+    const radii = counts ? pointRadii(flat.points, POINT_RADIUS, counts) : null;
+    layers.push(buildPointLayer(`${id}-point`, flat.points, POINT_FILL, radii));
   }
   return layers;
 }

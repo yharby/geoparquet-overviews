@@ -34,6 +34,23 @@ Node >= 24, pnpm 11.9.0.
   (lng), `y` (lat), `z` (zoom) via `replaceState` on every settle, and restores
   a deep-linked camera on first open through `initialView` (in `data/presets.ts`,
   applied with `MapView.jumpTo` instead of the default extent fit).
+- A performance audit (not a crash, just wasted work) fixed three things: the
+  zoom-control label memoizes its `planRead` result by `(strategy, zoom)`
+  instead of recomputing a full row-group filter+map on every Lit re-render,
+  the fetch path's read-range column lookup (`colFor`) builds a `Map` once per
+  fetch instead of a linear `.find()` inside a loop (was O(n^2) once page
+  pruning splits a fetch into many sub-ranges), and `refineToPages` /
+  `loadDensityCounts` are now single-flight per row-group index
+  (`file-cache.ts`'s `pageRangePending`/`countsPending`, mirroring the
+  whole-file `pending` dedup `getCachedFile` already had) so two overlapping
+  view fetches no longer both issue a duplicate page-index or count read for
+  the same group. Two known, deliberate tradeoffs surfaced by the same audit
+  were left alone: `rowgroups.ts` cancels a superseded fetch only
+  cooperatively at row-group boundaries (hyparquet takes no abort signal, this
+  is documented in its own comment, not an oversight), and crossing
+  `MERGE_LAYER_THRESHOLD` briefly double-uploads geometry (per-batch layers,
+  then the merged replacement) by design, so there is never a frame where the
+  map goes empty.
 - `src/data/manifest.ts` fetches the hosted `versions.json` catalog
   (`fetchManifest`, `MANIFEST_URL`), parses it (`parseManifest`), derives a
   version's preset list (`presetsForVersion`), and maps a dataset across
@@ -41,8 +58,13 @@ Node >= 24, pnpm 11.9.0.
   the version dropdown, defaulting to the manifest's `latest`, switching the
   preset list on `onVersionChange`, and falling back to the built-in
   `FILE_PRESETS` whenever the manifest is unreachable (`fetchManifest` resolves
-  null and the dropdown stays hidden). `versions.json` is published at the
-  bucket root and lists 0.1.0 and 0.2.0, so the dropdown is live.
+  null and the dropdown stays hidden). `versions.json` ships with the viewer in
+  `public/versions.json` (resolved against `import.meta.env.BASE_URL`, not the
+  hosted store) and lists 0.1.0, 0.2.0, and 0.3.0 (the manifest `latest`), so
+  the dropdown is live. Its `base`
+  field still points at source.coop, so the manifest only names datasets while
+  the parquet bytes are fetched from the hosted store. Add a dataset by editing
+  that file, no republish needed.
 - `src/data/metadata.ts` fetches the footer, parses `geo` and `overviews`,
   stamps the band ordinal on each row group, interprets the CRS. Each row
   group's bbox comes from the physical `bbox` covering column when present, else
@@ -57,7 +79,28 @@ Node >= 24, pnpm 11.9.0.
   bbox-pruned row-group indices plus the column to read. `flatStrategy.prunable`
   is true when any row group carries a usable bbox from either source, so
   Profile B files still prune to the viewport at row-group granularity (the
-  page-level path below still needs the physical covering column).
+  page-level path below still needs the physical covering column). Within a
+  banded prefix, `columnForRowGroup` (in `metadata.ts`) reads exact `geometry`
+  for a band coarser than the target level, but only on 0.3.0+ files
+  (`overviewsVersionAtLeast`), whose per-band grids would paint giant blocks
+  at finer zooms. Pre-0.3.0 files snapped every band to one fine global grid,
+  their coarse overviews stay correct and far cheaper at mid zooms, so they
+  keep the plain per-level column.
+- `src/data/counts.ts` reads the `overview_count` survivor count column when
+  the footer's `count_column` advertises it (`OverviewsInfo.countColumn`), one
+  tiny int32 columnar read per coarse-band row group, memoized per file in
+  `file-cache.ts` (`countsMemo`). `src/map/density-style.ts` turns counts into
+  binary style arrays, point radius `2.5 * clamp(0.6 + 0.5*log2(n), 1, 5)` px
+  and fill/line alpha `clamp(110 + 36*log2(n), 110, 255)`, threaded into the
+  layers as per-instance/per-vertex attributes, never per-frame accessors.
+  Eligibility is the row group's band (coarser than the finest level), not the
+  column read, so exact rows of a coarser prefix band style by density too. A
+  failed count read logs and falls back to the constant styling, old files
+  without `count_column` are untouched. Coarse bands of a polygon dataset are
+  mostly small quad overviews (subpixel survivors written as area-sized
+  squares), so the polygon fill-alpha path carries the density signal there,
+  and the 1px-minimum outline PathLayer keeps a sub-pixel quad visible. The
+  count-scaled point radius path applies to point datasets.
 - `src/data/pageindex.ts` prunes below row-group granularity, reads the
   `bbox` covering column's ColumnIndex and OffsetIndex and maps the view to
   overlapping page row ranges. Returns null on any problem so the caller
@@ -78,7 +121,12 @@ Node >= 24, pnpm 11.9.0.
   the GeoJSON flattener only as a fallback for already-decoded values.
 - `src/geo/crs.ts` reprojects projected files to lon and lat with proj4,
   in place on the flat buffers. Known defs live in `PROJ_DEFS`, add EPSG
-  codes there.
+  codes there. `transformPositionsInPlace` clamps every reprojected vertex into
+  the valid lon/lat envelope and replaces a non-finite result with `(0, 0)`, so
+  one degenerate source coordinate (outside a projection's domain, or already
+  non-finite in the source WKB) cannot throw deck.gl's "invalid latitude" and
+  blank the whole map, the same never-crash-the-overlay stance as the
+  covering-box clamp in `geo/aoi.ts`.
 - `src/data/flat-cache.ts` LRU-caches decoded flat buckets, 192 MB budget. A
   whole-group read keys on `(column, group, 'full')`. A page-pruned group keys
   each kept page on `(column, group, pageRowStart-pageRowEnd)` so panning inside

@@ -1,0 +1,58 @@
+{
+  "name": "geoparquet-overviews test data",
+  "latest": "0.3.0",
+  "base": "https://data.source.coop/youssef-harby/geoparquet-overviews",
+  "versions": [
+    {
+      "version": "0.1.0",
+      "spec": "overviews draft 0.1.0",
+      "prefix": "v0.1.0",
+      "datasets": [
+        { "id": "sample", "label": "sample (overviews demo)", "path": "sample.parquet" },
+        { "id": "big_sample", "label": "large sample (page pruning)", "path": "big_sample.parquet" },
+        { "id": "nls_rakennus", "label": "Finland buildings (EPSG:3067)", "path": "nls_rakennus_overviews.parquet" },
+        { "id": "overture_buildings", "label": "Overture buildings (Tokyo, 6.5M polygons)", "path": "overture-tokyo/buildings.parquet" },
+        { "id": "overture_segments", "label": "Overture roads (Tokyo, 1.4M lines)", "path": "overture-tokyo/segments.parquet" },
+        { "id": "overture_pois", "label": "Overture POIs (Tokyo, 266K points)", "path": "overture-tokyo/pois.parquet" }
+      ]
+    },
+    {
+      "version": "0.2.0",
+      "spec": "overviews draft 0.2.0",
+      "prefix": "v0.2.0",
+      "datasets": [
+        { "id": "sample", "label": "sample (overviews demo)", "path": "sample.parquet" },
+        { "id": "big_sample", "label": "large sample (page pruning)", "path": "big_sample.parquet" },
+        { "id": "nls_rakennus", "label": "Finland buildings (EPSG:3067)", "path": "nls_rakennus_overviews.parquet" },
+        { "id": "nls_rakennus_nobbox", "label": "Finland buildings (Profile B, no bbox)", "path": "nls_rakennus_overviews.nobbox.parquet" },
+        { "id": "overture_buildings", "label": "Overture buildings (Tokyo, 6.5M polygons)", "path": "overture-tokyo/buildings.parquet" },
+        { "id": "overture_segments", "label": "Overture roads (Tokyo, 1.4M lines)", "path": "overture-tokyo/segments.parquet" },
+        { "id": "overture_pois", "label": "Overture POIs (Tokyo, 266K points)", "path": "overture-tokyo/pois.parquet" },
+        { "id": "country_boundaries", "label": "Country boundaries (249 polygons)", "path": "country_boundaries.overviews.parquet" },
+        { "id": "settlements", "label": "Settlements (4.6M points)", "path": "settlements.overviews.parquet" },
+        { "id": "parks", "label": "Parks (1.5M polygons)", "path": "parks.overviews.parquet" },
+        { "id": "timezones", "label": "Timezones (444 polygons)", "path": "timezones.overviews.parquet" },
+        { "id": "germany_buildings", "label": "Germany buildings (52.5M polygons)", "path": "germany_buildings.overviews.parquet" }
+      ]
+    },
+    {
+      "version": "0.3.0",
+      "spec": "overviews draft 0.3.0",
+      "prefix": "v0.3.0",
+      "datasets": [
+        { "id": "sample", "label": "sample (overviews demo)", "path": "sample.parquet" },
+        { "id": "big_sample", "label": "large sample (page pruning)", "path": "big_sample.parquet" },
+        { "id": "nls_rakennus", "label": "Finland buildings (EPSG:3067)", "path": "nls_rakennus_overviews.parquet" },
+        { "id": "nls_rakennus_nobbox", "label": "Finland buildings (Profile B, no bbox)", "path": "nls_rakennus_overviews.nobbox.parquet" },
+        { "id": "overture_buildings", "label": "Overture buildings (Tokyo, 6.5M polygons)", "path": "overture-tokyo/buildings.parquet" },
+        { "id": "overture_segments", "label": "Overture roads (Tokyo, 1.4M lines)", "path": "overture-tokyo/segments.parquet" },
+        { "id": "overture_pois", "label": "Overture POIs (Tokyo, 266K points)", "path": "overture-tokyo/pois.parquet" },
+        { "id": "country_boundaries", "label": "Country boundaries (249 polygons)", "path": "country_boundaries.overviews.parquet" },
+        { "id": "settlements", "label": "Settlements (4.6M points)", "path": "settlements.overviews.parquet" },
+        { "id": "parks", "label": "Parks (1.5M polygons)", "path": "parks.overviews.parquet" },
+        { "id": "riyadh_buildings", "label": "Riyadh buildings (85K polygons)", "path": "riyadh_buildings.overviews.parquet" },
+        { "id": "timezones", "label": "Timezones (444 polygons)", "path": "timezones.overviews.parquet" }
+      ]
+    }
+  ]
+}

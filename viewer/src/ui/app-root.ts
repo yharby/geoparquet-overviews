@@ -9,7 +9,7 @@ import '../viz/row-group-detail';
 import type { FileLoadRequest } from './load-control';
 import { installFetchInstrumentation, setActiveUrl, timeWork, withPhase } from '../core/phase';
 import { emitEvent } from '../core/events';
-import type { Bbox } from '../geo/aoi';
+import { clampGeographicBbox, type Bbox } from '../geo/aoi';
 import {
   loadMetadataFromUrl,
   fileExtent,
@@ -26,9 +26,18 @@ import { readRowAttributes } from '../data/feature-detail';
 import { featureLoadingHtml, featureAttributesHtml, featureErrorHtml } from './feature-popup';
 import type { PickingInfo } from '@deck.gl/core';
 import { pageRangesForRowGroup, mergePageRanges, keptPageRanges, type PageRange } from '../data/pageindex';
-import { getPageRangeMemo, getFlatCache, isFilePrefetched } from '../data/file-cache';
+import {
+  getPageRangeMemo,
+  getPageRangePending,
+  getFlatCache,
+  getCountsMemo,
+  getCountsPending,
+  isFilePrefetched,
+} from '../data/file-cache';
+import { readGroupCounts, buildCountLookup, type CountForRow, type GroupCounts } from '../data/counts';
 import { detectLayout, type LayoutStrategy } from '../data/layout';
 import { viewFetchKey } from './fetch-key';
+import { uncachedPageRange } from './read-partition';
 import { planSignature } from '../data/plan-signature';
 import { initialUrl, initialView, type CameraView } from '../data/presets';
 import { MapView } from '../map/map-view';
@@ -46,6 +55,14 @@ installFetchInstrumentation();
 // layer-diff overhead of many batch layers wins, so the merge pays for itself.
 // Tunable, pinned empirically against the hosted datasets.
 const MERGE_LAYER_THRESHOLD = 8;
+
+// A row group is only worth page-pruning once its bbox area exceeds the AOI's
+// by this factor. Below it the page-index round trip does not pay for itself.
+// Was 4x, an unvalidated starting guess that left every row group between 1x
+// and 4x the AOI fully decoded no matter how much of it sat off screen.
+// Lowered to 1.5x, the documented floor where page pruning still saves on the
+// default 16 MB row-group size (see CLAUDE.md's page-pruning limitation note).
+const PAGE_PRUNE_AREA_RATIO = 1.5;
 
 export class AppRoot extends LitElement {
   static properties = {
@@ -129,6 +146,12 @@ export class AppRoot extends LitElement {
   // (Layer._initialize asserts `!this.internalState`). Layers are rebuilt fresh
   // each settle. Bounded, dropped on file switch.
   private mergedGeomCache = new Map<string, FlatGeometries>();
+  // planRead's column/roleName depend only on zoom, never on the bbox probe
+  // (only the discarded `indices` field reads the AOI), but Lit calls render()
+  // on every reactive change, e.g. once per progressively-streamed batch. Cache
+  // by (strategy, zoom) so a full row-group filter+map only reruns when the
+  // zoom slider actually moves, not on every unrelated re-render during a fetch.
+  private zoomControlCache: { strategy: LayoutStrategy; zoom: number; isOverview: boolean } | null = null;
   // The flattened buckets currently on the map, keyed by the layer-set id prefix
   // (`rg-batch-N` during progressive load, `rg-merged` once settled). A click
   // resolves `info.layer.id` to a prefix and a geometry kind, then reads the
@@ -438,11 +461,20 @@ export class AppRoot extends LitElement {
   }
 
   private renderZoomControl() {
-    // Label the current LOD from the strategy's plan for this zoom. column and
-    // read column depends only on the zoom, so any bbox works as the probe.
-    const probe = this.viewBbox ?? { xmin: 0, ymin: 0, xmax: 0, ymax: 0 };
-    const plan = this.strategy!.planRead(probe, this.currentZoom);
-    const isOverview = plan.column !== 'geometry';
+    // Label the current LOD from the strategy's plan for this zoom. column
+    // depends only on the zoom, so any bbox works as the probe, and the result
+    // is stable across re-renders that don't change strategy or zoom, see
+    // zoomControlCache above.
+    const cache = this.zoomControlCache;
+    let isOverview: boolean;
+    if (cache && cache.strategy === this.strategy && cache.zoom === this.currentZoom) {
+      isOverview = cache.isOverview;
+    } else {
+      const probe = this.viewBbox ?? { xmin: 0, ymin: 0, xmax: 0, ymax: 0 };
+      const plan = this.strategy!.planRead(probe, this.currentZoom);
+      isOverview = plan.column !== 'geometry';
+      this.zoomControlCache = { strategy: this.strategy!, zoom: this.currentZoom, isOverview };
+    }
     const roleName = isOverview ? 'overview' : 'exact';
     const range = this.zoomRange();
     return html`
@@ -587,6 +619,9 @@ export class AppRoot extends LitElement {
         crsDetail,
         column: '',
         band: null,
+        bandFeatureCount: null,
+        bandMinZoom: null,
+        bandMaxZoom: null,
         pagePrunedGroups: 0,
         wholeGroups: 0,
       };
@@ -636,9 +671,10 @@ export class AppRoot extends LitElement {
             // stuck on. jumpTo always emits moveend, so snap to the extent centre
             // instead to drive the opening fetch and clear the spinner. trackResize
             // refits once the container is sized.
+            const clamped = clampGeographicBbox(extent);
             const center = {
-              lng: (extent.xmin + extent.xmax) / 2,
-              lat: (extent.ymin + extent.ymax) / 2,
+              lng: (clamped.xmin + clamped.xmax) / 2,
+              lat: (clamped.ymin + clamped.ymax) / 2,
               zoom: this.mapView.getZoom(),
             };
             this.mapView.jumpTo(center);
@@ -735,15 +771,26 @@ export class AppRoot extends LitElement {
     }
 
     const pruneNote = prunable ? '' : ' This file has no covering bbox, so pruning is unavailable.';
-    const readingLabel = column === 'geometry' ? 'exact geometry' : `overview (${column})`;
+    // A cumulative-prefix read at a coarse band paints the target band's overview
+    // plus the coarser bands' exact geometry, so the read can span both columns.
+    const readColumns = new Set(indices.map((i) => plan.columnForIndex(i)));
+    const readingLabel =
+      readColumns.size > 1
+        ? `overview (${column}) + exact geometry`
+        : column === 'geometry'
+          ? 'exact geometry'
+          : `overview (${column})`;
     this.status = `Fetching ${indices.length} of ${metadata.rowGroups.length} row groups, ${readingLabel}…${pruneNote}`;
 
     // Map each selected row group to its absolute row range, so hyparquet reads
-    // exactly that group's column chunk over a range request.
+    // exactly that group's column chunk over a range request. Each group carries
+    // its own column, so a coarser band reads exact geometry while the target
+    // band reads its overview.
     const ranges: RowGroupRange[] = indices.map((i) => ({
       index: i,
       rowStart: this.rowOffsets[i],
       rowEnd: this.rowOffsets[i] + metadata.rowGroups[i].rowCount,
+      column: plan.columnForIndex(i),
     }));
 
     // Only claim the active URL if this fetch is still current, so a fetch
@@ -798,11 +845,21 @@ export class AppRoot extends LitElement {
     if (pagePruned > 0) {
       this.status = `Fetching ${total} of ${metadata.rowGroups.length} row groups, ${readingLabel}, ${pagePruned} page pruned…${pruneNote}`;
     }
+    // Density counts for the coarse-band styling (0.3.0 count_column files).
+    // Read up front so the cached-hit repaints below style identically to the
+    // fresh decodes; the reads are tiny int32 chunks, memoized per group, and
+    // any failure falls back to null (constant styling), never a broken render.
+    const countForRow = await this.loadDensityCounts(url, metadata, readRanges);
+    if (token !== this.fetchToken) return;
     // The overview level this view reads, for the read-cost panel's efficiency
     // readout. Taken from the plan's selected level, not the first read group,
     // so the finest (exact) level reports its own level rather than 0, even
     // though it owns the whole prefix and reads groups that span several levels.
     const viewBand = plan.band;
+    // The selected band's footer facts, for the read-cost panel. Looked up by the
+    // plan's band ordinal, null for the flat path or a file predating the fields.
+    const viewLevel =
+      viewBand !== null ? (metadata.overviewsInfo?.levels.find((l) => l.level === viewBand) ?? null) : null;
 
     const tStart = performance.now();
     let features = 0;
@@ -830,9 +887,18 @@ export class AppRoot extends LitElement {
     // as the merged fetch spans jitter. A whole-group read keeps the stable
     // 'full' key, the same shape whole-group entries used before, so those
     // entries survive across pans too. Both use the same null separator as before.
+    // Keyed by the group's own column, since a cumulative-prefix read may read
+    // one group as its overview at a low zoom and as exact geometry at a higher
+    // one, and the two decodes must never be served for each other.
+    // Built once per fetch so colFor is an O(1) lookup. A linear find() here
+    // was called once per range/page in both the cache-split loop below and the
+    // decode callback's cache-write path, making cache-key computation O(n^2)
+    // in the number of read ranges once page pruning splits a fetch into many.
+    const columnByIndex = new Map(readRanges.map((r) => [r.index, r.column]));
+    const colFor = (index: number): string => columnByIndex.get(index) ?? column;
     const pageKey = (index: number, rowStart: number, rowEnd: number): string =>
-      `${column}\u0000${index}\u0000${rowStart}-${rowEnd}`;
-    const groupKey = (index: number): string => `${column}\u0000${index}\u0000full`;
+      `${colFor(index)}\u0000${index}\u0000${rowStart}-${rowEnd}`;
+    const groupKey = (index: number): string => `${colFor(index)}\u0000${index}\u0000full`;
 
     // Paint one batch progressively and collect its buckets for the end-of-fetch
     // merge. Shared by the cache-hit and fresh-decode paths so both update the
@@ -845,7 +911,7 @@ export class AppRoot extends LitElement {
       const tUpload = performance.now();
       const batchId = `rg-batch-${batchOrdinal}`;
       timeWork('gpu-upload', `${batchFeatures} geometries`, () =>
-        this.mapView!.addLayers(buildLayers(batchId, flat)),
+        this.mapView!.addLayers(buildLayers(batchId, flat, countForRow)),
       );
       // Register this batch's buckets so a click during progressive load still
       // resolves to a row; the end-of-fetch merge replaces these with rg-merged.
@@ -881,6 +947,9 @@ export class AppRoot extends LitElement {
         crsDetail: this.summary?.crsDetail ?? '',
         column,
         band: viewBand,
+        bandFeatureCount: viewLevel?.featureCount ?? null,
+        bandMinZoom: viewLevel?.minZoom ?? null,
+        bandMaxZoom: viewLevel?.maxZoom ?? null,
         pagePrunedGroups: pagePruned,
         wholeGroups: total - pagePruned,
       };
@@ -908,13 +977,11 @@ export class AppRoot extends LitElement {
             cachedHits.push({ index: range.index, cached });
           } else {
             // One read range per missing page, so each decodes and caches alone.
-            // Several may share an index, that is intended.
-            uncachedRanges.push({
-              index: range.index,
-              rowStart: range.rowStart,
-              rowEnd: range.rowEnd,
-              subRanges: [p],
-            });
+            // Several may share an index, that is intended. uncachedPageRange
+            // carries the group's own column so a coarser prefix group read at an
+            // overview level is not silently fetched from geom_overview and cached
+            // under its exact `geometry` key (see read-partition.ts).
+            uncachedRanges.push(uncachedPageRange(range, p));
           }
         }
       } else {
@@ -994,7 +1061,7 @@ export class AppRoot extends LitElement {
         // Fresh Layer instances every settle: deck.gl finalizes a replaced Layer
         // and a finalized instance cannot be re-mounted. The merged geometry (the
         // costly part) is what the cache reuses, not the layers.
-        const layers = buildLayers('rg-merged', merged);
+        const layers = buildLayers('rg-merged', merged, countForRow);
         timeWork('gpu-upload', `${features.toLocaleString('en-US')} merged`, () =>
           this.mapView!.setLayers(layers),
         );
@@ -1031,10 +1098,70 @@ export class AppRoot extends LitElement {
     }
   }
 
+  // The row-to-count lookup for this view's density styling, or null when the
+  // file names no count column or nothing coarse is being read. Counts exist on
+  // every coarse-band row, including one read as exact `geometry` because its
+  // band is coarser than the target level (columnForRowGroup), so eligibility
+  // is the row group's band, not the column it reads; the finest band's counts
+  // are all null, so its groups are skipped outright. Each group's counts are
+  // read once (a whole-group columnar read of the int32 column, far smaller
+  // than geometry) and memoized on the file entry. A failed read memoizes null,
+  // logs, and styles that group with the constant fallback, it never breaks
+  // rendering.
+  private async loadDensityCounts(
+    url: string,
+    metadata: GeoParquetMetadata,
+    readRanges: RowGroupRange[],
+  ): Promise<CountForRow | null> {
+    const info = metadata.overviewsInfo;
+    const countColumn = info?.countColumn;
+    if (!info || !countColumn || info.levels.length < 2) return null;
+    const finest = info.levels[info.levels.length - 1].level;
+    const coarse = readRanges.filter((r) => {
+      const band = metadata.rowGroups[r.index]?.band;
+      return band != null && band < finest;
+    });
+    if (coarse.length === 0) return null;
+    const memo = getCountsMemo(url);
+    const pending = getCountsPending(url);
+    const missing = coarse.filter((r) => !memo.has(r.index) && !pending.has(r.index));
+    if (missing.length > 0) {
+      await withPhase('count-fetch', () =>
+        Promise.all(
+          missing.map((r) => {
+            const promise = readGroupCounts(url, countColumn, r.rowStart, r.rowEnd).catch((err: unknown) => {
+              console.warn(`overview_count read failed for row group ${r.index}, using constant style`, err);
+              return null;
+            });
+            pending.set(r.index, promise);
+            return promise.then((counts) => {
+              memo.set(r.index, counts);
+              pending.delete(r.index);
+            });
+          }),
+        ),
+      );
+    }
+    // A row already in flight when this call started (issued by an overlapping
+    // fetch) is neither in `memo` nor re-requested above, so wait on its shared
+    // promise too, otherwise this view would render without its counts.
+    const inFlight = coarse.filter((r) => !memo.has(r.index) && pending.has(r.index));
+    if (inFlight.length > 0) {
+      await Promise.all(inFlight.map((r) => pending.get(r.index)));
+    }
+    const groups: GroupCounts[] = [];
+    for (const r of coarse) {
+      const counts = memo.get(r.index);
+      if (counts) groups.push({ rowStart: r.rowStart, rowEnd: r.rowEnd, counts });
+    }
+    return buildCountLookup(groups);
+  }
+
   // Turn whole-group read ranges into page-pruned sub-ranges where it pays off.
-  // A row group is only page-pruned when its footprint dwarfs the viewport (>=
-  // 4x area) and the file exposes the covering page indexes. Every other group,
-  // and any read error, falls back to a whole-group read, so this never throws.
+  // A row group is only page-pruned when its footprint exceeds the viewport by
+  // PAGE_PRUNE_AREA_RATIO and the file exposes the covering page indexes. Every
+  // other group, and any read error, falls back to a whole-group read, so this
+  // never throws.
   private async refineToPages(
     url: string,
     metadata: GeoParquetMetadata,
@@ -1057,33 +1184,48 @@ export class AppRoot extends LitElement {
     const lookup = this.schemaLookupCache ?? schemaLookup(metadata.schema);
     const transform = metadata.projection.transform;
     const memo = getPageRangeMemo(url);
+    const sharedPending = getPageRangePending(url);
 
-    // First pass, find every wide group not yet memoized and kick off its page
-    // index read without awaiting, so a whole-extent view with many wide coarse
-    // groups fires its round trips together instead of one after another. Each
-    // probe is wrapped so a thrown error resolves to null, matching the
-    // whole-group fallback the serial try/catch used to give per group.
-    const pending: Array<{ index: number; promise: Promise<PageRange[] | null> }> = [];
+    // First pass, find every wide group not yet memoized or in flight and kick
+    // off its page index read without awaiting, so a whole-extent view with many
+    // wide coarse groups fires its round trips together instead of one after
+    // another. Each probe is wrapped so a thrown error resolves to null, matching
+    // the whole-group fallback the serial try/catch used to give per group. The
+    // promise is registered in sharedPending before any await, so an overlapping
+    // fetch's first pass (running before this one's probes settle) sees it as
+    // already in flight instead of starting a duplicate read of the same range.
+    const started: Array<{ index: number; promise: Promise<PageRange[] | null> }> = [];
     for (const range of ranges) {
       const rg = metadata.rowGroups[range.index];
       const raw = metadata.rawRowGroups[range.index];
-      const wideEnough = rg?.bbox && raw && bboxArea(rg.bbox) >= 4 * aoiArea;
-      if (!wideEnough || memo.has(range.index)) continue;
+      const wideEnough = rg?.bbox && raw && bboxArea(rg.bbox) >= PAGE_PRUNE_AREA_RATIO * aoiArea;
+      if (!wideEnough || memo.has(range.index) || sharedPending.has(range.index)) continue;
       const probe = pageRangesForRowGroup(file, raw!, covering, range.rowStart, rg!.rowCount, transform, lookup).catch(
         () => null,
       );
-      pending.push({ index: range.index, promise: probe });
+      sharedPending.set(range.index, probe);
+      started.push({ index: range.index, promise: probe });
     }
-    if (pending.length > 0) {
-      const resolved = await withPhase('page-index', () => Promise.all(pending.map((p) => p.promise)));
-      pending.forEach((p, i) => memo.set(p.index, resolved[i]));
+    if (started.length > 0) {
+      const resolved = await withPhase('page-index', () => Promise.all(started.map((p) => p.promise)));
+      started.forEach((p, i) => {
+        memo.set(p.index, resolved[i]);
+        sharedPending.delete(p.index);
+      });
+    }
+    // A group already in flight when this call started (issued by an overlapping
+    // fetch) is neither memoized nor started above, so wait on its shared promise
+    // too, otherwise this view would fall back to a whole-group read for it.
+    const awaiting = ranges.filter((r) => !memo.has(r.index) && sharedPending.has(r.index));
+    if (awaiting.length > 0) {
+      await Promise.all(awaiting.map((r) => sharedPending.get(r.index)));
     }
 
     const out: RowGroupRange[] = [];
     for (const range of ranges) {
       const rg = metadata.rowGroups[range.index];
       const raw = metadata.rawRowGroups[range.index];
-      const wideEnough = rg?.bbox && raw && bboxArea(rg.bbox) >= 4 * aoiArea;
+      const wideEnough = rg?.bbox && raw && bboxArea(rg.bbox) >= PAGE_PRUNE_AREA_RATIO * aoiArea;
       if (!wideEnough) {
         out.push(range);
         continue;

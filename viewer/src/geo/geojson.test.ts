@@ -180,7 +180,9 @@ describe('flattenGeoJson edge cases', () => {
 
 describe('flattenGeoJson transform', () => {
   // A transform that offsets every coordinate, standing in for reprojection.
-  const shift: CoordTransform = (x, y) => [x + 100, y + 200];
+  // Kept within the valid lon/lat envelope, transformPositionsInPlace clamps
+  // out-of-range results (see crs.test.ts), which this test is not about.
+  const shift: CoordTransform = (x, y) => [x + 10, y + 20];
 
   it('applies the transform to every bucket', () => {
     const flat = flattenGeoJson(
@@ -195,15 +197,15 @@ describe('flattenGeoJson transform', () => {
       ],
       shift,
     );
-    expect(Array.from(flat.points.positions)).toEqual([101, 201]);
-    expect(Array.from(flat.paths.positions)).toEqual([102, 202, 103, 203]);
-    expect(Array.from(flat.polygons.positions)).toEqual([100, 200, 100, 201, 101, 201]);
+    expect(Array.from(flat.points.positions)).toEqual([11, 21]);
+    expect(Array.from(flat.paths.positions)).toEqual([12, 22, 13, 23]);
+    expect(Array.from(flat.polygons.positions)).toEqual([10, 20, 10, 21, 11, 21]);
     // The holed polygon's rings are reprojected in place too: exterior first
     // vertex, then the hole's first vertex (the hole starts at vertex 4, element 8).
-    expect(flat.holedPolygons.positions[0]).toBe(100);
-    expect(flat.holedPolygons.positions[1]).toBe(200);
-    expect(flat.holedPolygons.positions[8]).toBe(101);
-    expect(flat.holedPolygons.positions[9]).toBe(201);
+    expect(flat.holedPolygons.positions[0]).toBe(10);
+    expect(flat.holedPolygons.positions[1]).toBe(20);
+    expect(flat.holedPolygons.positions[8]).toBe(11);
+    expect(flat.holedPolygons.positions[9]).toBe(21);
   });
 });
 

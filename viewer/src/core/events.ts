@@ -1,4 +1,4 @@
-export type FetchPhase = 'footer' | 'prefetch' | 'metadata' | 'page-index' | 'row-group-fetch';
+export type FetchPhase = 'footer' | 'prefetch' | 'metadata' | 'page-index' | 'row-group-fetch' | 'count-fetch';
 export type WorkPhase = 'wkb-decode' | 'gpu-upload' | 'flatten-cache';
 
 export interface FetchEvent {
