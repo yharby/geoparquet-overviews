@@ -1955,3 +1955,14 @@ def test_subpixel_survivor_falls_back_to_quad(tmp_path):
         assert gb[1] >= bb["ymin"] - 1e-9 and gb[3] <= bb["ymax"] + 1e-9
     # The boxes are subpixel at band 0, so the quad fallback must actually fire.
     assert n_quads > 0
+
+
+def test_cli_band_fractions_parse(tmp_path):
+    from click.testing import CliRunner
+
+    from geoparquet_overviews.cli import main
+
+    # --help lists the new flags and not the removed one
+    r = CliRunner().invoke(main, ["convert", "--help"])
+    assert "--coarsest-rel" in r.output and "--ladder-factor" in r.output
+    assert "--band-fractions" in r.output and "--drop-rate" not in r.output

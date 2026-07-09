@@ -39,7 +39,7 @@ def main() -> None:
     default=1.0,
     show_default=True,
     type=float,
-    help="Decoded geometry a screen should target, in MB. The banding budget, lower asks for more coarse bands. Ignored when --bands is forced.",
+    help="Decoded geometry a screen should target, in MB. Caps the overview ladder depth, lower asks for more coarse bands. Ignored when --bands is forced.",
 )
 @click.option(
     "--row-group-mb",
@@ -52,6 +52,26 @@ def main() -> None:
     default=None,
     type=float,
     help="Coordinate grid the overview geometry snaps to, in CRS units. Derived from the dataset extent when unset.",
+)
+@click.option(
+    "--band-fractions",
+    default=None,
+    type=str,
+    help="Comma-separated share of features per coarse band, largest first, e.g. 0.01,0.02,0.04. Derived from the tolerance ladder when unset.",
+)
+@click.option(
+    "--coarsest-rel",
+    default=1 / 1500,
+    show_default="1/1500",
+    type=float,
+    help="Band 0 simplify tolerance as a fraction of the larger extent span.",
+)
+@click.option(
+    "--ladder-factor",
+    default=2.0,
+    show_default=True,
+    type=float,
+    help="Each finer coarse band divides the tolerance by this. 2 steps one web zoom per band, raster-overview style.",
 )
 @click.option(
     "--coarse-row-groups",
@@ -103,7 +123,7 @@ def main() -> None:
     "--thin/--no-thin",
     default=True,
     show_default=True,
-    help="Density thin the coarse bands so each holds at most one feature per screen pixel per geometry dimension. --no-thin is a debug escape only.",
+    help="Thin band 0 for even coverage, at most one feature per screen pixel per geometry dimension. --no-thin is a debug escape only.",
 )
 @click.option("-v", "--verbose", is_flag=True, help="Verbose (DEBUG) logging.")
 @click.option("-q", "--quiet", is_flag=True, help="Only print the JSON summary, no stage logs.")
@@ -114,6 +134,9 @@ def convert_cmd(
     screen_budget_mb: float,
     row_group_mb: float,
     overview_grid: float | None,
+    band_fractions: str | None,
+    coarsest_rel: float,
+    ladder_factor: float,
     coarse_row_groups: int,
     compression_level: int,
     page_size_kb: int,
@@ -133,6 +156,9 @@ def convert_cmd(
         screen_budget_mb=screen_budget_mb,
         row_group_mb=row_group_mb,
         overview_grid=overview_grid,
+        band_fractions=([float(f) for f in band_fractions.split(",")] if band_fractions else None),
+        coarsest_rel=coarsest_rel,
+        ladder_factor=ladder_factor,
         coarse_row_groups=coarse_row_groups,
         compression_level=compression_level,
         page_size_kb=page_size_kb,
