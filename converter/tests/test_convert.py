@@ -226,6 +226,33 @@ def test_overview_ladder_consistent_across_band_counts():
     assert two[0] == pytest.approx(three[0])
 
 
+def test_custom_ladder_options(tmp_path):
+    """`coarsest_rel` and `ladder_factor` reshape the tolerance ladder, and the
+    footer's per-level `gsd` and strictly increasing `max_zoom` follow it."""
+    tol = _overview_tolerances(4, 300.0, coarsest_rel=1 / 500, ladder_factor=2.0)
+    assert tol[0] == pytest.approx(300.0 / 500)
+    assert tol[1] == pytest.approx(300.0 / 1000)
+    assert tol[2] == pytest.approx(300.0 / 2000)
+
+    src = tmp_path / "in.parquet"
+    dst = tmp_path / "out.parquet"
+    _write_gpq(src, _make_polygons(400))
+    convert(
+        src, dst,
+        ConvertOptions(
+            bands=4, band_fractions=[0.05, 0.15, 0.3],
+            coarsest_rel=1 / 500, ladder_factor=2.0,
+        ),
+    )
+    meta = pq.ParquetFile(dst).metadata.metadata
+    levels = json.loads(meta[b"overviews"])["levels"]
+    assert len(levels) == 4
+    gsd = [lv["gsd"] for lv in levels[:-1]]
+    assert gsd[0] == pytest.approx(gsd[1] * 2) and gsd[1] == pytest.approx(gsd[2] * 2)
+    zooms = [lv["max_zoom"] for lv in levels]
+    assert zooms == sorted(zooms) and len(set(zooms)) == len(zooms)
+
+
 def test_null_geometry_segregated(tmp_path):
     """C1, null geometries are kept in the finest band with a null bbox and null
     overview, do not crash, and are excluded from the dataset extent."""

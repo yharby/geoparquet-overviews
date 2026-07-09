@@ -56,7 +56,9 @@ _MAX_BINARY_BYTES = 2**31 - 1
 # coarse whole-extent preview and always resolves at `_COARSEST_REL` of the span,
 # and every finer coarse band divides the tolerance by `_LADDER_FACTOR`. One
 # extent-relative geometric ladder for every band count, so `--bands 2` keeps the
-# same strong band 0 preview as `--bands 3` instead of a far weaker one.
+# same strong band 0 preview as `--bands 3` instead of a far weaker one. Both
+# are defaults for `ConvertOptions.coarsest_rel` and `.ladder_factor`, a factor
+# of 2 steps one web zoom per band, raster-overview style.
 _COARSEST_REL = 1 / 1500
 _LADDER_FACTOR = 4.0
 _GRID_REL = 1 / 60000
@@ -76,6 +78,11 @@ class ConvertOptions:
     # None means derive the overview snap grid from the dataset extent.
     overview_grid: float | None = None
     band_fractions: list[float] | None = None
+    # Overview tolerance ladder. Band 0 simplifies at `coarsest_rel` of the
+    # larger extent span, every finer coarse band divides the tolerance by
+    # `ladder_factor`. A factor of 2 steps one web zoom per band.
+    coarsest_rel: float = _COARSEST_REL
+    ladder_factor: float = _LADDER_FACTOR
     # Target number of row groups per coarse band.
     coarse_row_groups: int = 32
     # zstd compression level for the written file. Higher is smaller and slower.
@@ -325,6 +332,7 @@ def _band_by_fraction(score: np.ndarray, bands: int, fractions: list[float] | No
 def _thin_points(
     cx: np.ndarray, cy: np.ndarray, mask: np.ndarray, bands: int, span: float,
     dataset_bbox: tuple[float, float, float, float],
+    coarsest_rel: float = _COARSEST_REL, ladder_factor: float = _LADDER_FACTOR,
 ) -> np.ndarray:
     """Spatially stratify points into bands by grid representativeness, instead
     of a fraction of file order. For each coarse band from coarsest to finest,
@@ -340,7 +348,7 @@ def _thin_points(
         return band
     x0, y0 = dataset_bbox[0], dataset_bbox[1]
     assigned = np.zeros(len(idx), dtype=bool)
-    tolerances = _overview_tolerances(bands, span)
+    tolerances = _overview_tolerances(bands, span, coarsest_rel, ladder_factor)
     for b in sorted(tolerances):  # coarsest (largest cell) first
         cell = tolerances[b]
         remaining = np.where(~assigned)[0]  # positions within idx
@@ -362,6 +370,7 @@ def _assign_bands(
     cx: np.ndarray, cy: np.ndarray, bands: int, fractions: list[float] | None,
     importance_values: np.ndarray | None, importance_column: str | None,
     span: float, dataset_bbox: tuple[float, float, float, float], geographic: bool,
+    coarsest_rel: float = _COARSEST_REL, ladder_factor: float = _LADDER_FACTOR,
 ) -> tuple[np.ndarray, str, str]:
     """Rank features into importance bands per geometry dimension, largest first.
 
@@ -408,7 +417,7 @@ def _assign_bands(
             score[m0] = _percentile_desc(importance_values[m0].astype(np.float64))
         else:
             thinned = True
-            tb = _thin_points(cx, cy, m0, bands, span, dataset_bbox)
+            tb = _thin_points(cx, cy, m0, bands, span, dataset_bbox, coarsest_rel, ladder_factor)
             band[m0] = tb[m0]
 
     scored = ~np.isnan(score)
@@ -432,12 +441,15 @@ def _assign_bands(
     return band, importance, overview_method
 
 
-def _overview_tolerances(bands: int, span: float) -> dict[int, float]:
+def _overview_tolerances(
+    bands: int, span: float,
+    coarsest_rel: float = _COARSEST_REL, ladder_factor: float = _LADDER_FACTOR,
+) -> dict[int, float]:
     """Simplify tolerance per coarse band, in the data's own units. One
     extent-relative geometric ladder for every band count. Band 0 resolves at
-    `_COARSEST_REL` of the span and each finer coarse band divides the tolerance
-    by `_LADDER_FACTOR`."""
-    return {b: span * _COARSEST_REL / (_LADDER_FACTOR ** b) for b in range(bands - 1)}
+    `coarsest_rel` of the span and each finer coarse band divides the tolerance
+    by `ladder_factor`."""
+    return {b: span * coarsest_rel / (ladder_factor ** b) for b in range(bands - 1)}
 
 
 def _snap_safe(geoms: np.ndarray, grid: float) -> np.ndarray:
@@ -538,6 +550,7 @@ def _overview_band(
 def _build_overview(
     geoms: np.ndarray, band: np.ndarray, dimensions: np.ndarray, bands: int,
     span: float, grid: float, geom_bytes: np.ndarray, jobs: int = 1,
+    coarsest_rel: float = _COARSEST_REL, ladder_factor: float = _LADDER_FACTOR,
 ) -> tuple[np.ndarray, dict[int, float]]:
     """Build the overview WKB for every coarse band feature, per its dimension,
     NULL for the finest band. Returns a WKB object array and the tolerance used
@@ -546,7 +559,7 @@ def _build_overview(
     Invalid rings are repaired with `make_valid` on this overview path only, so
     one bowtie polygon cannot abort the conversion. The exact `geometry` column
     is never touched, which is the project invariant."""
-    tolerances = _overview_tolerances(bands, span)
+    tolerances = _overview_tolerances(bands, span, coarsest_rel, ladder_factor)
     out = np.full(len(geoms), None, dtype=object)
     for b, tol in tolerances.items():
         mask = band == b
@@ -670,6 +683,10 @@ def _validate_options(opts: ConvertOptions) -> None:
         raise ValueError(f"jobs must be 0 (auto) or a positive count, got {opts.jobs}")
     if opts.overview_grid is not None and opts.overview_grid <= 0:
         raise ValueError(f"overview_grid must be positive, got {opts.overview_grid}")
+    if opts.coarsest_rel <= 0:
+        raise ValueError(f"coarsest_rel must be positive, got {opts.coarsest_rel}")
+    if opts.ladder_factor <= 1:
+        raise ValueError(f"ladder_factor must be greater than 1, got {opts.ladder_factor}")
     if opts.compression_level < 1:
         raise ValueError(f"compression_level must be at least 1, got {opts.compression_level}")
     if opts.page_size_kb < 1:
@@ -773,6 +790,7 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     band, importance, overview_method = _assign_bands(
         dimensions, area, length, valid, cx, cy, opts.bands, opts.band_fractions,
         importance_values, opts.importance_column, span, dataset_bbox, geographic,
+        opts.coarsest_rel, opts.ladder_factor,
     )
     # Pin null and empty geometries into the finest, exact band.
     band[~valid] = opts.bands - 1
@@ -840,13 +858,14 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     if overview_method == "thin":
         log.info("point dataset, no overview column, banding is the level of detail")
         overview_wkb = np.full(len(geoms), None, dtype=object)
-        band_tol = _overview_tolerances(bands, span)
+        band_tol = _overview_tolerances(bands, span, opts.coarsest_rel, opts.ladder_factor)
         has_overview = False
     else:
         jobs = opts.jobs if opts.jobs > 0 else (os.cpu_count() or 1)
         log.info("building overview column across %d thread(s)", jobs)
         overview_wkb, band_tol = _build_overview(
-            geoms, band, dimensions, bands, span, grid, geom_bytes, jobs
+            geoms, band, dimensions, bands, span, grid, geom_bytes, jobs,
+            opts.coarsest_rel, opts.ladder_factor,
         )
         has_overview = any(v is not None for v in overview_wkb)
 

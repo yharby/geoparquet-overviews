@@ -42,6 +42,26 @@ def main() -> None:
     help="Coordinate grid the overview geometry snaps to, in CRS units. Derived from the dataset extent when unset.",
 )
 @click.option(
+    "--band-fractions",
+    default=None,
+    type=str,
+    help="Comma-separated share of features per coarse band, largest first, e.g. 0.01,0.02,0.04. Defaults to 0.03,0.27 for 3 bands, equal counts otherwise.",
+)
+@click.option(
+    "--coarsest-rel",
+    default=1 / 1500,
+    show_default="1/1500",
+    type=float,
+    help="Band 0 simplify tolerance as a fraction of the larger extent span.",
+)
+@click.option(
+    "--ladder-factor",
+    default=4.0,
+    show_default=True,
+    type=float,
+    help="Each finer coarse band divides the tolerance by this. 2 steps one web zoom per band, raster-overview style.",
+)
+@click.option(
     "--coarse-row-groups",
     default=32,
     show_default=True,
@@ -96,6 +116,9 @@ def convert_cmd(
     bands: int,
     row_group_mb: float,
     overview_grid: float | None,
+    band_fractions: str | None,
+    coarsest_rel: float,
+    ladder_factor: float,
     coarse_row_groups: int,
     compression_level: int,
     page_size_kb: int,
@@ -113,6 +136,11 @@ def convert_cmd(
         bands=bands,
         row_group_mb=row_group_mb,
         overview_grid=overview_grid,
+        band_fractions=(
+            [float(f) for f in band_fractions.split(",")] if band_fractions else None
+        ),
+        coarsest_rel=coarsest_rel,
+        ladder_factor=ladder_factor,
         coarse_row_groups=coarse_row_groups,
         compression_level=compression_level,
         page_size_kb=page_size_kb,
