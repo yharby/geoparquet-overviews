@@ -105,13 +105,6 @@ def main() -> None:
     show_default=True,
     help="Density thin the coarse bands so each holds at most one feature per screen pixel per geometry dimension. --no-thin is a debug escape only.",
 )
-@click.option(
-    "--drop-rate",
-    default=2.0,
-    show_default=True,
-    type=float,
-    help="Geometric per-band survivor ceiling. Higher asks for a steeper falloff toward the coarsest band, and the last coarse band is capped too so genuine overflow reaches the exact band and skips its overview. A deeper derived band ladder compounds this cap on band 0, whose budget is n_valid divided by drop_rate raised to bands minus one. Must be greater than 1.0.",
-)
 @click.option("-v", "--verbose", is_flag=True, help="Verbose (DEBUG) logging.")
 @click.option("-q", "--quiet", is_flag=True, help="Only print the JSON summary, no stage logs.")
 def convert_cmd(
@@ -129,7 +122,6 @@ def convert_cmd(
     bbox: bool | None,
     jobs: int,
     thin: bool,
-    drop_rate: float,
     verbose: bool,
     quiet: bool,
 ) -> None:
@@ -149,7 +141,6 @@ def convert_cmd(
         bbox=bbox,
         jobs=jobs,
         thin=thin,
-        drop_rate=drop_rate,
     )
     summary = convert(src, dst, opts)
     click.echo(json.dumps(summary, indent=2))

@@ -12,9 +12,7 @@ import pytest
 import shapely
 
 from geoparquet_overviews.convert import (
-    _ZOOMS_PER_BAND,
     ConvertOptions,
-    _band_budgets,
     _derive_bands,
     _detect_regime,
     _is_geographic,
@@ -312,24 +310,6 @@ def test_overview_is_smaller_than_exact(tmp_path):
     assert overview_bytes < exact_bytes
 
 
-def test_overview_ladder_anchored_at_coarsest_zoom():
-    """The ladder is anchored at the extent's coarsest zoom, not a fraction of the
-    extent. Band 0 is the gsd at `z_coarsest` regardless of band count, and each
-    finer coarse band steps _ZOOMS_PER_BAND more zooms (a 4x resolution step per
-    band)."""
-    world = 2 * math.pi * 6378137.0
-    z_coarsest = 5
-    two = _overview_tolerances(2, world, z_coarsest)
-    three = _overview_tolerances(3, world, z_coarsest)
-    band0 = world / (256 * 2 ** z_coarsest)
-    assert two[0] == pytest.approx(band0)
-    assert three[0] == pytest.approx(band0)
-    # Band 0 preview is identical regardless of band count.
-    assert two[0] == pytest.approx(three[0])
-    # Each coarse band is a 4x resolution step (two web zooms).
-    assert three[1] == pytest.approx(three[0] / (2 ** _ZOOMS_PER_BAND))
-
-
 def test_overview_tolerances_geometric_ladder():
     """The ladder is extent-relative, not zoom-anchored. Band 0 resolves at
     `coarsest_rel` of the span, and each finer coarse band divides the
@@ -337,16 +317,6 @@ def test_overview_tolerances_geometric_ladder():
     tol = _overview_tolerances(4, span=1000.0, coarsest_rel=0.01, ladder_factor=2.0)
     assert tol == {0: 10.0, 1: 5.0, 2: 2.5}  # 3 coarse bands, band 3 is exact
     assert set(tol) == {0, 1, 2}
-
-
-def test_band0_is_the_coarsest_zoom_pixel():
-    """Band 0's tolerance equals the ground sample distance at `z_coarsest`, the
-    zoom where the dataset extent fills the screen. A world dataset anchors at
-    _ZOOMS_PER_BAND, unchanged from the fixed ladder."""
-    for world in (360.0, 2 * math.pi * 6378137.0):
-        for z_coarsest in (convert_mod._ZOOMS_PER_BAND, 7):
-            tol = _overview_tolerances(3, world, z_coarsest)
-            assert tol[0] == pytest.approx(world / (256 * 2 ** z_coarsest))
 
 
 def test_coarsest_zoom_anchors_to_extent():
@@ -369,10 +339,9 @@ def test_per_band_grid_coarsens_with_band():
     """Each coarse band snaps to a fraction of its own tolerance, so band 0 gets a
     strictly larger snap grid than the finest coarse band, and every band's grid is
     its tolerance over the sub-pixel divisor."""
-    world = 2 * math.pi * 6378137.0
-    z_coarsest = convert_mod._ZOOMS_PER_BAND
-    grids = _overview_grids(4, world, z_coarsest, None)
-    tol = _overview_tolerances(4, world, z_coarsest)
+    span = 1000.0
+    grids = _overview_grids(4, span, 0.01, 2.0, None)
+    tol = _overview_tolerances(4, span, 0.01, 2.0)
     finest_coarse = max(grids)
     # Band 0 snaps coarser than the finest coarse band.
     assert grids[0] > grids[finest_coarse]
@@ -384,7 +353,7 @@ def test_per_band_grid_coarsens_with_band():
 def test_overview_grid_override_is_uniform():
     """A set `--overview-grid` forces the same grid on every band, the escape
     hatch overriding the per-band derivation."""
-    grids = _overview_grids(4, 360.0, convert_mod._ZOOMS_PER_BAND, override=0.001)
+    grids = _overview_grids(4, 1000.0, 0.01, 2.0, override=0.001)
     assert set(grids.keys()) == {0, 1, 2}
     assert all(g == 0.001 for g in grids.values())
 
@@ -393,24 +362,25 @@ def test_derive_bands_scales_with_density():
     """The band count is derived from byte density, bytes per CRS area unit where
     the data sits. A high-byte-density dataset asks for many coarse bands, a low
     one for few, and a positive --bands override wins."""
-    world = 2 * math.pi * 6378137.0
+    coarsest_rel = 1 / 1500
+    ladder_factor = 2.0
     budget = 1_000_000  # 1 MB per screen, the default
     # A high-byte-density case, a large total WKB payload over a metre extent,
     # such as Finland-scale buildings (~5.65M features, a few hundred bytes each),
-    # here as its uniform density. The coarse ladder runs from where the extent
-    # fills the screen up to where the exact geometry fits the budget, several
-    # coarse bands plus the exact band.
-    dense = _derive_bands(1_700_000_000 / (7e5 * 1.3e6), 7e5, 1.3e6, world, budget)
+    # here as its uniform density. The coarse ladder runs from the coarsest
+    # tolerance down to where the exact geometry fits the budget, several coarse
+    # bands plus the exact band.
+    dense = _derive_bands(1_700_000_000 / (7e5 * 1.3e6), 7e5, coarsest_rel, ladder_factor, budget)
     assert 4 <= dense <= 6
     # A low-byte-density case, a tiny payload over a continent-scale extent. The
-    # exact geometry already fits the screen budget at the coarsest zoom, so no
-    # coarse band is warranted and the dataset is a single exact band, no overview.
-    sparse = _derive_bands(2_000 / (4e6 * 4e6), 4e6, 4e6, world, budget)
+    # exact geometry already fits the screen budget at the coarsest tolerance, so
+    # no coarse band is warranted and the dataset is a single exact band, no overview.
+    sparse = _derive_bands(2_000 / (4e6 * 4e6), 4e6, coarsest_rel, ladder_factor, budget)
     assert sparse == 1
     assert dense > sparse
     # A positive --bands overrides the derivation entirely (checked via convert
     # elsewhere), and the screen budget tunes it, a lower budget asks for more.
-    tighter = _derive_bands(1_700_000_000 / (7e5 * 1.3e6), 7e5, 1.3e6, world, budget / 8)
+    tighter = _derive_bands(1_700_000_000 / (7e5 * 1.3e6), 7e5, coarsest_rel, ladder_factor, budget / 8)
     assert tighter >= dense
 
 
@@ -451,16 +421,17 @@ def test_vertex_heavy_derives_more_bands_than_count_light():
     large many-vertex polygons, derive different band counts, and the vertex-heavy
     one gets strictly more bands, because its higher byte density hits the screen
     budget at a finer zoom."""
-    world = 360.0
     span = 10.0
+    coarsest_rel = 1 / 1500
+    ladder_factor = 2.0
     budget = 1_000_000
     n = 300
     light = shapely.to_wkb(np.array(_polys_with_vertices(n, 4), dtype=object))
     heavy = shapely.to_wkb(np.array(_polys_with_vertices(n, 500), dtype=object))
     light_bytes = int(sum(len(w) for w in light))
     heavy_bytes = int(sum(len(w) for w in heavy))
-    light_bands = _derive_bands(light_bytes / (span * span), span, span, world, budget)
-    heavy_bands = _derive_bands(heavy_bytes / (span * span), span, span, world, budget)
+    light_bands = _derive_bands(light_bytes / (span * span), span, coarsest_rel, ladder_factor, budget)
+    heavy_bands = _derive_bands(heavy_bytes / (span * span), span, coarsest_rel, ladder_factor, budget)
     assert heavy_bands > light_bands
 
 
@@ -484,30 +455,6 @@ def test_detect_regime_labels(tmp_path):
     heavy = convert(str(heavy_src), str(tmp_path / "h.parquet"), ConvertOptions(row_group_mb=0.02))
     assert tiny["regime"] == "count"
     assert heavy["regime"] == "vertex"
-
-
-def test_band_budgets_decay_geometrically():
-    """Each coarse band's budget is a geometric fraction of n_valid, tightest at
-    band 0. Unlike gpq-tiles' own formula (whose finest level is the canonical,
-    never-capped one), the last coarse band is capped too, at n_valid /
-    drop_rate, which is what lets real overflow reach the exact band."""
-    budgets = _band_budgets(n_valid=1600, bands=4, drop_rate=2.0)
-    # 3 coarse bands (0, 1, 2), finest coarse band is 2.
-    assert budgets == {0: 200, 1: 400, 2: 800}
-
-
-def test_band_budgets_no_coarse_bands_is_empty():
-    assert _band_budgets(n_valid=500, bands=1, drop_rate=2.0) == {}
-
-
-def test_band_budgets_floors_at_one():
-    # A tiny n_valid with several bands and a steep drop_rate would otherwise
-    # round band 0's budget to 0, erasing its first paint entirely, a
-    # different failure than the legitimate empty-band merge elsewhere in the
-    # pipeline (that merge is for a band with no occupied cells at all).
-    budgets = _band_budgets(n_valid=5, bands=5, drop_rate=10.0)
-    assert all(v >= 1 for v in budgets.values())
-    assert budgets[0] == 1
 
 
 def test_thin_band0_even_coverage_and_counts():
@@ -538,7 +485,8 @@ def test_assign_bands_fraction_split_polygons():
     area = np.arange(n, dtype=float) + 1.0
     length = np.zeros(n)
     valid = np.ones(n, dtype=bool)
-    cx = np.linspace(0, 1000, n); cy = np.zeros(n)
+    cx = np.linspace(0, 1000, n)
+    cy = np.zeros(n)
     band, imp, method, score = _assign_bands(
         dims, area, length, valid, cx, cy, bands=3, fractions=[0.1, 0.2],
         importance_values=None, importance_column=None, span=1000.0,
@@ -547,6 +495,38 @@ def test_assign_bands_fraction_split_polygons():
     assert imp == "area_desc" and method == "simplify_snap"
     assert (band == 0).sum() == 10 and (band == 1).sum() == 20 and (band == 2).sum() == 70
     assert not np.isnan(score[valid]).any()
+
+
+def test_convert_light_overview_is_small(tmp_path):
+    # 5000 small many-vertex polygons -> multi-band, but the overview column stays
+    # a small fraction of the exact geometry. The point of light overviews is that
+    # a coarse band carries a heavily simplified copy, not a near-exact duplicate,
+    # so the features need enough vertices for simplification to actually shrink
+    # them (a 5-vertex box cannot shrink and would defeat the property).
+    rng = np.random.default_rng(0)
+    xs = rng.uniform(0, 1000, 5000)
+    ys = rng.uniform(0, 1000, 5000)
+    polys = shapely.buffer(shapely.points(xs, ys), 2.0, quad_segs=16)
+    t = pa.table({"geometry": pa.array(shapely.to_wkb(polys), type=pa.binary())},
+                 metadata={b"geo": json.dumps({"version": "1.1.0", "primary_column": "geometry",
+                          "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Polygon"]}}}).encode()})
+    src = tmp_path / "in.parquet"
+    pq.write_table(t, src)
+    dst = tmp_path / "out.parquet"
+    convert(str(src), str(dst), ConvertOptions(compression_level=3))
+    md = pq.ParquetFile(dst).metadata
+    ov = geom = 0
+    for i in range(md.num_row_groups):
+        rg = md.row_group(i)
+        for j in range(rg.num_columns):
+            c = rg.column(j)
+            if c.path_in_schema == "geom_overview":
+                ov += c.total_compressed_size
+            elif c.path_in_schema == "geometry":
+                geom += c.total_compressed_size
+    assert ov < geom * 0.6   # overview is a small fraction of exact, not a near-copy
+    o = json.loads(md.metadata[b"overviews"])
+    assert o["count_column"] == "overview_count"   # band-0 density signal present
 
 
 def test_null_geometry_segregated(tmp_path):
@@ -745,18 +725,14 @@ def test_negative_jobs_rejected(tmp_path):
         convert(str(src), str(dst), ConvertOptions(jobs=-1))
 
 
-def test_drop_rate_rejected_at_or_below_one(tmp_path):
-    with pytest.raises(ValueError, match="drop_rate"):
-        convert("x", "y", ConvertOptions(drop_rate=1.0))
-
-
-def test_no_feature_lost_with_drop_rate(tmp_path):
-    """The budget cap only redistributes rows between bands, it never drops a
-    feature, even under an aggressive drop_rate."""
+def test_no_feature_lost_under_band0_thinning(tmp_path):
+    """Band-0 thinning and the fraction banding of the demoted rest only move
+    features between bands, they never drop one. Every input feature survives in
+    exactly one band, coarse survivors plus the finest exact band."""
     src = tmp_path / "dense.parquet"
     dst = tmp_path / "out.parquet"
     _write_clustered(src, n=600, seed=2)
-    convert(str(src), str(dst), ConvertOptions(bands=3, row_group_mb=0.02, drop_rate=1.05))
+    convert(str(src), str(dst), ConvertOptions(bands=3, row_group_mb=0.02))
     out = pq.read_table(dst)
     assert out.num_rows == 600
     band = np.array(out.column("band").to_pylist())
@@ -1107,18 +1083,14 @@ def test_point_dataset_importance_column(tmp_path):
             weight.append(float(c * per + k))
     _write_gpq(src, geoms, extra_columns={"weight": pa.array(np.array(weight))})
 
-    # This sparse, far-flung fixture derives many bands (each cluster is its own
-    # coarse-zoom cell, so the ladder runs deep), which makes the default
-    # per-band survivor budget (drop_rate 2.0) bite band 0 hard: at 10 derived
-    # bands its exponent is steep enough to cap band 0 to a single overall
-    # survivor, not one per cluster. That budget behavior is not what this test
-    # is about (see test_no_feature_lost_with_drop_rate for that), so use a
-    # drop_rate close to 1 to keep the cap well above this fixture's natural
-    # five-cluster winner count and preserve the attribute-ranking assertion
-    # below.
+    # Band 0 is thinned to one survivor per coarsest cell over all valid points,
+    # the highest attribute value in each cluster. This far-flung fixture puts
+    # each cluster in its own coarsest cell, so all five cluster maxima survive
+    # band 0 and the attribute ranking below holds. Force enough bands that band
+    # 0 is genuinely a thinned coarse band rather than the lone exact band.
     summary = convert(
         str(src), str(dst),
-        ConvertOptions(row_group_mb=0.02, importance_column="weight", drop_rate=1.1),
+        ConvertOptions(bands=2, row_group_mb=0.02, importance_column="weight"),
     )
     assert summary["has_overview"] is False
 
@@ -1202,7 +1174,12 @@ def test_mixed_dataset_line_reaches_band0(tmp_path):
     geoms.append(shapely.LineString([(0.0, 0.0), (10.0, 10.0)]))  # spans the extent
     _write_gpq(src, geoms)
 
-    convert(str(src), str(dst), ConvertOptions(row_group_mb=0.02))
+    # Force two bands and a coarse enough band-0 tolerance that thinning demotes
+    # a real share of the polygons into the finest band, so band 0 is a genuine
+    # thinned coarse band rather than collapsing to a single exact band. The lone
+    # line is the sole feature of its geometry dimension, so it never contends
+    # with a polygon for a cell and always survives into band 0.
+    convert(str(src), str(dst), ConvertOptions(bands=2, row_group_mb=0.02, coarsest_rel=0.1))
 
     out = pq.read_table(dst)
     ids = np.array(out.column("id").to_pylist())
@@ -1215,14 +1192,9 @@ def test_mixed_dataset_line_reaches_band0(tmp_path):
 
     ov = json.loads(pq.read_metadata(dst).metadata[b"overviews"])
     assert ov["importance"] == "mixed_quantile_desc"
-    # This sparse fixture's cell contention alone lets every feature win its
-    # own band-0 cell, but the default per-band survivor budget (drop_rate
-    # 2.0) caps band 0 well below that count regardless, so real overflow now
-    # demotes into band 1 and the file no longer collapses to a single exact
-    # band. The footer must say what actually happened: real thinning and
-    # simplification occurred, so the method is `simplify_snap`, not the
-    # dishonest `none` this test asserted before the per-band budget existed,
-    # and the coarse bands carry a real count_column.
+    # With a real coarse band the footer reports honest work, band 0 is thinned
+    # and simplified, so the method is `simplify_snap` and the coarse band carries
+    # a count column.
     assert ov["overview_method"] == "simplify_snap"
     assert ov["count_column"] == "overview_count"
 
@@ -1304,8 +1276,12 @@ def test_overview_geometry_types_recomputed(tmp_path):
     _write_gpq(src, geoms)
 
     # Force two bands so every loser lands in the finest band (null overview)
-    # rather than surviving a mid band and carrying an overview of its own.
-    convert(str(src), str(dst), ConvertOptions(bands=2, row_group_mb=0.02))
+    # rather than surviving a mid band and carrying an overview of its own. A
+    # coarser band-0 tolerance keeps each cluster's polygon and multipolygon in
+    # one shared cell so the higher-area polygon reliably wins and the
+    # multipolygon is demoted, while the 0.05-spaced clusters stay in distinct
+    # cells.
+    convert(str(src), str(dst), ConvertOptions(bands=2, row_group_mb=0.02, coarsest_rel=0.01))
 
     geo = json.loads(pq.read_metadata(dst).metadata[b"geo"])
     assert geo["columns"]["geometry"]["geometry_types"] == ["MultiPolygon", "Polygon"]
@@ -1348,8 +1324,9 @@ def _square(cx, cy, s):
 
 def test_thinning_demotes_dense_features(tmp_path):
     """Many large polygons packed into a single coarse-band cell collapse to
-    roughly one survivor in band 0 with thinning on, while thinning off keeps
-    them all. Compare band-0 counts thin vs no-thin."""
+    roughly one survivor in band 0 with band-0 thinning on. With thinning off
+    band 0 is instead a plain importance fraction of the whole set, so it holds
+    far more of the cluster. Compare band-0 counts thin vs no-thin."""
     src = tmp_path / "dense.parquet"
     thin_dst = tmp_path / "thin.parquet"
     nothin_dst = tmp_path / "nothin.parquet"
@@ -1370,164 +1347,77 @@ def test_thinning_demotes_dense_features(tmp_path):
 
     thin_b0 = _band0(thin_dst)
     nothin_b0 = _band0(nothin_dst)
-    # Without thinning the whole cluster sits in band 0, with thinning it
-    # collapses to about one feature per cell.
-    assert nothin_b0 >= 30
+    # Without band-0 thinning, band 0 is a plain importance fraction of the whole
+    # set and keeps many features. With thinning it collapses the packed cluster
+    # to about one survivor per cell.
+    assert nothin_b0 >= 10
     assert thin_b0 <= 3
     assert thin_b0 < nothin_b0
 
 
-def test_thinned_band_is_subset_of_source():
-    """Thinning only moves features to finer, higher-index bands, never coarser,
-    and the finest band's membership only grows."""
+def test_thin_band0_survivors_subset_of_valid():
+    """Band-0 thinning keeps one survivor per coarsest cell, so the survivors are
+    a strict subset of the valid features and only valid features can survive.
+    The per-survivor counts sum to the whole valid population, losers carry 0."""
     rng = np.random.default_rng(11)
     n = 200
     dimensions = np.full(n, 2, dtype=np.int8)
     valid = np.ones(n, dtype=bool)
-    # Three coarse bands plus a finest band, everyone starts coarse.
-    band = np.array([i % 3 for i in range(n)], dtype=np.int16)
+    valid[[7, 88, 150]] = False  # a few invalid rows never survive
     # Cluster the representative points onto a coarse grid so cells collide.
     rx = rng.integers(0, 5, n).astype(np.float64)
     ry = rng.integers(0, 5, n).astype(np.float64)
     metric = rng.random(n)
     stable_hash = rng.integers(0, 2**32, n, dtype=np.uint64).astype(np.uint32)
-    bands = 4
-    tolerances = convert_mod._overview_tolerances(bands, 10.0, convert_mod._ZOOMS_PER_BAND)
-    origin = (0.0, 0.0)
 
-    out, _ = convert_mod._thin_bands(
-        band, dimensions, rx, ry, metric, stable_hash, valid, bands, tolerances, origin
+    # cell = span * coarsest_rel = 1.0, so the integer grid gives at most 25 cells.
+    is_survivor, counts = convert_mod._thin_band0(
+        dimensions, rx, ry, metric, stable_hash, valid,
+        span=10.0, coarsest_rel=0.1, ladder_factor=2.0, origin=(0.0, 0.0),
     )
-    # No feature moved to a coarser band.
-    assert np.all(out >= band)
-    # The input array was not mutated.
-    assert np.any(out != band)
-    # The finest band only grew.
-    finest = bands - 1
-    assert int((out == finest).sum()) >= int((band == finest).sum())
+    # Only valid features survive, and thinning genuinely dropped some.
+    assert not (is_survivor & ~valid).any()
+    assert 0 < int(is_survivor.sum()) < int(valid.sum())
+    # Every valid feature competed in the single band-0 pass, so the survivor
+    # counts sum to the whole valid population and losers carry no count.
+    assert int(counts[is_survivor].sum()) == int(valid.sum())
+    assert np.all(counts[~is_survivor] == 0)
 
 
-def test_thin_bands_budget_caps_survivors_beyond_cell_contention():
-    """Ten features, each alone in its own cell (cell contention alone would
-    keep all ten), with a budget of 3 on band 0. Only the top 3 by metric
-    survive band 0, the rest demote to band 1 with their count reset to 0,
-    exactly like a cell-contention loser."""
-    n = 10
-    dimensions = np.full(n, 2, dtype=np.int8)
-    valid = np.ones(n, dtype=bool)
-    band = np.zeros(n, dtype=np.int16)
-    rx = np.arange(n, dtype=np.float64) * 10.0  # far apart, one per cell
-    ry = np.zeros(n, dtype=np.float64)
-    metric = np.arange(n, dtype=np.float64)  # feature 9 is the most important
-    stable_hash = np.arange(n, dtype=np.uint32)
-    bands = 2
-    tolerances = {0: 1.0}
-    origin = (0.0, 0.0)
-    budgets = {0: 3}
-
-    out, counts = convert_mod._thin_bands(
-        band, dimensions, rx, ry, metric, stable_hash, valid, bands,
-        tolerances, origin, budgets,
-    )
-    survivors = set(np.where(out == 0)[0].tolist())
-    assert survivors == {9, 8, 7}  # the three highest metric values
-    assert int((out == 0).sum()) == 3
-    assert int((out == 1).sum()) == 7
-    demoted = set(range(n)) - survivors
-    assert np.all(counts[list(demoted)] == 0)
-
-
-def test_thin_bands_last_band_budget_sends_overflow_to_exact():
-    """Capping the last coarse band too (not just intermediate ones) is what
-    makes the budget actually shrink the file: real overflow from the last
-    coarse band demotes straight into the exact band and skips its overview,
-    rather than cycling between coarse bands."""
-    n = 6
-    dimensions = np.full(n, 2, dtype=np.int8)
-    valid = np.ones(n, dtype=bool)
-    band = np.zeros(n, dtype=np.int16)  # everyone starts in the only coarse band
-    rx = np.arange(n, dtype=np.float64) * 10.0  # one per cell regardless of tolerance
-    ry = np.zeros(n, dtype=np.float64)
-    metric = np.arange(n, dtype=np.float64)
-    stable_hash = np.arange(n, dtype=np.uint32)
-    bands = 2  # one coarse band (0) plus the exact band (1)
-    tolerances = {0: 1.0}
-    origin = (0.0, 0.0)
-    budgets = {0: 2}  # only the top 2 by metric may stay in this, the last coarse band
-
-    out, counts = convert_mod._thin_bands(
-        band, dimensions, rx, ry, metric, stable_hash, valid, bands,
-        tolerances, origin, budgets,
-    )
-    assert set(np.where(out == 0)[0].tolist()) == {4, 5}
-    assert set(np.where(out == 1)[0].tolist()) == {0, 1, 2, 3}
-    # The exact band is never thinned, its members keep count 0 (written null).
-    assert np.all(counts[[0, 1, 2, 3]] == 0)
-
-
-def test_thin_bands_budgets_none_is_unchanged():
-    """Omitting `budgets` (the default) must reproduce the pre-existing
-    cell-contention-only behavior exactly."""
-    rng = np.random.default_rng(11)
-    n = 200
-    dimensions = np.full(n, 2, dtype=np.int8)
-    valid = np.ones(n, dtype=bool)
-    band = np.array([i % 3 for i in range(n)], dtype=np.int16)
-    rx = rng.integers(0, 5, n).astype(np.float64)
-    ry = rng.integers(0, 5, n).astype(np.float64)
-    metric = rng.random(n)
-    stable_hash = rng.integers(0, 2**32, n, dtype=np.uint64).astype(np.uint32)
-    bands = 4
-    tolerances = convert_mod._overview_tolerances(bands, 10.0, convert_mod._ZOOMS_PER_BAND)
-    origin = (0.0, 0.0)
-
-    without_arg, counts_a = convert_mod._thin_bands(
-        band, dimensions, rx, ry, metric, stable_hash, valid, bands, tolerances, origin
-    )
-    with_none, counts_b = convert_mod._thin_bands(
-        band, dimensions, rx, ry, metric, stable_hash, valid, bands, tolerances, origin, None
-    )
-    assert np.array_equal(without_arg, with_none)
-    assert np.array_equal(counts_a, counts_b)
-
-
-def test_thinning_is_idempotent():
-    """Re-thinning an already-thinned assignment returns the same array, a
-    thinned band assignment is a fixed point."""
+def test_thin_band0_is_idempotent():
+    """The crc32/stable_hash tie-break makes band-0 thinning deterministic, so
+    running it twice on the same inputs yields the identical survivor mask and
+    counts, a fixed point."""
     rng = np.random.default_rng(13)
     n = 300
     dimensions = np.full(n, 2, dtype=np.int8)
     valid = np.ones(n, dtype=bool)
-    band = np.array([i % 3 for i in range(n)], dtype=np.int16)
     rx = rng.integers(0, 6, n).astype(np.float64)
     ry = rng.integers(0, 6, n).astype(np.float64)
     metric = rng.random(n)
     stable_hash = rng.integers(0, 2**32, n, dtype=np.uint64).astype(np.uint32)
-    bands = 4
-    tolerances = convert_mod._overview_tolerances(bands, 10.0, convert_mod._ZOOMS_PER_BAND)
-    origin = (0.0, 0.0)
+    kw = dict(span=10.0, coarsest_rel=0.1, ladder_factor=2.0, origin=(0.0, 0.0))
 
-    once, _ = convert_mod._thin_bands(
-        band, dimensions, rx, ry, metric, stable_hash, valid, bands, tolerances, origin
+    once, counts_a = convert_mod._thin_band0(
+        dimensions, rx, ry, metric, stable_hash, valid, **kw
     )
-    twice, _ = convert_mod._thin_bands(
-        once, dimensions, rx, ry, metric, stable_hash, valid, bands, tolerances, origin
+    twice, counts_b = convert_mod._thin_band0(
+        dimensions, rx, ry, metric, stable_hash, valid, **kw
     )
     assert np.array_equal(once, twice)
+    assert np.array_equal(counts_a, counts_b)
 
 
-def test_thinning_independent_of_input_order():
-    """The crc32 tie-break makes the per-cell winner order-independent. Build a
+def test_thin_band0_independent_of_input_order():
+    """The crc32 tie-break makes the per-cell survivor order-independent. Build a
     cell layout with tied metrics so the hash alone decides, thin it, shuffle
     every input row, thin again, and assert the surviving feature ids match."""
-    # 5 cells, 4 features each, all in band 0 of a 2-band layout, all metric
-    # equal so the crc32 tie-break is the only decider.
+    # 5 cells, 4 features each, all metric equal so the crc32 tie-break decides.
     ids = np.arange(20)
     cells = np.repeat(np.arange(5), 4)  # 4 features share each cell
     dimensions = np.full(20, 2, dtype=np.int8)
     valid = np.ones(20, dtype=bool)
-    band = np.zeros(20, dtype=np.int16)
-    # Place each feature at the centre of its cell (cell size 1.0).
+    # Place each cluster far enough apart to fall in its own coarsest cell.
     rx = cells.astype(np.float64) * 10.0 + 0.5
     ry = np.full(20, 0.5)
     metric = np.ones(20)  # tied, hash decides
@@ -1535,23 +1425,22 @@ def test_thinning_independent_of_input_order():
         (convert_mod.zlib.crc32(f"feature-{i}".encode()) for i in ids),
         dtype=np.uint32, count=20,
     )
-    bands = 2
-    tolerances = convert_mod._overview_tolerances(bands, 50.0, convert_mod._ZOOMS_PER_BAND)
-    origin = (0.0, 0.0)
+    # cell = span * coarsest_rel = 5.0, under the 10.0 cluster spacing.
+    kw = dict(span=50.0, coarsest_rel=0.1, ladder_factor=2.0, origin=(0.0, 0.0))
 
-    out, counts = convert_mod._thin_bands(
-        band, dimensions, rx, ry, metric, stable_hash, valid, bands, tolerances, origin
+    is_survivor, counts = convert_mod._thin_band0(
+        dimensions, rx, ry, metric, stable_hash, valid, **kw
     )
-    survivors = set(ids[out == 0].tolist())
+    survivors = set(ids[is_survivor].tolist())
     # Each survivor's count is its cell's whole population, four per cell here.
-    assert np.all(counts[out == 0] == 4)
+    assert np.all(counts[is_survivor] == 4)
 
     perm = np.random.default_rng(99).permutation(20)
-    out2, _ = convert_mod._thin_bands(
-        band[perm], dimensions[perm], rx[perm], ry[perm], metric[perm],
-        stable_hash[perm], valid[perm], bands, tolerances, origin,
+    is_survivor2, _ = convert_mod._thin_band0(
+        dimensions[perm], rx[perm], ry[perm], metric[perm],
+        stable_hash[perm], valid[perm], **kw,
     )
-    survivors2 = set(ids[perm][out2 == 0].tolist())
+    survivors2 = set(ids[perm][is_survivor2].tolist())
 
     # One survivor per cell, five in all, identical set regardless of order.
     assert len(survivors) == 5
@@ -1854,13 +1743,14 @@ def test_clustered_data_derives_more_bands_than_uniform():
     """The same bytes ask for more coarse bands when they cluster, the ladder
     must serve the dense screens a user actually zooms into, not the empty
     countryside average that hands off to the unthinned exact band too early."""
-    world = 360.0
+    coarsest_rel = 1 / 1500
+    ladder_factor = 2.0
     budget = 1_000_000
     total = 3e8
     span = 10.0
     average = total / (span * span)
-    uniform_bands = _derive_bands(average, span, span, world, budget)
-    clustered_bands = _derive_bands(average * 400, span, span, world, budget)
+    uniform_bands = _derive_bands(average, span, coarsest_rel, ladder_factor, budget)
+    clustered_bands = _derive_bands(average * 400, span, coarsest_rel, ladder_factor, budget)
     assert clustered_bands > uniform_bands
 
 
@@ -1906,103 +1796,42 @@ def test_ladder_never_exceeds_fine_max_zoom(tmp_path):
 
 
 def test_overview_count_column(tmp_path):
-    """Coarse-band survivors carry the density signal thinning would otherwise
-    destroy. Each survivor's overview_count is its cell's whole population in
-    the pass it won, so the counts across band 0 sum to every valid feature,
-    the finest band is null, and the footer names the column."""
+    """Band-0 survivors carry the density signal thinning would otherwise
+    destroy. Each survivor's overview_count is its coarsest cell's whole
+    population, so band 0's counts sum to every valid feature. Only band 0 is
+    thinned, so every deeper band, mid or the finest exact band, carries a null
+    count, and the footer names the column."""
     src = tmp_path / "src.parquet"
     dst = tmp_path / "out.parquet"
     n = 600
     _write_clustered(src, n=n)
 
-    # The default per-band survivor budget (drop_rate 2.0) would cap band 0
-    # below this fixture's natural ~292 cell-contention winners, zeroing the
-    # excess winners' cell-population counts and breaking the clean
-    # sum-covers-everyone arithmetic this test relies on. That budget
-    # behavior belongs to test_no_feature_lost_with_drop_rate, not here, so
-    # use a drop_rate close to 1 to keep the cap above the natural winner
-    # count and exercise the count column on its own.
-    convert(str(src), str(dst), ConvertOptions(bands=3, row_group_mb=0.02, drop_rate=1.1))
+    convert(str(src), str(dst), ConvertOptions(bands=3, row_group_mb=0.02))
 
     out = pq.read_table(dst)
     assert "overview_count" in out.column_names
     band = np.array(out.column("band").to_pylist())
     counts = out.column("overview_count").to_pylist()
-    finest = band.max()
 
+    # Only band 0 carries counts. Every deeper band, mid or finest, is null.
     for b, c in zip(band, counts, strict=True):
-        if b == finest:
-            assert c is None
-        else:
+        if b == 0:
             assert c is not None and c >= 1
+        else:
+            assert c is None
 
-    # Every valid feature competed in pass 0, so band 0's counts cover them all.
+    # Every valid feature competed in the single band-0 pass, so band 0's counts
+    # cover them all.
     band0_sum = sum(c for b, c in zip(band, counts, strict=True) if b == 0)
     assert band0_sum == n
-    # Pass 1 saw exactly the features pass 0 demoted.
-    band0_n = int((band == 0).sum())
-    band1_sum = sum(c for b, c in zip(band, counts, strict=True) if b == 1)
-    assert band1_sum == n - band0_n
 
     ov = json.loads(pq.read_metadata(dst).metadata[b"overviews"])
     assert ov["count_column"] == "overview_count"
 
-    # Re-conversion drops and rebuilds the column, byte-identical. Same
-    # drop_rate as the first pass, a mismatched budget would re-band the file
-    # and this comparison isn't testing drop_rate itself (see the note above).
+    # Re-conversion drops and rebuilds the column, byte-identical.
     dst2 = tmp_path / "out2.parquet"
-    convert(str(dst), str(dst2), ConvertOptions(bands=3, row_group_mb=0.02, drop_rate=1.1))
+    convert(str(dst), str(dst2), ConvertOptions(bands=3, row_group_mb=0.02))
     assert dst.read_bytes() == dst2.read_bytes()
-
-
-def test_overview_count_bounded_under_binding_budget(tmp_path):
-    """Guards the count semantics test_overview_count_column deliberately
-    avoids by pinning drop_rate close to 1. Here the default drop_rate=2.0
-    genuinely binds band 0, so a demoted winner's tally was cleared there and
-    band 0's counts must sum to strictly less than n_valid.
-
-    The whole-file sum of overview_count does not equal n_valid under a
-    binding budget, so that is not the property this test asserts. A cell's
-    population is written once by whichever winner claims it, but a feature
-    demoted out of that cell can go on to win a different cell in a finer
-    band, so it can be counted again there, the whole-file sum can land above
-    or below n_valid depending on how thinning cascades. The property that
-    does hold, proven from `_thin_bands` itself and checked here, is a
-    per-band bound. Band b's cell grid partitions exactly the rows still live
-    when its own thinning pass runs, that pool is precisely the rows whose
-    final band ends up b or coarser, since a row's band only ever increases,
-    so band b's written counts can never exceed that pool's size, and they
-    equal it exactly whenever band b's own budget does not cut into its
-    winners."""
-    n = 900
-    src = tmp_path / "clustered.parquet"
-    dst = tmp_path / "out.parquet"
-    _write_clustered(src, n=n)
-    convert(str(src), str(dst), ConvertOptions(bands=4, row_group_mb=0.02))
-
-    out = pq.read_table(dst)
-    band = np.array(out.column("band").to_pylist())
-    counts = np.array(
-        [c if c is not None else 0 for c in out.column("overview_count").to_pylist()]
-    )
-    finest = int(band.max())
-
-    # (a) The default budget genuinely binds band 0 for this fixture. Empirically
-    # band0_sum is 224 against n_valid 900, well under, so the assertion below is
-    # not vacuous.
-    band0_sum = int(counts[band == 0].sum())
-    assert band0_sum < n
-
-    # (b) The true cross-band property, a bound rather than an equality. At the
-    # moment band b's own pass runs, its pool is exactly the rows whose final
-    # band is b or coarser, and every cell in that pool is counted at most once,
-    # by its winner, so band b's counts can never exceed that pool.
-    for b in range(finest):
-        pool = int((band >= b).sum())
-        band_sum = int(counts[band == b].sum())
-        assert band_sum <= pool
-    # Band 0's pool is the entire valid set, the bound (a) tightens into strict.
-    assert int((band >= 0).sum()) == n
 
 
 def test_point_dataset_carries_counts(tmp_path):

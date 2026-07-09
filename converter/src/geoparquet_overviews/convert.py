@@ -401,42 +401,6 @@ def _max_coarse_for_zoom(z_coarsest: int) -> int:
     return max(0, (_FINE_MAX_ZOOM - 1 - z_coarsest) // _ZOOMS_PER_BAND + 1)
 
 
-def _band_budgets(n_valid: int, bands: int, drop_rate: float) -> dict[int, int]:
-    """Per-coarse-band survivor ceiling, geometric decay toward the coarsest
-    band, gpq-tiles/tippecanoe style: budget(b) = n_valid / drop_rate **
-    (finest - b + 1), where finest = bands - 2 is the last coarse band before
-    the exact band.
-
-    Unlike gpq-tiles' own formula, whose finest level is the canonical,
-    never-capped one, the last coarse band here is capped too, at
-    n_valid / drop_rate. That matters because every row gets exactly one
-    `geom_overview` value, simplified at whichever coarse band's tolerance it
-    ends up assigned to, except in the exact band where it is null. Demoting
-    an intermediate band's overflow into the next coarse band therefore does
-    not shrink the file, it only changes how simplified that feature's
-    overview is. Only overflow that reaches the exact band skips overview
-    storage entirely, so the last coarse band must be capped too or this
-    mechanism only redistributes bytes between bands instead of reducing
-    their total. Genuine overflow from the last coarse band demotes straight
-    into the exact band via the same demotion path `_thin_bands` already
-    uses, a visibility gate, not data loss, since the feature is still in
-    the file per the "no feature is ever dropped" invariant, it simply does
-    not preview at a coarser zoom.
-
-    Floored to an integer and never allowed below 1, so the cap alone can
-    never erase a band's first paint (an empty band from having no occupied
-    cells at all is a different, already-handled case, see the empty-band
-    merge in `convert()`). Returns an empty dict when there is no coarse
-    band to budget (bands <= 1), the caller's cap then never binds."""
-    if bands <= 1:
-        return {}
-    finest = bands - 2
-    return {
-        b: max(1, int(n_valid / drop_rate ** (finest - b + 1)))
-        for b in range(bands - 1)
-    }
-
-
 def _derive_bands(byte_density, span, coarsest_rel, ladder_factor, screen_budget_bytes):
     """Total band count, coarse plus one exact, capped where exact geometry read
     with page pruning already meets the per-screen byte budget. `gsd_fine` is the
@@ -671,84 +635,6 @@ def _representative_points(
     rx = np.concatenate([p[0] for p in parts])
     ry = np.concatenate([p[1] for p in parts])
     return rx, ry
-
-
-def _thin_bands(
-    band: np.ndarray, dimensions: np.ndarray, rx: np.ndarray, ry: np.ndarray,
-    metric: np.ndarray, stable_hash: np.ndarray, valid: np.ndarray, bands: int,
-    tolerances: dict[int, float], origin: tuple[float, float],
-    budgets: dict[int, int] | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Demote over-dense features to finer bands so each coarse band holds at
-    most one feature per one-pixel cell, per geometry dimension. Coarsest band
-    first, within band b lay the band's grid (cell size tolerances[b]), and in
-    every occupied cell keep the single highest (metric, then stable_hash)
-    feature, demoting the rest to band b+1 where they are reconsidered. The
-    finest band is never thinned, so no feature leaves the file, it only moves
-    to a finer band. Features of different geometry dimensions never contend for
-    the same cell, so a point and the polygon over it can both survive.
-
-    `budgets`, from `_band_budgets`, is an optional second demotion source. If
-    band b's cell-contention winners still exceed `budgets[b]`, the lowest
-    ranked excess is demoted too, ranked by the same (metric desc, stable_hash
-    asc) key, but across all of band b's winners together, not per geometry
-    dimension the way cell contention itself works (cell_id packs the
-    dimension into its top bits there, so points, lines, and polygons never
-    contend for the same cell). An unranked point carries metric 0, so on a
-    mixed point and polygon file a binding budget demotes unranked points out
-    of the coarse overview ahead of ranked polygons. Demoting the last coarse
-    band's excess this way sends it to the exact band, skipping its overview
-    entirely, the only demotion path that actually shrinks the file rather
-    than just moving bytes between coarse bands. `None` (the default) applies
-    no cap, unchanged from before this parameter existed.
-
-    Returns the new band array, each band a subset of its pre-thinning
-    membership, and a per-feature survivor count. A coarse-band survivor's count
-    is how many features, itself included, competed for its one-pixel cell in
-    the pass it won, the density signal thinning would otherwise destroy. One
-    survivor per pixel makes a dense city and a sparse village paint identically,
-    the count is what lets a viewer scale a survivor's symbol so the cluster
-    stays visible. Rows the thinning never crowned (the finest band, invalid
-    rows, and a row demoted past its band's budget) keep count 0, the caller
-    writes those as null."""
-    band = band.copy()
-    counts = np.zeros(len(band), dtype=np.int64)
-    for b in range(bands - 1):
-        sel = np.where(valid & (band == b))[0]
-        if len(sel) == 0:
-            continue
-        cell = tolerances[b]
-        ix = np.floor((rx[sel] - origin[0]) / cell).astype(np.int64)
-        iy = np.floor((ry[sel] - origin[1]) / cell).astype(np.int64)
-        # Representative points of valid features are inside the dataset extent,
-        # so ix and iy are non-negative. Band 0's grid is about _SCREEN_PX cells
-        # across by construction of the extent-anchored ladder and each band
-        # multiplies that by 2**_ZOOMS_PER_BAND, so give each axis 30 bits (past
-        # a billion cells, well beyond the capped band count) and pack the
-        # geometry dimension into the top 2 bits so cohorts never share a cell.
-        # Total width 62 bits stays a positive int64. Clip as a last-resort guard
-        # against a pathological extent.
-        ix = np.clip(ix, 0, (1 << 30) - 1)
-        iy = np.clip(iy, 0, (1 << 30) - 1)
-        cell_id = (dimensions[sel].astype(np.int64) << 60) | (ix << 30) | iy
-        winners = _winners_per_cell(cell_id, metric[sel], stable_hash[sel])
-        keep = np.zeros(len(sel), dtype=bool)
-        keep[winners] = True
-        # How crowded each winner's cell was, the survivor's density weight.
-        uniq, inverse, cell_counts = np.unique(
-            cell_id, return_inverse=True, return_counts=True
-        )
-        counts[sel[winners]] = cell_counts[inverse[winners]]
-
-        cap = budgets.get(b) if budgets else None
-        if cap is not None and len(winners) > cap:
-            rank = np.lexsort((stable_hash[sel[winners]], -metric[sel[winners]]))
-            excess = winners[rank[cap:]]
-            keep[excess] = False
-            counts[sel[excess]] = 0
-
-        band[sel[~keep]] = b + 1
-    return band, counts
 
 
 def _thin_points(
@@ -1213,8 +1099,8 @@ def _validate_options(opts: ConvertOptions) -> None:
     if opts.bands < 0:
         raise ValueError(f"bands must be 0 (derive) or a positive count, got {opts.bands}")
     # A forced count shares the derived path's cap. Past it the coarsest bands'
-    # per-band cell underflows the thinning grid's bit budget, the np.clip in
-    # _thin_bands collapses every cell into one and silently mis-thins, and an
+    # per-band cell underflows the band-0 thinning grid's bit budget, the np.clip in
+    # _thin_band0 collapses every cell into one and silently mis-thins, and an
     # extreme value underflows the tolerance to 0 or overflows _overview_tolerances.
     if opts.bands > _MAX_COARSE_BANDS + 1:
         raise ValueError(
@@ -1237,8 +1123,6 @@ def _validate_options(opts: ConvertOptions) -> None:
         raise ValueError(f"page_size_kb must be at least 1, got {opts.page_size_kb}")
     if opts.bbox is False and not opts.native_geo:
         raise ValueError("--no-bbox requires native geo types, there would be no pruning surface at all")
-    if opts.drop_rate <= 1.0:
-        raise ValueError(f"drop_rate must be greater than 1.0, got {opts.drop_rate}")
 
 
 def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
@@ -1362,8 +1246,9 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     # band count they need from one formula, and the local (byte-weighted
     # quantile over an extent grid) estimate keeps clustered data honest, the
     # ladder covers the zooms a dense city needs, not just the empty-countryside
-    # average. The coarse ladder runs from `z_coarsest` up to the zoom where
-    # exact geometry becomes affordable, at _ZOOMS_PER_BAND steps per band, plus
+    # average. The coarse count is the number of `ladder_factor` halvings from
+    # the coarsest tolerance (`span * coarsest_rel`) down to `gsd_fine`, the
+    # tolerance at which a screen of exact geometry meets the byte budget, plus
     # one exact band. `regime` is a descriptive label only, it reports which
     # regime the file is, it never branches the pipeline.
     n_valid = int(valid.sum())
@@ -1410,41 +1295,31 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     )
 
     band, importance, overview_method, score = _assign_bands(
-        dimensions, area, length, valid, cx, cy, bands,
-        importance_values, opts.importance_column, geographic,
+        dimensions, area, length, valid, cx, cy, bands, opts.band_fractions,
+        importance_values, opts.importance_column, span, dataset_bbox, geographic,
+        opts.coarsest_rel, opts.ladder_factor,
     )
-    # Pin null and empty geometries into the finest, exact band. (Also done inside
-    # _assign_bands, kept here so the invariant is explicit at the call site.)
     band[~valid] = bands - 1
     log.info("ranked by importance %r, overview method %r", importance, overview_method)
 
-    # Density thin the coarse bands. Every valid feature starts in band 0, so the
-    # thinning cascade alone places it. Demote the over-dense ones to finer bands,
-    # per geometry dimension, so each coarse band holds at most one feature per
-    # one-pixel cell. No feature leaves the file, the finest band keeps everyone
-    # demoted into it. This runs after banding and the null pin, and before the
-    # empty-band merge, since thinning can empty a coarse band that the merge
-    # must then renumber, and before the band-major sort which needs final bands.
     survivor_counts = np.zeros(len(band), dtype=np.int64)
-    if opts.thin:
-        thin_mask = valid
-        rx, ry = _representative_points(geoms, dimensions, bounds, thin_mask, jobs=opts.jobs)
-        tolerances = _overview_tolerances(bands, span, opts.coarsest_rel, opts.ladder_factor)
-        budgets = _band_budgets(n_valid, bands, opts.drop_rate)
-        if budgets:
-            log.info("per-band survivor budget (drop_rate %.2f): %s", opts.drop_rate, budgets)
-        origin = (dataset_bbox[0], dataset_bbox[1])
-        # Per-cohort-comparable importance, 0 for unranked points where the
-        # single point per cell makes the value moot.
+    if opts.thin and bands > 1:
+        rx, ry = _representative_points(geoms, dimensions, bounds, valid, jobs=opts.jobs)
         metric = np.nan_to_num(score, nan=0.0)
-        before = {b: int((valid & (band == b)).sum()) for b in range(bands - 1)}
-        band, survivor_counts = _thin_bands(
-            band, dimensions, rx, ry, metric, stable_hash, valid,
-            bands, tolerances, origin, budgets,
-        )
-        for b in range(bands - 1):
-            after = int((valid & (band == b)).sum())
-            log.info("  band %d: %d -> %d features after thinning", b, before[b], after)
+        origin = (dataset_bbox[0], dataset_bbox[1])
+        is_survivor, survivor_counts = _thin_band0(
+            dimensions, rx, ry, metric, stable_hash, valid,
+            span, opts.coarsest_rel, opts.ladder_factor, origin)
+        # Band 0 = even-coverage survivors over ALL valid features. Fraction-band the
+        # non-survivors into bands 1..bands-1 (finest exact), so band 0 covers the whole
+        # extent while deeper bands stay pure fraction. This runs before, not after,
+        # fraction banding, which is what reclaims the coverage win.
+        nonsurv = valid & ~is_survivor
+        band[is_survivor] = 0
+        band[nonsurv] = _band_by_fraction(score[nonsurv], bands - 1, opts.band_fractions) + 1
+        band[~valid] = bands - 1
+        log.info("band 0 thinned for coverage: %d survivors of %d valid features",
+                 int(is_survivor.sum()), int(valid.sum()))
 
     # Merge empty bands. A tiny dataset can leave a coarse band with no features,
     # which would make `levels` start above 0. Renumber the populated bands to a
@@ -1500,7 +1375,13 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
         log.info("dropping pre-existing overview columns before rewrite, %s", drop)
     table = table.drop_columns(drop)
 
-    table = table.take(pa.array(sort_idx))
+    # A geometry-only input drops to zero passthrough columns above. `take` on a
+    # zero-column table resets its row count to 0, and the later append_column
+    # calls then fail on a length mismatch, so skip the reorder when there is
+    # nothing to reorder. drop_columns already preserved the row count and the
+    # first appended column re-establishes the length for the rest.
+    if table.num_columns:
+        table = table.take(pa.array(sort_idx))
     geoms = geoms[sort_idx]
     bounds = bounds[sort_idx]
     band = band[sort_idx]
