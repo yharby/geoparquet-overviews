@@ -510,6 +510,45 @@ def test_band_budgets_floors_at_one():
     assert budgets[0] == 1
 
 
+def test_thin_band0_even_coverage_and_counts():
+    from geoparquet_overviews.convert import _thin_band0
+    # 4 points in one coarsest cell, 1 in another. Band 0 keeps 1 survivor per cell,
+    # selected over ALL valid features (thinning runs before any fraction banding).
+    rx = np.array([0.0, 1.0, 2.0, 3.0, 500.0])
+    ry = np.zeros(5)
+    metric = np.array([0.1, 0.9, 0.2, 0.3, 0.5]) # highest in the crowded cell wins
+    sh = np.arange(5, dtype=np.uint32)
+    valid = np.ones(5, dtype=bool)
+    dims = np.zeros(5, dtype=np.int8)
+    # coarsest cell = span * coarsest_rel = 100.0, so x=0..3 share a cell, x=500 is alone
+    is_survivor, counts = _thin_band0(dims, rx, ry, metric, sh, valid,
+                                      span=1000.0, coarsest_rel=0.1, ladder_factor=2.0,
+                                      origin=(0.0, 0.0))
+    assert is_survivor.sum() == 2              # one survivor per occupied cell
+    assert is_survivor[1] and is_survivor[4]   # crowded-cell winner and the lone point
+    assert not is_survivor[[0, 2, 3]].any()    # crowded-cell losers are not survivors
+    assert counts[1] == 4                      # crowded cell had 4 features
+    assert counts[4] == 1
+
+
+def test_assign_bands_fraction_split_polygons():
+    from geoparquet_overviews.convert import _assign_bands
+    n = 100
+    dims = np.full(n, 2, dtype=np.int8)
+    area = np.arange(n, dtype=float) + 1.0
+    length = np.zeros(n)
+    valid = np.ones(n, dtype=bool)
+    cx = np.linspace(0, 1000, n); cy = np.zeros(n)
+    band, imp, method, score = _assign_bands(
+        dims, area, length, valid, cx, cy, bands=3, fractions=[0.1, 0.2],
+        importance_values=None, importance_column=None, span=1000.0,
+        dataset_bbox=(0, 0, 1000, 1), geographic=False,
+        coarsest_rel=1/1500, ladder_factor=2.0)
+    assert imp == "area_desc" and method == "simplify_snap"
+    assert (band == 0).sum() == 10 and (band == 1).sum() == 20 and (band == 2).sum() == 70
+    assert not np.isnan(score[valid]).any()
+
+
 def test_null_geometry_segregated(tmp_path):
     """C1, null geometries are kept in the finest band with a null bbox and null
     overview, do not crash, and are excluded from the dataset extent."""

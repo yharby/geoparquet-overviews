@@ -98,6 +98,10 @@ _GRID_SUBPIXEL = 4
 # do not fragment into tiny row groups.
 _MIN_COARSE_GROUP_ROWS = 1024
 
+# Default share of features, by count, in each coarse band, largest first. Used
+# only when bands == 3 and no explicit fractions are given.
+_DEFAULT_BAND_FRACTIONS = [0.03, 0.27]
+
 
 @dataclass
 class ConvertOptions:
@@ -487,6 +491,45 @@ def _percentile_desc(metric: np.ndarray) -> np.ndarray:
     return 1.0 - ranks / m
 
 
+def _band_edges(count: int, bands: int, fractions: list[float] | None) -> list[int]:
+    """Cumulative-count band boundaries, largest first. Band 0 takes the first
+    fraction of a descending-importance order, and so on. With no explicit
+    fractions the 3 band case uses the tuned default, and every other band count
+    derives a geometric doubling split, band b takes 2**b of the count so band 0
+    stays the small coarse cohort and each finer band about doubles it. A single
+    bin (bands == 1) puts everything in band 0."""
+    if fractions is None and bands == 3:
+        fractions = _DEFAULT_BAND_FRACTIONS
+    if fractions is None:
+        # Geometric doubling split, band b gets 2**b / (2**bands - 1) of the
+        # count, so band 0 is the smallest cohort and each finer band doubles it.
+        denom = (1 << bands) - 1
+        cum = 0.0
+        edges = []
+        for b in range(bands - 1):
+            cum += (1 << b) / denom
+            edges.append(round(count * cum))
+    else:
+        cum = 0.0
+        edges = []
+        for f in fractions[: bands - 1]:
+            cum += f
+            edges.append(round(count * cum))
+    return [0, *edges, count]
+
+
+def _band_by_fraction(score: np.ndarray, bands: int, fractions: list[float] | None) -> np.ndarray:
+    """Cut a set of features into bands by descending score and the cumulative
+    band fractions. Band 0 is the highest score."""
+    m = len(score)
+    order = np.argsort(-score, kind="stable")
+    band = np.empty(m, dtype=np.int16)
+    edges = _band_edges(m, bands, fractions)
+    for b in range(bands):
+        band[order[edges[b] : edges[b + 1]]] = b
+    return band
+
+
 def _winners_per_cell(cell_id: np.ndarray, metric: np.ndarray, stable_hash: np.ndarray) -> np.ndarray:
     """Local indices of the single kept feature per occupied cell, the one with
     the highest metric, ties broken by stable_hash ascending. A total order on
@@ -505,6 +548,34 @@ def _winners_per_cell(cell_id: np.ndarray, metric: np.ndarray, stable_hash: np.n
     first[0] = True
     first[1:] = sorted_cells[1:] != sorted_cells[:-1]
     return order[first]
+
+
+def _thin_band0(dimensions, rx, ry, metric, stable_hash, valid,
+                span, coarsest_rel, ladder_factor, origin):
+    """Over all valid features, keep one survivor per coarsest-band cell for even
+    whole-extent coverage. Returns a boolean is_survivor mask (survivors form band 0)
+    and each survivor's cell population as overview_count (0 for non-survivors).
+    Points, lines, and polygons never share a cell (the geometry dimension packs
+    into the cell id's top bits). The coarsest cell size is the band-0 tolerance,
+    span * coarsest_rel. This runs before fraction banding, so band 0 covers the
+    whole extent, not only the clustered top fraction; the caller fraction-bands
+    the non-survivors into bands 1..bands-1. Only band 0 is thinned, so the count
+    is band-0-only."""
+    n = len(valid)
+    is_survivor = np.zeros(n, dtype=bool)
+    counts = np.zeros(n, dtype=np.int64)
+    cell = span * coarsest_rel
+    sel = np.where(valid)[0]
+    if len(sel) == 0 or cell <= 0:
+        return is_survivor, counts
+    ix = np.clip(np.floor((rx[sel] - origin[0]) / cell).astype(np.int64), 0, (1 << 30) - 1)
+    iy = np.clip(np.floor((ry[sel] - origin[1]) / cell).astype(np.int64), 0, (1 << 30) - 1)
+    cell_id = (dimensions[sel].astype(np.int64) << 60) | (ix << 30) | iy
+    winners = _winners_per_cell(cell_id, metric[sel], stable_hash[sel])
+    is_survivor[sel[winners]] = True
+    _, inverse, cell_counts = np.unique(cell_id, return_inverse=True, return_counts=True)
+    counts[sel[winners]] = cell_counts[inverse[winners]]
+    return is_survivor, counts
 
 
 def _representative_points_chunk(
@@ -680,31 +751,68 @@ def _thin_bands(
     return band, counts
 
 
+def _thin_points(
+    cx: np.ndarray, cy: np.ndarray, mask: np.ndarray, bands: int, span: float,
+    dataset_bbox: tuple[float, float, float, float],
+    coarsest_rel: float = _COARSEST_REL, ladder_factor: float = _LADDER_FACTOR,
+) -> np.ndarray:
+    """Spatially stratify points into bands by grid representativeness, instead
+    of a fraction of file order. For each coarse band from coarsest to finest,
+    lay that band's snap grid over the extent (the overview tolerance ladder is
+    the cell size) and a point becomes the representative of its cell at the
+    coarsest band where the cell has no representative yet. Remaining points
+    fall to the finest band. Returns a full-length band array, non-masked rows
+    left at the finest band."""
+    n = len(cx)
+    band = np.full(n, bands - 1, dtype=np.int16)
+    idx = np.where(mask)[0]
+    if len(idx) == 0:
+        return band
+    x0, y0 = dataset_bbox[0], dataset_bbox[1]
+    assigned = np.zeros(len(idx), dtype=bool)
+    tolerances = _overview_tolerances(bands, span, coarsest_rel, ladder_factor)
+    for b in sorted(tolerances):  # coarsest (largest cell) first
+        cell = tolerances[b]
+        remaining = np.where(~assigned)[0]  # positions within idx
+        if len(remaining) == 0:
+            break
+        gi = idx[remaining]
+        ix = np.floor((cx[gi] - x0) / cell).astype(np.int64)
+        iy = np.floor((cy[gi] - y0) / cell).astype(np.int64)
+        key = ix * (1 << 32) + iy
+        _, first = np.unique(key, return_index=True)  # first point per occupied cell
+        reps = remaining[first]
+        band[idx[reps]] = b
+        assigned[reps] = True
+    return band
+
+
 def _assign_bands(
     dimensions: np.ndarray, area: np.ndarray, length: np.ndarray, valid: np.ndarray,
-    cx: np.ndarray, cy: np.ndarray, bands: int, importance_values: np.ndarray | None,
-    importance_column: str | None, geographic: bool,
+    cx: np.ndarray, cy: np.ndarray, bands: int, fractions: list[float] | None,
+    importance_values: np.ndarray | None, importance_column: str | None,
+    span: float, dataset_bbox: tuple[float, float, float, float], geographic: bool,
+    coarsest_rel: float = _COARSEST_REL, ladder_factor: float = _LADDER_FACTOR,
 ) -> tuple[np.ndarray, str, str, np.ndarray]:
-    """Rank features into a per-cohort percentile score, the metric density
-    thinning uses to pick each cell's survivor, and start every valid feature in
-    band 0 so the thinning cascade alone places it.
+    """Rank features into importance bands per geometry dimension, largest first.
 
     Dimension 2 (polygons) ranks by area, scaled by cos(latitude) on a
     geographic CRS. Dimension 1 (lines) ranks by length. Dimension 0 (points)
-    ranks by a numeric attribute column when one is named, otherwise it is left
-    unscored so pure spatial thinning (the crc32 hash) decides the survivor.
-    Fraction banding is gone, thinning is the sole banding mechanism, so every
-    valid feature begins in band 0 and the cascade demotes the over-dense ones.
+    ranks by a numeric attribute column when one is named, otherwise by grid
+    thinning. In a mixed layer each dimension cohort is turned into a percentile
+    rank within its cohort and the metric cohorts are then banded on the merged
+    percentile, so a global band fraction still holds and an extent-spanning
+    line can reach band 0 alongside large polygons. Thinned points get their
+    band directly from thinning, which replaces fraction banding for them.
 
-    Returns the band array (all valid at 0), the honest `importance` string, the
+    Returns the band per feature, the honest `importance` string, the
     `overview_method` (`thin` for a pure-point dataset, else `simplify_snap`),
     and the per-feature percentile `score`, NaN where a feature is not metric
-    ranked (a spatially thinned point, or null/empty), which density thinning
-    reuses as its per-cohort-comparable metric.
+    ranked (a thinned point, or null/empty), which the band-0 density thinning
+    reuses as its per-cohort-comparable survivor metric.
     """
     n = len(dimensions)
-    band = np.zeros(n, dtype=np.int16)  # every feature starts in band 0
-    band[~valid] = bands - 1  # null and empty pinned to the finest band
+    band = np.full(n, bands - 1, dtype=np.int16)
     present = {int(d) for d in np.unique(dimensions[valid])}
     is_mixed = len(present) > 1
 
@@ -714,9 +822,8 @@ def _assign_bands(
             importance_column,
         )
 
-    # Metric percentile per cohort, the thinning survivor metric. NaN means the
-    # feature is not metric-ranked (a spatially thinned point, or null/empty),
-    # so the thinning metric falls to 0 and the crc32 hash alone decides.
+    # Metric percentile per cohort, merged and banded by fraction. NaN means the
+    # feature is not metric-ranked (a thinned point, or null/empty).
     score = np.full(n, np.nan, dtype=np.float64)
     thinned = False
 
@@ -734,8 +841,13 @@ def _assign_bands(
         if importance_values is not None:
             score[m0] = _percentile_desc(importance_values[m0].astype(np.float64))
         else:
-            # Left unscored, pure spatial thinning by the crc32 hash.
             thinned = True
+            tb = _thin_points(cx, cy, m0, bands, span, dataset_bbox, coarsest_rel, ladder_factor)
+            band[m0] = tb[m0]
+
+    scored = ~np.isnan(score)
+    if scored.any():
+        band[scored] = _band_by_fraction(score[scored], bands, fractions)
 
     if is_mixed:
         importance = "mixed_quantile_desc"
