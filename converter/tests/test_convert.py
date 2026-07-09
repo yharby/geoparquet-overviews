@@ -119,7 +119,8 @@ def _write_plain(path, n=300, seed=1):
 def test_convert_options_ladder_defaults():
     o = ConvertOptions()
     assert o.coarsest_rel == 1 / 1500
-    assert o.ladder_factor == 2.0
+    assert o.ladder_factor == 4.0
+    assert o.screen_budget_mb == 8.0
     assert o.band_fractions is None
     assert o.thin is True
     assert not hasattr(o, "drop_rate")
@@ -951,8 +952,8 @@ def test_per_band_bbox_padding(tmp_path):
     bands and a populated finest band."""
     src = tmp_path / "packed.parquet"
     dst = tmp_path / "out.parquet"
-    # Tight overlapping clusters so density thinning cascades survivors across two
-    # coarse bands and still fills the finest exact band, giving three populated
+    # Tight overlapping clusters so band-0 thinning plus the fraction split fill
+    # two coarse bands and still fill the finest exact band, giving three populated
     # bands to compare per-band padding across.
     _write_gpq(src, _make_clustered(600, seed=5))
 
@@ -1201,14 +1202,14 @@ def test_mixed_dataset_line_reaches_band0(tmp_path):
 
 def test_single_band_collapse_writes_method_none(tmp_path):
     """Guards the honesty branch that `test_mixed_dataset_line_reaches_band0`
-    used to cover before the per-band survivor budget existed: when
-    `_derive_bands` genuinely returns 1 (the exact geometry already fits the
-    screen budget at the dataset's own coarsest zoom), there is no coarse
-    band, `budgets` is empty, and no thinning demotion runs. `overview_method`
-    must then report the honest `none`, never a false `simplify_snap`. The
-    fixture here is a handful of small boxes spread thinly across a wide
-    extent, few vertices and low local byte density, so it collapses to one
-    band under the DEFAULT drop_rate with no override needed. A polygon
+    also exercises: when `_derive_bands` genuinely returns 1 (the exact
+    geometry already fits the screen budget at the dataset's own coarsest
+    zoom), there is no coarse band, so no fraction split and no band-0
+    thinning run. `overview_method` must then report the honest `none`, never
+    a false `simplify_snap`. The fixture here is a handful of small boxes
+    spread thinly across a wide extent, few vertices and low local byte
+    density, so it collapses to one band under the derived band count with no
+    override needed. A polygon
     fixture is used (not points), since a pure-point file always writes
     `overview_method` `thin`, not `none`. The wide extent (span 100, versus
     the 0..10 extent most fixtures use) is what keeps the local byte density
@@ -1330,10 +1331,12 @@ def test_thinning_demotes_dense_features(tmp_path):
     src = tmp_path / "dense.parquet"
     thin_dst = tmp_path / "thin.parquet"
     nothin_dst = tmp_path / "nothin.parquet"
-    # 40 big overlapping squares clustered so their on-surface points share one
+    # 200 big overlapping squares clustered so their on-surface points share one
     # band-0 cell, plus one far tiny anchor that stretches the extent so the
-    # band-0 cell is comfortably larger than the cluster.
-    geoms = [_square(i * 0.001, 0.0, 5.0) for i in range(40)]
+    # band-0 cell is comfortably larger than the cluster. A large cohort keeps a
+    # clear contrast between the two modes now that the default coarse fraction
+    # is a small slice of the whole set.
+    geoms = [_square(i * 0.0002, 0.0, 5.0) for i in range(200)]
     geoms.append(_square(1000.0, 0.0, 0.001))
     _write_gpq(src, geoms)
 
@@ -1353,6 +1356,8 @@ def test_thinning_demotes_dense_features(tmp_path):
     assert nothin_b0 >= 10
     assert thin_b0 <= 3
     assert thin_b0 < nothin_b0
+    # The two modes must stay clearly distinct, not off by a feature or two.
+    assert nothin_b0 >= thin_b0 * 3
 
 
 def test_thin_band0_survivors_subset_of_valid():
@@ -1486,8 +1491,8 @@ def test_no_feature_lost_under_derived_banding(tmp_path):
 
 def _poly_table(n=40):
     """A clustered polygon table. Features gather into tight clusters so that
-    density thinning, the sole banding mechanism now, demotes the crowd of each
-    cluster to the finest band and keeps one coarse-band survivor. That yields a
+    band-0 density thinning demotes the crowd of each cluster into the fraction
+    banded rest and keeps one coarse-band survivor. That yields a
     populated coarse band (and a `geom_overview` column) under the derived,
     zoom-anchored banding, which a spread of one polygon per band-0 cell would
     not. Eight clusters of `n // 8` boxes, clusters a unit apart, boxes within a

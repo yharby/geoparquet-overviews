@@ -79,11 +79,12 @@ pnpm dev                                            # vite, port 5173+
   projected CRS defs live in the `PROJ_DEFS` registry in `crs.ts`, seeded with
   EPSG:3067. Unknown projected codes show a notice instead of a broken render.
 - Validated end to end on a real 5.65M-row EPSG:3067 buildings dataset. Under
-  the density-thinned layout a whole-country preview reads the band 0 overview
-  column, ~2 MB on disk decoding ~13 MB of area-sized quads, vs ~620 MB exact
-  geometry, ~47x less decoded and ~90x less over the wire (the pre-0.3.0
-  fraction-banded figure was ~9 MB decoded, ~67x, with no density signal and
-  coverage stopping at z10). The viewer renders it correctly over Finland.
+  the light-overviews layout a whole-country preview reads the band 0 overview
+  column, ~4.6 MB on disk decoding ~25 MB of area-sized quads, vs ~620 MB exact
+  geometry decoded (~191 MB on disk). The whole overview column is ~16.7 MB, vs
+  the ~112 MB the earlier all-band density thinning wrote for the same file, and
+  band 0 still fills 2073 of a 4096 cell grid, so the coverage win survives. The
+  viewer renders it correctly over Finland.
 - Converter ranks features per geometry dimension, area for polygons, length
   for lines, an attribute column or grid thinning for points, and writes the
   resulting `overview_method` into the footer. The viewer renders points,
@@ -100,65 +101,69 @@ pnpm dev                                            # vite, port 5173+
   Index as before, Profile B (`--no-bbox`) omits them and relies solely on
   native GeospatialStatistics for row-group pruning, with no page-level
   pruning at all since Parquet has no page-level geospatial statistics.
-- Draft 0.3.0 (branch `feat/v030-band-thinning`, not yet merged). Bands are now
-  formed by deterministic density thinning, not an importance fraction. Every
-  valid feature starts in band 0 and, coarsest band first, the converter keeps
-  one survivor per pixel per geometry dimension (the highest ranked feature
-  winning each cell, ties broken on a crc32 of the feature WKB so it stays
-  idempotent) and demotes the rest to the next finer band. No feature is
-  dropped, the finest band is exact and keeps everyone demoted into it. The old
-  fraction model (`_DEFAULT_BAND_FRACTIONS`, `_band_by_fraction`, `_thin_points`)
-  is deleted. The overview ladder runs in absolute web zoom, but its coarsest
-  band is anchored at the zoom where the dataset extent fills a screen
-  (`_coarsest_zoom`, extent span over `_SCREEN_PX`), not at whole-world zoom, so
-  a city-scale file never spends bands on zooms where its extent is a speck (band
-  b serves `z_coarsest + 2*b`, cell `world/(256*2**zoom)`). The band count is
-  derived from a decoded-bytes-per-screen budget (`--screen-budget-mb`, default
-  1.0), covering `z_coarsest` up to the zoom where exact geometry fits the
-  budget, so count-heavy and vertex-heavy data each get the band count they need
-  with no regime branch, and a sparse dataset that already fits the budget at its
+- Draft 0.3.0, light-overviews layout (branch `feat/v030-band-thinning`, not yet
+  merged). Coarse bands are formed by a light importance fraction, largest first,
+  not by all-the-way-down density thinning. `_band_by_fraction` and `_band_edges`
+  cut a descending-score order so the coarse bands together hold
+  `_COARSE_TOTAL_FRACTION` of the features (default 0.10, band 0 the smallest
+  slice and each finer coarse band about doubling it), and the exact final band
+  keeps the large remainder. Keeping the coarse cohort small is what keeps the
+  overview column light, since every coarse feature carries a quad or segment
+  overview copy (never NULL), so overview bytes track the coarse feature count,
+  not the tolerance. Band 0 alone is then density thinned by `_thin_band0`, one
+  survivor per pixel per geometry dimension over all valid features (highest
+  ranked wins each cell, ties broken on a crc32 of the feature WKB so it stays
+  idempotent), for even whole-extent coverage, and the non-survivors are fraction
+  banded into the finer bands. Each band-0 survivor carries `overview_count`, its
+  cell population, the density signal thinning would otherwise erase, null on
+  every finer band, and because band-0 thinning runs over every valid feature the
+  band-0 counts sum to the full valid total. The overview ladder runs in absolute
+  web zoom, its coarsest band anchored at the zoom where the dataset extent fills
+  a screen (`_coarsest_zoom`, extent span over `_SCREEN_PX`), not at whole-world
+  zoom, so a city-scale file never spends bands on zooms where its extent is a
+  speck. Band 0 resolves at `_COARSEST_REL` (1/1500) of the larger extent span
+  and each finer coarse band divides the tolerance by `_LADDER_FACTOR` (4.0, two
+  web zooms per band, the `_ZOOMS_PER_BAND` step), tunable through `--coarsest-rel`
+  and `--ladder-factor`. The band count is derived from a decoded-bytes-per-screen
+  budget (`--screen-budget-mb`, default 8.0) as a depth cap, `_derive_bands`
+  covers `z_coarsest` up to the zoom where exact geometry read with page pruning
+  already fits the budget, past which no overview band is written and the viewer
+  reads exact geometry, so count-heavy and vertex-heavy data each get the band
+  count they need and a sparse dataset that already fits the budget at its
   coarsest zoom gets a single exact band and no overview. The budget solves
-  against local byte density (`_local_byte_density`, a byte-weighted 0.9
-  quantile over a 128x128 grid of bbox centroids), not the whole-extent
-  average, because clustered data (buildings in cities inside an empty bbox)
-  otherwise derives too few coarse bands and hands dense-city screens the
-  unthinned exact band far too early. No overview band may serve at or past
-  zoom 24 (`_max_coarse_for_zoom` clamps derived and forced counts), the exact
-  band owns z24 up. Each coarse-band survivor carries `overview_count`, its
-  cell population in the pass it won (band 0's counts sum to the full valid
-  total only when no per-band budget binds, see the budget bullet below),
-  the density signal one-per-pixel thinning would otherwise erase,
-  advertised by a top-level `count_column` footer field and written for
-  pure-point files too. A survivor whose shape collapses below its band's
-  pixel writes a small area-sized grid-aligned quad (`_quad_fallback`,
-  Tippecanoe's tiny-polygon-reduction idiom) and a collapsed line writes a
-  short oriented segment (`_segment_fallback`), never NULL, otherwise a
-  buildings dataset blanks its entire whole-country first paint. Each
-  geometry type keeps its kind in the overview, only point features paint as
-  points. Coarse-band coverings pad by half the band tolerance to enclose the
-  quad. A file that collapses to a single band writes `overview_method:
-  "none"`, never a false `simplify_snap`. Each coarse band
-  snaps its overview to its own per-band grid (a quarter of that band's pixel).
-  The giant-triangle bug (a coarse band's overview painting at a fine zoom via
-  the cumulative prefix) is fixed on both sides, the converter's fine
-  extent-anchored overviews plus the viewer reading exact geometry for a
-  coarser band caught in a finer band's prefix (`columnForRowGroup`, gated to
-  0.3.0+ files, pre-0.3.0 files snapped every band to one fine global grid so
-  their coarse overviews stay correct and cheap at mid zooms). The `overviews`
-  key is version `0.3.0`, `levels[]` gained `min_zoom`, `grid`, and
-  `feature_count`, and the block gained a descriptive `regime` label and
-  `count_column`. `--bands 0` derives, a positive value forces it (still zoom
-  clamped). SPEC.md and DESIGN.md are updated. Reconversion and republish of
-  the hosted `v0.3.0/` prefix with the current converter (count column, local
-  density ladder) is pending.
-- v0.3.0's `_thin_bands` also applies a per-band survivor budget
-  (`_band_budgets`, `--drop-rate`, default 2.0), gpq-tiles/tippecanoe style
-  geometric decay toward the coarsest band, with the last coarse band capped
-  too so real overflow reaches the exact band and skips its overview, fixing
-  the disproportionate mid-band weight a pure one-per-pixel ladder produced
-  on count-heavy data (validated against the real Tokyo buildings fixture,
-  see `docs/superpowers/specs/2026-07-09-band-budget-and-bbox-default-design.md`).
-  `--bbox` also stopped being a fixed always-on default, it now follows the
+  against local byte density (`_local_byte_density`, a byte-weighted 0.9 quantile
+  over a 128x128 grid of bbox centroids), not the whole-extent average, because
+  clustered data (buildings in cities inside an empty bbox) otherwise derives too
+  few coarse bands and hands dense-city screens the exact band far too early. No
+  overview band may serve at or past zoom 24 (`_max_coarse_for_zoom` clamps
+  derived and forced counts), the exact band owns z24 up. A survivor whose shape
+  collapses below its band's pixel writes a small area-sized grid-aligned quad
+  (`_quad_fallback`, Tippecanoe's tiny-polygon-reduction idiom) and a collapsed
+  line writes a short oriented segment (`_segment_fallback`), never NULL, so band
+  0 never blanks the whole-country first paint. Each geometry type keeps its kind
+  in the overview, only point features paint as points, and a pure-point dataset
+  writes no overview column (`overview_method: "thin"`), the banding is its level
+  of detail. Coarse-band coverings pad by half the band tolerance to enclose the
+  quad. A file that collapses to a single band writes `overview_method: "none"`,
+  never a false `simplify_snap`. Each coarse band snaps its overview to its own
+  per-band grid (a quarter of that band's pixel). The giant-triangle bug (a coarse
+  band's overview painting at a fine zoom via the cumulative prefix) is fixed on
+  both sides, the converter's fine extent-anchored overviews plus the viewer
+  reading exact geometry for a coarser band caught in a finer band's prefix
+  (`columnForRowGroup`, gated to 0.3.0+ files, pre-0.3.0 files snapped every band
+  to one fine global grid so their coarse overviews stay correct and cheap at mid
+  zooms). The `overviews` key is version `0.3.0`, `levels[]` gained `min_zoom`,
+  `grid`, and `feature_count`, and the block gained a descriptive `regime` label
+  and `count_column`. `--bands 0` derives, a positive value forces it (still zoom
+  clamped). The old all-band `_thin_bands` cascade, the `_band_budgets` per-band
+  survivor budget and its `--drop-rate` flag, and `_DEFAULT_BAND_FRACTIONS` are
+  deleted. A six-archetype bake-off (countries, timezones, states, Finland
+  buildings, roads, points) drove the defaults, Finland's overview column landed
+  at 16.66 MB (1.19x the fraction-only bake-off baseline, vs 112 MB for the old
+  all-band thinning), file 315 MB, band-0 coverage 2073 of 4096. SPEC.md and
+  DESIGN.md are updated. Reconversion and republish of the hosted `v0.3.0/`
+  prefix with the current converter is pending.
+- `--bbox` is not a fixed always-on default, it follows the
   same count/vertex regime signal, on for count-heavy data where page pruning
   earns its keep, off for vertex-heavy data where it was measured at a
   rounding error of file size anyway.

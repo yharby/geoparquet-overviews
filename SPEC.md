@@ -23,12 +23,14 @@ normative. Sections marked non-normative are informative only.
 
 ## Terminology
 
-- **Band.** One level of detail. Bands are formed by density thinning, each
-  coarse band holds at most one feature per screen pixel per geometry dimension,
-  the highest ranked feature winning each cell, so band 0 is the sparsest and
-  carries the features that matter most at low zoom. The last band holds
-  everything else at exact precision. Every feature belongs to exactly one band
-  and is stored exactly once.
+- **Band.** One level of detail. Coarse bands hold a small importance-ranked
+  slice of the features, largest first, so band 0 carries the few features that
+  matter most at low zoom and each finer coarse band about doubles that slice.
+  The last band holds everything else at exact precision. Band 0 alone is
+  additionally density thinned to one survivor per pixel per geometry dimension
+  for even whole-extent coverage, and each survivor records how many features
+  competed for its cell. Every feature belongs to exactly one band and is stored
+  exactly once.
 - **Level.** The metadata description of one band, an entry in the
   `overviews.levels` array. Level ordinals and band ordinals are the same
   numbers.
@@ -40,8 +42,8 @@ normative. Sections marked non-normative are informative only.
   stored in a second geometry column. The exact primary geometry is never
   modified.
 - **gsd.** Ground sample distance, the resolution a band's overview geometry
-  was simplified to, expressed in CRS units per pixel. It is also the side of
-  the band's thinning cell, one pixel at the coarsest zoom the band serves.
+  was simplified to, expressed in CRS units per pixel, one pixel at the coarsest
+  zoom the band serves. On band 0 it is also the side of the thinning cell.
 - **Regime.** A descriptive label for the dataset, count-heavy or vertex-heavy,
   from the average geometry weight per feature. It records which kind of data
   the file holds and never changes how a reader reads it.
@@ -103,8 +105,8 @@ major component of `version` is one they do not support.
 | `levels` | array | REQUIRED | One entry per band, sorted ascending by `level`, coarsest first. MUST contain at least one entry. See the level fields below. |
 | `overview_method` | string | REQUIRED | How the reduced level of detail was produced. See the defined values below. |
 | `overview_column` | string | Conditionally REQUIRED | Name of the overview geometry column, `"geom_overview"` in the reference implementation. MUST be present when the file carries an overview geometry column and MUST be absent when it does not. |
-| `count_column` | string | OPTIONAL | Name of the survivor count column, `"overview_count"` in the reference implementation. Present only when density thinning wrote one. Each coarse-band row's value is the number of source features, itself included, that competed for that survivor's thinning cell in the pass it won, and the value is null in the final band and on rows with null or empty geometry. It is the density signal thinning would otherwise erase, one survivor per cell makes a dense cluster and sparse coverage paint identically, and a reader MAY scale a survivor's symbol by this count so the cluster stays visible. A reader MUST NOT require it. |
-| `importance` | string | OPTIONAL | How features were ranked to decide which one wins each thinning cell. Descriptive only, see the defined values below. |
+| `count_column` | string | OPTIONAL | Name of the survivor count column, `"overview_count"` in the reference implementation. Present only when band-0 thinning wrote one. Each band-0 survivor's value is the number of source features, itself included, that competed for that survivor's thinning cell, and the value is null on every finer band and on rows with null or empty geometry. It is the density signal band-0 thinning would otherwise erase, one survivor per cell makes a dense cluster and sparse coverage paint identically, and a reader MAY scale a survivor's symbol by this count so the cluster stays visible. A reader MUST NOT require it. |
+| `importance` | string | OPTIONAL | How features were ranked to place them into bands, largest first, and to decide which one wins each band-0 thinning cell. Descriptive only, see the defined values below. |
 | `regime` | string | OPTIONAL | A descriptive label for the dataset, `"count"` for many-feature data, `"vertex"` for few-heavy-geometry data, from the average bytes per feature. Descriptive only, a reader MUST NOT need to interpret it. |
 | `spatial_key` | string | OPTIONAL | The space-filling curve used for the within-band sort, `"hilbert"` in the reference implementation. Descriptive only. Readers MUST NOT depend on it. |
 | `covering` | object | OPTIONAL | Points at the bbox covering column, in the same shape as the GeoParquet `covering` object. If present it MUST be identical to the covering declared for the primary geometry column in `geo`. Readers SHOULD take the covering from `geo` and MAY ignore this copy. |
@@ -117,7 +119,7 @@ major component of `version` is one they do not support.
 | `row_group_end` | integer | REQUIRED | Index of the last row group belonging to this band, inclusive. The band's rows together with all coarser bands occupy the row-group prefix from 0 through this index. MUST be strictly increasing across levels. |
 | `min_zoom` | integer | REQUIRED | The lowest web zoom this band is intended to paint, the natural pair to `max_zoom`. It is 0 on level 0 and MUST equal the previous level's `max_zoom` plus 1 on every later level, so the levels tile the zoom range with no gap. Advisory only, see the zoom model below. |
 | `max_zoom` | integer | REQUIRED | The highest web zoom this band is intended to paint. MUST be strictly increasing across levels. Advisory only, see the zoom model below. |
-| `gsd` | number | REQUIRED | Ground sample distance the band's overview geometry was simplified to, in CRS units per pixel, which is also the side of the band's thinning cell. MUST be 0 on the final level and MUST be greater than 0 on every coarse level. `gsd` is the authoritative resolution signal. |
+| `gsd` | number | REQUIRED | Ground sample distance the band's overview geometry was simplified to, in CRS units per pixel, which on band 0 is also the side of the thinning cell. MUST be 0 on the final level and MUST be greater than 0 on every coarse level. `gsd` is the authoritative resolution signal. |
 | `grid` | object or null | OPTIONAL | The coordinate snap grid the band's overview was quantized to, `{ "origin": [x, y], "cell_size": [dx, dy] }` in the file's CRS units, both positional arrays. `origin` is the anchor of the snap lattice, the reference implementation snaps from coordinate zero so it is `[0, 0]`. A coordinate maps to the cell whose corner is `origin + n * cell_size`. A coarse level's grid is a sub-pixel fraction of its own `gsd`, so a coarse band carries only the precision it paints. MUST be null on the final level, which carries no overview. |
 | `feature_count` | integer | OPTIONAL | The number of features in this band. The values across all levels sum to the file's row count, so the footer itself attests that no feature was dropped, only moved to a finer band. It lets a reader price a level before reading it. |
 | `extent` | array or null | OPTIONAL | Four numbers `[xmin, ymin, xmax, ymax]` in the file's CRS units, the padded extent of the band's own features. MUST be null when the band has no valid geometry. When present it MUST enclose every covering value in the band, including the padding described in the covering section below. |
@@ -164,7 +166,7 @@ here. The values defined by this draft, matching the reference converter, are
 | `length_desc` | Features ranked by length, longest first. Used for line datasets. |
 | `attribute:<column>` | Features ranked by the named numeric attribute column, largest first. |
 | `grid_thin` | Point features with no attribute rank, where pure spatial thinning decides each cell's survivor. |
-| `mixed_quantile_desc` | A mixed-dimension dataset where each dimension cohort was ranked within itself and converted to a descending percentile, and that percentile is the thinning metric within each cohort's own cells. |
+| `mixed_quantile_desc` | A mixed-dimension dataset where each dimension cohort was ranked within itself and converted to a descending percentile, and that percentile is both the band-placement rank and the band-0 thinning metric within each cohort's own cells. |
 
 ### `overview_method` values
 
@@ -303,10 +305,10 @@ small grid-aligned quad centred on the feature's representative point, sized
 by the feature's own area and clamped between one snap-grid cell and one band
 pixel, so the survivor stays a polygon and larger features paint larger. This
 is the same idiom as Tippecanoe's tiny-polygon reduction, which replaces
-subpixel polygons with small squares rather than dropping them. Under density
-thinning each survivor stands for its whole cell, so a NULL here would erase
-the cell from the preview, and on a dataset of small features at a coarse
-zoom that blanks the entire first paint. Only when even the quad cannot be
+subpixel polygons with small squares rather than dropping them. On band 0,
+whose thinned survivor stands for its whole cell, a NULL here would erase the
+cell from the preview, and on a dataset of small features at a coarse zoom that
+blanks the entire first paint. Only when even the quad cannot be
 built is the value NULL, never empty WKB, and a reader painting the overview
 column MUST skip NULL values rather than fall back to the exact geometry.
 
@@ -360,8 +362,8 @@ Normative requirements on a conforming reader.
   than k carry overviews snapped for lower zooms, and on a per-band-grid file
   those overviews paint oversized blocks at level k's zooms. A reader SHOULD
   therefore read the primary geometry column for row groups of bands coarser
-  than the selected level. Coarse bands are small under density thinning, so
-  the exact read stays cheap. On a pre-0.3.0 file, which snapped every band to
+  than the selected level. Coarse bands hold only a small importance-ranked
+  slice of the features, so the exact read stays cheap. On a pre-0.3.0 file, which snapped every band to
   one fine global grid, the coarser bands' overviews are correct at finer
   zooms and reading them is the cheaper choice.
 - A reader painting the overview column MUST skip NULL overview values. A
@@ -407,28 +409,33 @@ Normative requirements on a conforming writer, beyond the layout section.
   write `area_desc` for a line dataset.
 - A writer MUST NOT write empty WKB into the overview column. Degenerate
   results are NULL.
-- **Density thinning.** A writer SHOULD form bands by density thinning rather
-  than by a fixed feature share. Every feature starts in the coarsest band, and
-  for each band from coarsest to finest the writer keeps at most one feature per
-  thinning cell per geometry dimension, the highest ranked feature winning the
-  cell, and demotes the rest to the next finer band. No feature is ever dropped,
-  the final band keeps everyone demoted into it. The survivor of a cell MUST be
-  chosen by a total order that does not depend on input row order, so the output
-  is reproducible, the reference implementation breaks ties on a content hash of
-  the feature geometry.
-- **Survivor counts.** A thinning writer SHOULD record each survivor's cell
-  population in the column named by `count_column`, so the density signal
-  thinning removes from the geometry survives in the data. The count is the
-  number of features, the survivor included, that competed for the survivor's
-  cell in the pass it won. Without a binding per-band budget, every valid
-  feature falls into exactly one cell in the coarsest band, so the coarsest
-  band's counts sum to every valid feature in the file. A writer MAY also cap
-  a band's survivor count against a budget, in which case a cell winner
-  demoted for exceeding that budget has its tally cleared at that band and
-  recounted in the finer band it falls into instead. When the coarsest
-  band's own budget binds, its counts sum to less than the valid total
-  instead. A survivor's own count always stays the exact population of the cell
-  it won, whether or not a budget is in effect.
+- **Band formation.** A writer SHOULD form coarse bands by an importance
+  fraction, largest first, so that the coarse bands together hold only a small
+  slice of the features and the exact final band keeps the large remainder.
+  Every coarse feature carries a simplified overview copy, so a small coarse
+  cohort is what keeps the overview column light, and the finer detail is
+  served by the exact band read with page pruning past the ladder's depth cap.
+  The reference implementation gives band 0 the smallest slice and about doubles
+  the slice on each finer coarse band, ten percent of the features across all
+  coarse bands by default, tunable through an explicit fraction ladder. No
+  feature is ever dropped, the final band keeps everyone not placed in a coarse
+  band.
+- **Band-0 coverage thinning.** A writer SHOULD additionally thin band 0 alone
+  to one survivor per pixel per geometry dimension, over all valid features,
+  before the fraction split, so band 0 covers the whole extent evenly rather
+  than clustering in the densest regions the importance rank favors. The
+  survivor of a cell MUST be chosen by a total order that does not depend on
+  input row order, so the output is reproducible, the reference implementation
+  breaks ties on a content hash of the feature geometry. The features not kept
+  in band 0 are fraction banded into the finer bands. Deeper coarse bands are
+  pure fraction and are not thinned.
+- **Survivor counts.** A band-0 thinning writer SHOULD record each band-0
+  survivor's cell population in the column named by `count_column`, so the
+  density signal thinning removes from the geometry survives in the data. The
+  count is the number of features, the survivor included, that competed for the
+  survivor's cell. Because band-0 thinning runs over every valid feature, the
+  band-0 counts sum to every valid feature in the file. The count is written
+  only on band 0 and is null on every finer band.
 - **Derived band count.** A writer SHOULD derive the number of bands from the
   dataset rather than fix it. The reference implementation runs the coarse ladder
   from the zoom where the dataset extent fills a screen up to the zoom where a

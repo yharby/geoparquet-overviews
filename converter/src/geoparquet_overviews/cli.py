@@ -6,7 +6,13 @@ import sys
 
 import click
 
-from .convert import ConvertOptions, convert
+from .convert import (
+    _COARSEST_REL,
+    _LADDER_FACTOR,
+    _SCREEN_BUDGET_MB,
+    ConvertOptions,
+    convert,
+)
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -36,7 +42,7 @@ def main() -> None:
 )
 @click.option(
     "--screen-budget-mb",
-    default=1.0,
+    default=_SCREEN_BUDGET_MB,
     show_default=True,
     type=float,
     help="Decoded geometry a screen should target, in MB. Caps the overview ladder depth, lower asks for more coarse bands. Ignored when --bands is forced.",
@@ -61,17 +67,17 @@ def main() -> None:
 )
 @click.option(
     "--coarsest-rel",
-    default=1 / 1500,
+    default=_COARSEST_REL,
     show_default="1/1500",
     type=float,
     help="Band 0 simplify tolerance as a fraction of the larger extent span.",
 )
 @click.option(
     "--ladder-factor",
-    default=2.0,
+    default=_LADDER_FACTOR,
     show_default=True,
     type=float,
-    help="Each finer coarse band divides the tolerance by this. 2 steps one web zoom per band, raster-overview style.",
+    help="Each finer coarse band divides the tolerance by this. 4 steps two web zooms per band, the raster-overview style _ZOOMS_PER_BAND step.",
 )
 @click.option(
     "--coarse-row-groups",

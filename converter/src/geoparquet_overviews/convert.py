@@ -66,11 +66,11 @@ _MAX_BINARY_BYTES = 2**31 - 1
 # grid-snapped.
 _ZOOMS_PER_BAND = 2          # each coarse band steps 2 web zooms (a 4x resolution step)
 _SCREEN_PX = 1024            # viewport side in pixels for the affordability model
-_SCREEN_BUDGET_MB = 1.0      # target decoded exact geometry per screen in MB, the banding budget
+_SCREEN_BUDGET_MB = 8.0      # target decoded exact geometry per screen in MB, the banding budget
 _MAX_COARSE_BANDS = 9        # cap, stays within the thinning cell-id bit budget
 
 _COARSEST_REL = 1 / 1500   # band 0 tolerance as a fraction of the larger extent span
-_LADDER_FACTOR = 2.0       # each finer coarse band divides the tolerance by this (one web zoom)
+_LADDER_FACTOR = 4.0       # each finer coarse band divides the tolerance by this (2 web zooms, the _ZOOMS_PER_BAND step)
 
 # Local byte density estimation for the band-count budget. Real data clusters,
 # buildings sit in cities inside a mostly empty bounding box, so the naive
@@ -98,9 +98,15 @@ _GRID_SUBPIXEL = 4
 # do not fragment into tiny row groups.
 _MIN_COARSE_GROUP_ROWS = 1024
 
-# Default share of features, by count, in each coarse band, largest first. Used
-# only when bands == 3 and no explicit fractions are given.
-_DEFAULT_BAND_FRACTIONS = [0.03, 0.27]
+# Total share of features, by count, that all coarse bands together hold when no
+# explicit ladder is given. The exact final band keeps the large remainder. A
+# small total is deliberate. Every coarse feature carries a simplified overview
+# copy, and a shape that collapses below its band pixel still writes a small quad
+# or segment (never NULL), so overview bytes track the coarse feature count, not
+# the coarse tolerance. Keeping the coarse cohort a small slice of the largest,
+# lowest-zoom features is what keeps the overview column light, the finer detail
+# is served by the exact band read with page pruning past the ladder's depth cap.
+_COARSE_TOTAL_FRACTION = 0.10
 
 
 @dataclass
@@ -458,21 +464,27 @@ def _percentile_desc(metric: np.ndarray) -> np.ndarray:
 def _band_edges(count: int, bands: int, fractions: list[float] | None) -> list[int]:
     """Cumulative-count band boundaries, largest first. Band 0 takes the first
     fraction of a descending-importance order, and so on. With no explicit
-    fractions the 3 band case uses the tuned default, and every other band count
-    derives a geometric doubling split, band b takes 2**b of the count so band 0
-    stays the small coarse cohort and each finer band about doubles it. A single
-    bin (bands == 1) puts everything in band 0."""
-    if fractions is None and bands == 3:
-        fractions = _DEFAULT_BAND_FRACTIONS
+    fractions every band count derives a geometric doubling split whose coarse
+    bands together hold `_COARSE_TOTAL_FRACTION` of the count, band b taking
+    2**b of that total, so band 0 is the smallest cohort, each finer coarse band
+    about doubles it, and the exact final band keeps the large remainder. Keeping
+    the coarse total a small slice is what keeps the overview column light, since
+    every coarse feature carries an overview copy. A single bin (bands == 1) puts
+    everything in band 0."""
     if fractions is None:
-        # Geometric doubling split, band b gets 2**b / (2**bands - 1) of the
-        # count, so band 0 is the smallest cohort and each finer band doubles it.
-        denom = (1 << bands) - 1
+        # Geometric doubling split normalized to _COARSE_TOTAL_FRACTION. The
+        # bands-1 coarse bins take 2**b / (2**(bands-1) - 1) of that total, so
+        # band 0 is the smallest coarse cohort, each finer coarse band doubles
+        # it, and the exact final band keeps the 1 - _COARSE_TOTAL_FRACTION
+        # remainder.
+        coarse = bands - 1
         cum = 0.0
         edges = []
-        for b in range(bands - 1):
-            cum += (1 << b) / denom
-            edges.append(round(count * cum))
+        if coarse > 0:
+            denom = (1 << coarse) - 1
+            for b in range(coarse):
+                cum += _COARSE_TOTAL_FRACTION * (1 << b) / denom
+                edges.append(round(count * cum))
     else:
         cum = 0.0
         edges = []

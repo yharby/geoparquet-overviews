@@ -56,27 +56,26 @@ in order. Footer JSON builders live in `footer.py`, the CLI in `cli.py`.
    serves at or past `_FINE_MAX_ZOOM`. `_assign_bands` ranks each dimension
    cohort into a percentile `score` via `_percentile_desc`, area for polygons
    with cos latitude scaling, length for lines, `_importance_values` or an
-   unscored spatial fallback for points, and starts every valid feature in
-   band 0. Density thinning (`_thin_bands`) is the sole banding mechanism, it
-   demotes the over-dense features down the ladder and returns each survivor's
-   cell population, which becomes the `overview_count` column (null on the
-   finest band, band 0's counts sum to the full valid total only when no
-   per-band budget binds, see below). Null and empty rows
-   are pinned to the finest band, empty bands are merged and renumbered
-   contiguously, and a file that collapses to a single band writes
-   `overview_method` `"none"`.
-
-   `_thin_bands` also applies an optional per-band survivor budget from
-   `_band_budgets`, `budget(b) = n_valid / drop_rate ** (finest - b + 1)`
-   (`--drop-rate`, default 2.0), a second demotion source on top of cell
-   contention. Unlike gpq-tiles' own formula the last coarse band is capped
-   too, so real overflow reaches the exact band and skips its overview
-   entirely, the only way the cap actually shrinks the file rather than
-   reshuffling bytes between coarse bands. A budget-demoted cell winner's
-   tally is cleared at the band it lost and recounted in the finer band it
-   falls into, so when the budget binds band 0, its survivor counts can sum
-   to less than the file's valid total. Each survivor's own count stays the
-   exact population of the cell it won.
+   unscored spatial fallback for points. Coarse banding is a light importance
+   fraction, `_band_by_fraction` and `_band_edges` cut a descending-score order
+   into bands whose coarse cohort together holds `_COARSE_TOTAL_FRACTION` of the
+   features (default 0.10, band 0 the smallest slice and each finer coarse band
+   about doubling it), and the exact final band keeps the large remainder.
+   `--band-fractions` overrides the derived ladder. Keeping the coarse cohort
+   small is what keeps the overview column light, since every coarse feature
+   carries a quad or segment overview copy (never NULL), so overview bytes track
+   the coarse feature count, and the depth cap in `_derive_bands` hands finer
+   zooms to the exact band read with page pruning. `_thin_band0` then runs on
+   band 0 alone, over all valid features, keeping one survivor per coarsest-band
+   cell per geometry dimension for even whole-extent coverage, and fraction bands
+   the non-survivors into bands 1..bands-1. Each band-0 survivor's cell population
+   becomes the `overview_count` column, null on every finer band, and because the
+   thinning runs over every valid feature the band-0 counts sum to the full valid
+   total. Null and empty rows are pinned to the finest band, empty bands are
+   merged and renumbered contiguously, and a file that collapses to a single band
+   writes `overview_method` `"none"`. The old all-band `_thin_bands` cascade, the
+   `_band_budgets`/`--drop-rate` per-band survivor budget, and `_DEFAULT_BAND_FRACTIONS`
+   are gone.
 6. Hilbert sort. `_hilbert_distance` on quantized bbox centroids, then
    `np.lexsort((hilbert, band))`, band major, Hilbert minor.
 7. Overview build. `_build_overview` calls `_overview_band` per coarse band,
