@@ -1957,6 +1957,37 @@ def test_subpixel_survivor_falls_back_to_quad(tmp_path):
     assert n_quads > 0
 
 
+def test_footer_count_column_band0_only(tmp_path):
+    """Band-0 thinning still runs `_thin_band0`, not the old per-band cascade,
+    so the `count_column` and `has_counts` gate in `convert()` must key off
+    `opts.thin and bands > 1`, not off which thinning function ran. A row of
+    same-size boxes spread wide enough to land in more than one band should
+    still get an `overview_count` column and a `feature_count` on every
+    level."""
+    xs = np.linspace(0, 1000, 400)
+    polys = shapely.box(xs, 0, xs + 1, 1)
+    t = pa.table(
+        {"geometry": pa.array(shapely.to_wkb(polys), type=pa.binary())},
+        metadata={
+            b"geo": json.dumps({
+                "version": "1.1.0",
+                "primary_column": "geometry",
+                "columns": {
+                    "geometry": {"encoding": "WKB", "geometry_types": ["Polygon"]},
+                },
+            }).encode(),
+        },
+    )
+    src = tmp_path / "in.parquet"
+    pq.write_table(t, src)
+    dst = tmp_path / "out.parquet"
+    convert(str(src), str(dst), ConvertOptions(compression_level=3))
+    o = json.loads(pq.ParquetFile(dst).metadata.metadata[b"overviews"])
+    if len(o["levels"]) > 1:
+        assert o.get("count_column") == "overview_count"
+        assert all("feature_count" in lvl for lvl in o["levels"])
+
+
 def test_cli_band_fractions_parse(tmp_path):
     from click.testing import CliRunner
 
