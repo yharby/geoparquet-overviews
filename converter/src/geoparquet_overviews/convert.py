@@ -69,6 +69,9 @@ _SCREEN_PX = 1024            # viewport side in pixels for the affordability mod
 _SCREEN_BUDGET_MB = 1.0      # target decoded exact geometry per screen in MB, the banding budget
 _MAX_COARSE_BANDS = 9        # cap, stays within the thinning cell-id bit budget
 
+_COARSEST_REL = 1 / 1500   # band 0 tolerance as a fraction of the larger extent span
+_LADDER_FACTOR = 2.0       # each finer coarse band divides the tolerance by this (one web zoom)
+
 # Local byte density estimation for the band-count budget. Real data clusters,
 # buildings sit in cities inside a mostly empty bounding box, so the naive
 # average (total bytes over the whole extent area) understates the density a
@@ -136,17 +139,19 @@ class ConvertOptions:
     # 1 forces single-threaded. Only the overview build is threaded, read and
     # write already thread inside pyarrow.
     jobs: int = 0
-    # Density thin the coarse bands so each holds at most one feature per
-    # one-pixel cell per geometry dimension. On by default, `--no-thin` is a
-    # debug and before/after escape only, not a supported profile.
+    # Density thin band 0 only, so it holds at most one feature per one-pixel
+    # cell per geometry dimension. On by default, `--no-thin` is a debug and
+    # before/after escape only, not a supported profile.
     thin: bool = True
-    # Geometric per-band survivor ceiling, gpq-tiles/tippecanoe style.
-    # budget(b) decays toward the coarsest band, and the last coarse band is
-    # capped too, so genuine overflow reaches the exact band and skips its
-    # overview instead of just reshuffling bytes between coarse bands. Must
-    # be greater than 1.0, a value at or below it would defeat the cap. See
-    # `_band_budgets`.
-    drop_rate: float = 2.0
+    # Band 0's tolerance as a fraction of the larger extent span.
+    coarsest_rel: float = _COARSEST_REL
+    # Each finer coarse band divides the tolerance by this factor, one web
+    # zoom per band.
+    ladder_factor: float = _LADDER_FACTOR
+    # Explicit fraction ladder overriding the derived one, one entry per
+    # coarse band. None derives the ladder from `coarsest_rel` and
+    # `ladder_factor` instead.
+    band_fractions: list[float] | None = None
 
 
 def _find_geometry_column(schema: pa.Schema) -> str:

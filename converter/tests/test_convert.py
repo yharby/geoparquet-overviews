@@ -118,6 +118,15 @@ def _write_plain(path, n=300, seed=1):
     _write_gpq(path, _make_polygons(n, seed))
 
 
+def test_convert_options_ladder_defaults():
+    o = ConvertOptions()
+    assert o.coarsest_rel == 1 / 1500
+    assert o.ladder_factor == 2.0
+    assert o.band_fractions is None
+    assert o.thin is True
+    assert not hasattr(o, "drop_rate")
+
+
 def test_convert_writes_overviews_footer(tmp_path):
     src = tmp_path / "plain.parquet"
     dst = tmp_path / "overviews.parquet"
