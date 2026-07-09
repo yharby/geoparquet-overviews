@@ -155,8 +155,8 @@ class ConvertOptions:
     thin: bool = True
     # Band 0's tolerance as a fraction of the larger extent span.
     coarsest_rel: float = _COARSEST_REL
-    # Each finer coarse band divides the tolerance by this factor, one web
-    # zoom per band.
+    # Each finer coarse band divides the tolerance by this factor, two web
+    # zooms per band.
     ladder_factor: float = _LADDER_FACTOR
     # Explicit fraction ladder overriding the derived one, one entry per
     # coarse band. None derives the ladder from `coarsest_rel` and

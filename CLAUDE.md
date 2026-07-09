@@ -107,8 +107,12 @@ pnpm dev                                            # vite, port 5173+
   cut a descending-score order so the coarse bands together hold
   `_COARSE_TOTAL_FRACTION` of the features (default 0.10, band 0 the smallest
   slice and each finer coarse band about doubling it), and the exact final band
-  keeps the large remainder. Keeping the coarse cohort small is what keeps the
-  overview column light, since every coarse feature carries a quad or segment
+  keeps the large remainder. That smallest-slice-then-doubling description is
+  the fraction sub-mechanism applied to the non-survivors, under the default
+  thinning path below, band 0 itself is replaced by the even-coverage thinning
+  survivors over all valid features, so band 0 can end up larger than band 1.
+  Keeping the coarse cohort small is what keeps the overview column light,
+  since every coarse feature carries a quad or segment
   overview copy (never NULL), so overview bytes track the coarse feature count,
   not the tolerance. Band 0 alone is then density thinned by `_thin_band0`, one
   survivor per pixel per geometry dimension over all valid features (highest

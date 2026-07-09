@@ -45,8 +45,13 @@ plain WKB that every reader already decodes.
    importance-ranked slice of the features, largest first. Band 0 gets the
    smallest slice and each finer coarse band about doubles it, ten percent of
    the features across all coarse bands by default, and the exact final band
-   keeps the large remainder. Every coarse feature carries an overview copy, so
-   keeping the coarse cohort small is what keeps the overview column light, and
+   keeps the large remainder. That smallest-slice-then-doubling split is how
+   the non-survivors of the band-0 thinning pass below are fraction-banded into
+   the finer coarse bands, under the default thinning path band 0 itself is
+   replaced by the even-coverage thinning survivors over all valid features, so
+   band 0 can end up larger than band 1, not smaller. Every coarse feature
+   carries an overview copy, so keeping the coarse cohort small is what keeps
+   the overview column light, and
    the depth cap stops the ladder where a screen of exact geometry read with
    page pruning is already affordable. Band 0 alone is then density thinned to
    one survivor per pixel per geometry dimension over all valid features, so its

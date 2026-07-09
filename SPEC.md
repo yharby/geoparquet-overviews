@@ -417,9 +417,12 @@ Normative requirements on a conforming writer, beyond the layout section.
   served by the exact band read with page pruning past the ladder's depth cap.
   The reference implementation gives band 0 the smallest slice and about doubles
   the slice on each finer coarse band, ten percent of the features across all
-  coarse bands by default, tunable through an explicit fraction ladder. No
-  feature is ever dropped, the final band keeps everyone not placed in a coarse
-  band.
+  coarse bands by default, tunable through an explicit fraction ladder. That
+  smallest-slice-then-doubling shape describes how the band-0 non-survivors are
+  fraction-banded into the finer coarse bands below, under the default
+  thinning path band 0 itself is replaced by the even-coverage thinning
+  survivors, so band 0 can be larger than band 1. No feature is ever dropped,
+  the final band keeps everyone not placed in a coarse band.
 - **Band-0 coverage thinning.** A writer SHOULD additionally thin band 0 alone
   to one survivor per pixel per geometry dimension, over all valid features,
   before the fraction split, so band 0 covers the whole extent evenly rather

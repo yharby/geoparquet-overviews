@@ -1053,7 +1053,8 @@ def test_point_dataset_thinned_stratified(tmp_path):
     pts = shapely.from_wkb(out.column("geometry").to_pylist())
     band0 = band == 0
     # One representative per coarse cell, so band 0 has exactly the 10 locations,
-    # not round(100 * 0.03) = 3 leading rows.
+    # the count comes from band-0 thinning over the whole extent, not a fraction
+    # of the 100 input rows.
     assert int(band0.sum()) == 10
     band0_locs = {(round(p.x, 6), round(p.y, 6)) for p in pts[band0]}
     assert band0_locs == {(round(lx, 6), round(ly, 6)) for lx, ly in locations}
@@ -1965,32 +1966,19 @@ def test_subpixel_survivor_falls_back_to_quad(tmp_path):
 def test_footer_count_column_band0_only(tmp_path):
     """Band-0 thinning still runs `_thin_band0`, not the old per-band cascade,
     so the `count_column` and `has_counts` gate in `convert()` must key off
-    `opts.thin and bands > 1`, not off which thinning function ran. A row of
-    same-size boxes spread wide enough to land in more than one band should
-    still get an `overview_count` column and a `feature_count` on every
-    level."""
-    xs = np.linspace(0, 1000, 400)
-    polys = shapely.box(xs, 0, xs + 1, 1)
-    t = pa.table(
-        {"geometry": pa.array(shapely.to_wkb(polys), type=pa.binary())},
-        metadata={
-            b"geo": json.dumps({
-                "version": "1.1.0",
-                "primary_column": "geometry",
-                "columns": {
-                    "geometry": {"encoding": "WKB", "geometry_types": ["Polygon"]},
-                },
-            }).encode(),
-        },
-    )
+    `opts.thin and bands > 1`, not off which thinning function ran. A forced
+    multi-band conversion, clustered features so the coarse bands actually
+    populate, must get an `overview_count` column and a `feature_count` on
+    every level."""
     src = tmp_path / "in.parquet"
-    pq.write_table(t, src)
     dst = tmp_path / "out.parquet"
-    convert(str(src), str(dst), ConvertOptions(compression_level=3))
+    _write_clustered(src, n=400)
+    convert(str(src), str(dst), ConvertOptions(bands=3, row_group_mb=0.02))
     o = json.loads(pq.ParquetFile(dst).metadata.metadata[b"overviews"])
-    if len(o["levels"]) > 1:
-        assert o.get("count_column") == "overview_count"
-        assert all("feature_count" in lvl for lvl in o["levels"])
+    # Multiple bands are the point of this test, not an incidental collapse.
+    assert len(o["levels"]) > 1
+    assert o.get("count_column") == "overview_count"
+    assert all("feature_count" in lvl for lvl in o["levels"])
 
 
 def test_cli_band_fractions_parse(tmp_path):
