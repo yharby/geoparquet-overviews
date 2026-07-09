@@ -96,6 +96,34 @@ describe('detectLayout', () => {
     expect(exact.columnForIndex(0)).toBe('geometry');
   });
 
+  it('reads exact geometry past a depth-capped ladder whose deepest overview level maxZoom is z9', () => {
+    // The light-overviews depth cap can end the ladder well short of z24, so the
+    // exact (last) level's own maxZoom may be far below a requested zoom too.
+    // levelForZoom's fallback must still resolve to that last level on nothing
+    // more than "no earlier level's maxZoom covers this zoom", never a
+    // hard-coded assumption that overviews (or the exact band) reach z24.
+    const meta = baseMeta({
+      rowGroups: [
+        { ...rg(0, 0, 1), band: 0 },
+        { ...rg(1, 1, 2), band: 1 },
+      ],
+      overviewsInfo: {
+        version: '0.3.0', mode: 'banded', spatialKey: 'hilbert', overviewColumn: 'geom_overview',
+        overviewMethod: 'simplify_snap', importance: 'area_desc', countColumn: null,
+        levels: [
+          { level: 0, rowGroupEnd: 0, rowGroupStart: 0, maxZoom: 9, gsd: 0.05, minZoom: 0, featureCount: null, bytes: null, extent: null, extentBbox: null },
+          { level: 1, rowGroupEnd: 1, rowGroupStart: 0, maxZoom: 10, gsd: 0, minZoom: 10, featureCount: null, bytes: null, extent: null, extentBbox: null },
+        ],
+      },
+    });
+    const s = detectLayout(meta);
+    const plan = s.planRead(AOI, 12); // past both levels' own maxZoom
+    expect(plan.column).toBe('geometry'); // resolves to the last (exact) level
+    expect(plan.band).toBe(1);
+    expect(plan.columnForIndex(0)).toBe('geometry'); // coarser band in the prefix, exact too
+    expect(plan.columnForIndex(1)).toBe('geometry');
+  });
+
   it('falls back to flat-wkb and prunes by bbox when a covering is present', () => {
     // A covering is what makes bbox pruning possible, so a flat file that has
     // one is prunable and only the intersecting groups are read.
