@@ -1,5 +1,6 @@
 import { PathLayer, ScatterplotLayer, SolidPolygonLayer } from '@deck.gl/layers';
 import type { Layer } from '@deck.gl/core';
+import type { Bbox } from '../geo/aoi';
 import type {
   FlatGeometries,
   FlatHoledPolygons,
@@ -208,6 +209,63 @@ export function buildHoledPolygonLayer(
       },
       _pathType: 'loop',
       getColor: lineColor,
+      widthUnits: 'pixels',
+      getWidth: 1,
+      widthMinPixels: 1,
+      pickable: false,
+    }),
+  ];
+}
+
+// The low-zoom bbox preview for a flat file with no overview column: one 1px
+// rectangle outline per pruned row group, drawn from the footer covering bboxes
+// with no geometry fetched. Positions are interleaved lon/lat (already
+// reprojected). Each rectangle is emitted as five vertices with the first point
+// repeated to close the ring explicitly, rather than relying on the PathLayer's
+// `loop` mode, which does not add the closing segment for binary startIndices
+// data (the left edge would otherwise be missing). Shares the polygon outline
+// color so the preview reads as the same dataset.
+// Vertices per box ring: four corners plus the first repeated to close it.
+const BBOX_RING_VERTS = 5;
+
+// Pack the boxes into interleaved-xy ring positions and their per-box
+// startIndices, each ring closed by repeating its first corner. Pure and
+// exported so the closed-ring invariant is unit-testable without a GPU.
+export function bboxRings(boxes: Bbox[]): { positions: Float64Array; startIndices: Uint32Array } {
+  const positions = new Float64Array(boxes.length * BBOX_RING_VERTS * 2);
+  const startIndices = new Uint32Array(boxes.length + 1);
+  let p = 0;
+  for (let i = 0; i < boxes.length; i++) {
+    const b = boxes[i];
+    startIndices[i] = i * BBOX_RING_VERTS;
+    // bottom-left, bottom-right, top-right, top-left, back to bottom-left.
+    positions[p++] = b.xmin;
+    positions[p++] = b.ymin;
+    positions[p++] = b.xmax;
+    positions[p++] = b.ymin;
+    positions[p++] = b.xmax;
+    positions[p++] = b.ymax;
+    positions[p++] = b.xmin;
+    positions[p++] = b.ymax;
+    positions[p++] = b.xmin;
+    positions[p++] = b.ymin;
+  }
+  startIndices[boxes.length] = boxes.length * BBOX_RING_VERTS;
+  return { positions, startIndices };
+}
+
+export function buildBboxLayer(id: string, boxes: Bbox[]): Layer[] {
+  if (boxes.length === 0) return [];
+  const { positions, startIndices } = bboxRings(boxes);
+  return [
+    new PathLayer({
+      id,
+      data: {
+        length: boxes.length,
+        startIndices,
+        attributes: { getPath: { value: positions, size: 2 } },
+      },
+      getColor: POLYGON_LINE,
       widthUnits: 'pixels',
       getWidth: 1,
       widthMinPixels: 1,

@@ -7,8 +7,32 @@ import { SolidPolygonLayer } from '@deck.gl/layers';
 // code review used to empirically confirm the bug, rather than re-implementing
 // or mocking its behavior.
 import { getSurfaceIndices } from '../../node_modules/@deck.gl/layers/dist/solid-polygon-layer/polygon.js';
-import { buildHoledPolygonLayer } from './polygon-layer';
+import { buildHoledPolygonLayer, bboxRings } from './polygon-layer';
 import type { FlatHoledPolygons } from '../geo/geojson';
+
+describe('bboxRings (low-zoom bbox preview)', () => {
+  it('emits a closed 5-vertex ring per box so every edge, including the left one, draws', () => {
+    const { positions, startIndices } = bboxRings([
+      { xmin: 0, ymin: 0, xmax: 2, ymax: 1 },
+      { xmin: 10, ymin: 20, xmax: 12, ymax: 25 },
+    ]);
+    // Two boxes, five vertices each, two components per vertex.
+    expect(positions).toHaveLength(2 * 5 * 2);
+    expect(Array.from(startIndices)).toEqual([0, 5, 10]);
+    // First ring: bottom-left, bottom-right, top-right, top-left, and back to
+    // bottom-left. The repeated first corner is what closes the left edge that a
+    // PathLayer 'loop' fails to add for binary startIndices data.
+    expect(Array.from(positions.slice(0, 10))).toEqual([0, 0, 2, 0, 2, 1, 0, 1, 0, 0]);
+    expect(positions[0]).toBe(positions[8]); // ring closes: last == first x
+    expect(positions[1]).toBe(positions[9]); //             last == first y
+  });
+
+  it('returns empty arrays for no boxes', () => {
+    const { positions, startIndices } = bboxRings([]);
+    expect(positions).toHaveLength(0);
+    expect(Array.from(startIndices)).toEqual([0]);
+  });
+});
 
 // Square with a square hole, interleaved xy: exterior 4 verts then hole 4 verts.
 // holeIndices is in ELEMENT units (vertex 4 * 2 components = element 8).
