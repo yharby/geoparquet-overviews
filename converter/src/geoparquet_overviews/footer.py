@@ -96,16 +96,22 @@ def overviews_meta(
     has_overview: bool,
     importance: str = "area_desc",
     overview_method: str = "simplify_snap",
-    version: str = "0.2.0",
+    regime: str = "count",
+    version: str = "0.3.0",
     covering: bool = True,
+    count_column: str | None = None,
 ) -> str:
-    """The additive `overviews` footer block, draft 0.2.0.
+    """The additive `overviews` footer block, draft 0.3.0.
 
     `levels` is computed from the real row group layout, never hand authored.
     Each level maps a band to the index of its last row group, the coarsest
     web zoom it should paint, and its ground sample distance in CRS units per
     pixel. A client reads `levels` to know which row group prefix and which
-    geometry column to fetch for a given zoom.
+    geometry column to fetch for a given zoom. Each level additionally carries
+    `min_zoom`, the coarsest web zoom the band starts serving and the pair to
+    `max_zoom`, `grid`, the band's per-band snap grid as a positional `origin`
+    and `cell_size` (null on the finest exact band, which has no overview), and
+    `feature_count`, the number of features in the band.
 
     `importance` records how features were actually ranked into bands,
     `area_desc` for polygons, `length_desc` for lines, `attribute:<column>` for
@@ -113,9 +119,20 @@ def overviews_meta(
     `mixed_quantile_desc` for a mixed-dimension layer merged by quantile. It is
     descriptive, a reader never needs to interpret it to read the file.
 
+    `regime` is a descriptive label, count-heavy versus vertex-heavy, derived
+    from the average exact bytes per feature. Like `importance` it is descriptive
+    only, a reader never has to interpret it to read the file.
+
     `overview_method` states how `geom_overview` was derived, `simplify_snap`
     when an overview column is written, `thin` for a pure-point dataset where
-    the banding itself is the level of detail and no overview column exists.
+    the banding itself is the level of detail and no overview column exists,
+    and `none` for a single-band file where nothing was reduced at all.
+
+    `count_column` names the per-survivor density count column when thinning
+    wrote one, each coarse-band survivor's value is how many features competed
+    for its one-pixel cell, itself included, so a viewer can scale the
+    survivor's symbol and keep a dense cluster distinguishable from sparse
+    coverage. Absent when thinning was off or the file is a single band.
 
     `covering` is False for Profile B (`--no-bbox`), which omits the physical
     bbox struct column, so there is no covering to point at and native
@@ -125,6 +142,7 @@ def overviews_meta(
         "version": version,
         "spatial_key": spatial_key,
         "importance": importance,
+        "regime": regime,
     }
     if covering:
         block["covering"] = COVERING
@@ -133,5 +151,7 @@ def overviews_meta(
             block["overview_column"] = "geom_overview"
         # Present even for the pure-point `thin` case, where overview_column is absent.
         block["overview_method"] = overview_method
+        if count_column is not None:
+            block["count_column"] = count_column
         block["levels"] = levels
     return json.dumps(block)

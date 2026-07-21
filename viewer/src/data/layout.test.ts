@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { detectLayout } from './layout';
+import { detectLayout, PREVIEW_MAX_ZOOM } from './layout';
 import type { GeoParquetMetadata, RowGroupInfo } from './metadata';
 
 const rg = (index: number, xmin: number, xmax: number): RowGroupInfo => ({
@@ -96,6 +96,34 @@ describe('detectLayout', () => {
     expect(exact.columnForIndex(0)).toBe('geometry');
   });
 
+  it('reads exact geometry past a depth-capped ladder whose deepest overview level maxZoom is z9', () => {
+    // The light-overviews depth cap can end the ladder well short of z24, so the
+    // exact (last) level's own maxZoom may be far below a requested zoom too.
+    // levelForZoom's fallback must still resolve to that last level on nothing
+    // more than "no earlier level's maxZoom covers this zoom", never a
+    // hard-coded assumption that overviews (or the exact band) reach z24.
+    const meta = baseMeta({
+      rowGroups: [
+        { ...rg(0, 0, 1), band: 0 },
+        { ...rg(1, 1, 2), band: 1 },
+      ],
+      overviewsInfo: {
+        version: '0.3.0', mode: 'banded', spatialKey: 'hilbert', overviewColumn: 'geom_overview',
+        overviewMethod: 'simplify_snap', importance: 'area_desc', countColumn: null,
+        levels: [
+          { level: 0, rowGroupEnd: 0, rowGroupStart: 0, maxZoom: 9, gsd: 0.05, minZoom: 0, featureCount: null, bytes: null, extent: null, extentBbox: null },
+          { level: 1, rowGroupEnd: 1, rowGroupStart: 0, maxZoom: 10, gsd: 0, minZoom: 10, featureCount: null, bytes: null, extent: null, extentBbox: null },
+        ],
+      },
+    });
+    const s = detectLayout(meta);
+    const plan = s.planRead(AOI, 12); // past both levels' own maxZoom
+    expect(plan.column).toBe('geometry'); // resolves to the last (exact) level
+    expect(plan.band).toBe(1);
+    expect(plan.columnForIndex(0)).toBe('geometry'); // coarser band in the prefix, exact too
+    expect(plan.columnForIndex(1)).toBe('geometry');
+  });
+
   it('falls back to flat-wkb and prunes by bbox when a covering is present', () => {
     // A covering is what makes bbox pruning possible, so a flat file that has
     // one is prunable and only the intersecting groups are read.
@@ -109,6 +137,31 @@ describe('detectLayout', () => {
     expect(plan.indices).toEqual([0, 1]); // bbox prune only
   });
 
+  it('reads the file primary geometry column, not a hardcoded "geometry" (web-optimized gpio files)', () => {
+    // gpio's --optimize-for web keeps the source geometry column name, which is
+    // often `geom` (DuckDB/GDAL default), not `geometry`. The flat path must read
+    // whatever geo.primary_column names, else hyparquet finds no column and the
+    // map stays empty.
+    const cover = { xmin: ['bbox', 'xmin'], ymin: ['bbox', 'ymin'], xmax: ['bbox', 'xmax'], ymax: ['bbox', 'ymax'] };
+    const s = detectLayout(
+      baseMeta({
+        coveringPaths: cover,
+        geo: { primary_column: 'geom', columns: { geom: {} } },
+      }),
+    );
+    expect(s.kind).toBe('flat-wkb');
+    const plan = s.planRead(AOI, 10);
+    expect(plan.column).toBe('geom');
+    expect(plan.columnForIndex(0)).toBe('geom');
+  });
+
+  it('defaults the flat geometry column to "geometry" when geo is absent', () => {
+    const s = detectLayout(baseMeta({ coveringPaths: null }));
+    const plan = s.planRead(AOI, 10);
+    expect(plan.column).toBe('geometry');
+    expect(plan.columnForIndex(0)).toBe('geometry');
+  });
+
   it('prunes by the native-stats bbox even without a covering column (Profile B, V5)', () => {
     // Profile B files have no covering, but readGeoParquetMetadata falls back to
     // the geometry chunk's native GeospatialStatistics, so rowGroups still carry
@@ -118,6 +171,35 @@ describe('detectLayout', () => {
     expect(s.prunable).toBe(true);
     const plan = s.planRead({ xmin: 0.5, ymin: 0, xmax: 1.5, ymax: 1 }, 10);
     expect(plan.indices).toEqual([0, 1]); // bbox prune still applies
+  });
+
+  it('previews the pruned row-group bboxes at low zoom instead of fetching geometry', () => {
+    // A flat file has no cheap coarse geometry, so below PREVIEW_MAX_ZOOM the
+    // plan carries the pruned groups' footer bboxes as rectangles and reads no
+    // geometry. rg(0..2) span x 0..3, so an AOI over 0.5..1.5 keeps groups 0,1.
+    const s = detectLayout(baseMeta({}));
+    const plan = s.planRead({ xmin: 0.5, ymin: 0, xmax: 1.5, ymax: 1 }, PREVIEW_MAX_ZOOM - 1);
+    expect(plan.previewBoxes).toBeDefined();
+    expect(plan.previewBoxes).toHaveLength(2); // one box per pruned row group
+    expect(plan.previewBoxes![0]).toEqual({ xmin: 0, ymin: 0, xmax: 1, ymax: 1 });
+    expect(plan.lodKey).toBe('flat:preview');
+  });
+
+  it('reads geometry, not the bbox preview, once past PREVIEW_MAX_ZOOM', () => {
+    const s = detectLayout(baseMeta({}));
+    const plan = s.planRead(AOI, PREVIEW_MAX_ZOOM);
+    expect(plan.previewBoxes).toBeUndefined();
+    expect(plan.lodKey).toBe('flat:geom');
+    expect(plan.column).toBe('geometry');
+  });
+
+  it('skips the preview at low zoom when no row group has a bbox to draw', () => {
+    // No boxes means nothing to preview, so fall through to a geometry read even
+    // below the preview zoom rather than paint an empty preview.
+    const s = detectLayout(baseMeta({ coveringPaths: null, rowGroups: [rgNoBbox(0), rgNoBbox(1)] }));
+    const plan = s.planRead(AOI, PREVIEW_MAX_ZOOM - 1);
+    expect(plan.previewBoxes).toBeUndefined();
+    expect(plan.lodKey).toBe('flat:geom');
   });
 
   it('reads every row group when no row group has any bbox at all', () => {

@@ -35,13 +35,13 @@ import {
   isFilePrefetched,
 } from '../data/file-cache';
 import { readGroupCounts, buildCountLookup, type CountForRow, type GroupCounts } from '../data/counts';
-import { detectLayout, type LayoutStrategy } from '../data/layout';
+import { detectLayout, PREVIEW_MAX_ZOOM, type LayoutStrategy } from '../data/layout';
 import { viewFetchKey } from './fetch-key';
 import { uncachedPageRange } from './read-partition';
 import { planSignature } from '../data/plan-signature';
 import { initialUrl, initialView, type CameraView } from '../data/presets';
 import { MapView } from '../map/map-view';
-import { buildLayers } from '../map/polygon-layer';
+import { buildLayers, buildBboxLayer } from '../map/polygon-layer';
 import { vertexCount, mergeFlatGeometries, type FlatGeometries } from '../geo/geojson';
 import type { LayoutHeatmap } from '../viz/layout-heatmap';
 import type { VizWaterfall } from '../viz/waterfall';
@@ -138,6 +138,10 @@ export class AppRoot extends LitElement {
   // resolves to the same signature leaves the layers untouched.
   private renderedPlanSig: string | null = null;
   private renderedUrl: string | null = null;
+  // True when the screen currently shows the low-zoom bbox preview rather than
+  // real geometry, so the next geometry fetch knows to clear the boxes the
+  // moment it starts loading instead of leaving them under the incoming render.
+  private renderedPreview = false;
   // Merged flat buckets keyed by plan signature, so a recurring large view skips
   // the re-decode and re-merge (the real cost) and resolves picks against the
   // same buckets its layers were built from. We cache the geometry, not the
@@ -566,6 +570,7 @@ export class AppRoot extends LitElement {
     this.lastFetchKey = null;
     this.renderedPlanSig = null;
     this.renderedUrl = null;
+    this.renderedPreview = false;
     this.mergedGeomCache.clear();
     this.summary = null;
     this.fileFacts = null;
@@ -771,15 +776,66 @@ export class AppRoot extends LitElement {
     }
 
     const pruneNote = prunable ? '' : ' This file has no covering bbox, so pruning is unavailable.';
+
+    // Low-zoom preview (flat file, no overview column): draw the pruned row
+    // groups' footer covering bboxes as rectangles and fetch nothing. Stands in
+    // for coarse geometry until the zoom passes PREVIEW_MAX_ZOOM, when the real
+    // WKB read below takes over. No page refinement, no range reads, no picking.
+    if (plan.previewBoxes) {
+      const previewSig = `preview|${indices.join(',')}`;
+      if (url === this.renderedUrl && previewSig === this.renderedPlanSig) {
+        // The same boxes are already on screen, an in-place pan within the
+        // preview, so leave them and only refresh the viewport readouts.
+        this.fetchedIndices = new Set(indices);
+        this.pendingWorking = new Set();
+        this.flushVizNow(token);
+        this.loading = false;
+        return;
+      }
+      this.resetViz();
+      this.mapView.clearLayers();
+      this.pickFlats.clear();
+      this.mapView.closeFeaturePopup();
+      this.mapView.setLayers(buildBboxLayer('bbox-preview', plan.previewBoxes));
+      this.fetchedIndices = new Set(indices);
+      this.pendingWorking = new Set();
+      this.flushVizNow(token);
+      this.renderedPlanSig = previewSig;
+      this.renderedUrl = url;
+      this.renderedPreview = true;
+      this.loading = false;
+      this.status = `${plan.previewBoxes.length} row-group bounding boxes, no geometry fetched. Zoom past z${PREVIEW_MAX_ZOOM} to load geometry.${pruneNote}`;
+      if (token === this.fetchToken) setActiveUrl(null);
+      return;
+    }
+
+    // Real geometry from here. If the preview boxes are still on screen, clear
+    // them the moment loading starts rather than leaving them under the
+    // incoming render.
+    if (this.renderedPreview) {
+      this.resetViz();
+      this.mapView.clearLayers();
+      this.pickFlats.clear();
+      this.mapView.closeFeaturePopup();
+      this.renderedPlanSig = null;
+      this.renderedPreview = false;
+      this.flushVizNow(token);
+    }
+
     // A cumulative-prefix read at a coarse band paints the target band's overview
     // plus the coarser bands' exact geometry, so the read can span both columns.
     const readColumns = new Set(indices.map((i) => plan.columnForIndex(i)));
     const readingLabel =
-      readColumns.size > 1
-        ? `overview (${column}) + exact geometry`
-        : column === 'geometry'
-          ? 'exact geometry'
-          : `overview (${column})`;
+      // The flat path (no pyramid) always reads the full-precision geometry, so
+      // call it exact rather than mislabelling a non-'geometry' column name
+      // (e.g. `geom`) as an overview.
+      plan.band === null
+        ? 'exact geometry'
+        : readColumns.size > 1
+          ? `overview (${column}) + exact geometry`
+          : column === 'geometry'
+            ? 'exact geometry'
+            : `overview (${column})`;
     this.status = `Fetching ${indices.length} of ${metadata.rowGroups.length} row groups, ${readingLabel}…${pruneNote}`;
 
     // Map each selected row group to its absolute row range, so hyparquet reads

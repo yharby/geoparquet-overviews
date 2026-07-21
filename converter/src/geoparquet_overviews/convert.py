@@ -25,6 +25,7 @@ import math
 import os
 import re
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -51,31 +52,75 @@ _FINE_MAX_ZOOM = 24
 # read and when building it on write. See `_decode_wkb` and `_geom_array`.
 _MAX_BINARY_BYTES = 2**31 - 1
 
-# Overview resolution ladder, expressed as a fraction of the dataset's larger
-# extent span. Unit-agnostic, identical in degrees or metres. Band 0 is the
-# coarse whole-extent preview and always resolves at `_COARSEST_REL` of the span,
-# and every finer coarse band divides the tolerance by `_LADDER_FACTOR`. One
-# extent-relative geometric ladder for every band count, so `--bands 2` keeps the
-# same strong band 0 preview as `--bands 3` instead of a far weaker one.
-_COARSEST_REL = 1 / 1500
-_LADDER_FACTOR = 4.0
-_GRID_REL = 1 / 60000
+# Overview resolution ladder, anchored in absolute web zoom rather than a
+# fraction of the extent. Each coarse band steps `_ZOOMS_PER_BAND` web zooms, a
+# 4x resolution step, and band 0 is a genuine zoomed-out pixel of the whole
+# extent, which is what makes a coarse band actually cheap. The band count itself
+# is derived from the dataset's decode cost per screen, a screen should target at
+# most `_SCREEN_BUDGET_MB` of exact geometry across a `_SCREEN_PX` square
+# viewport, and the coarse ladder covers z0 up to the zoom where exact geometry
+# becomes affordable. Two caps bound the ladder, `_MAX_COARSE_BANDS` keeps the
+# thinning cell ids inside their bit budget, and no coarse band may serve past
+# `_FINE_MAX_ZOOM - 1`, the exact band owns `_FINE_MAX_ZOOM` and beyond, so an
+# overview is never written at a zoom where it would just be exact geometry
+# grid-snapped.
+_ZOOMS_PER_BAND = 2          # each coarse band steps 2 web zooms (a 4x resolution step)
+_SCREEN_PX = 1024            # viewport side in pixels for the affordability model
+_SCREEN_BUDGET_MB = 8.0      # target decoded exact geometry per screen in MB, the banding budget
+_MAX_COARSE_BANDS = 9        # cap, stays within the thinning cell-id bit budget
 
-# Default share of features, by count, in each coarse band. Largest first.
-_DEFAULT_BAND_FRACTIONS = [0.03, 0.27]
+_COARSEST_REL = 1 / 1500   # band 0 tolerance as a fraction of the larger extent span
+_LADDER_FACTOR = 4.0       # each finer coarse band divides the tolerance by this (2 web zooms, the _ZOOMS_PER_BAND step)
+
+# Local byte density estimation for the band-count budget. Real data clusters,
+# buildings sit in cities inside a mostly empty bounding box, so the naive
+# average (total bytes over the whole extent area) understates the density a
+# user actually zooms into and hands the ladder too few coarse bands. Instead
+# the extent is cut into a `_DENSITY_CELLS` square grid, each valid feature's
+# bytes land in its bbox-centroid cell, and the budget solves against the
+# byte-weighted `_DENSITY_QUANTILE` of the occupied cells' densities, the
+# density the typical dense screen sees, not the empty-countryside average.
+_DENSITY_CELLS = 128
+_DENSITY_QUANTILE = 0.9
+
+# Regime label threshold, average exact WKB bytes per valid feature. A building
+# WKB is a few hundred bytes, a detailed coastline or admin polygon is many
+# thousands, so this splits the count-heavy regime from the vertex-heavy one.
+# Descriptive only, the byte-density band derivation already serves both.
+_VERTEX_REGIME_BYTES = 2000
+
+# Each coarse band snaps its overview to a quarter of its own pixel, a sub-pixel
+# fraction so the snap is invisible at the zoom the band serves, while the band
+# stops carrying the finer coordinate precision it never paints.
+_GRID_SUBPIXEL = 4
 
 # A coarse band needs at least this many features per group, so small datasets
 # do not fragment into tiny row groups.
 _MIN_COARSE_GROUP_ROWS = 1024
 
+# Total share of features, by count, that all coarse bands together hold when no
+# explicit ladder is given. The exact final band keeps the large remainder. A
+# small total is deliberate. Every coarse feature carries a simplified overview
+# copy, and a shape that collapses below its band pixel still writes a small quad
+# or segment (never NULL), so overview bytes track the coarse feature count, not
+# the coarse tolerance. Keeping the coarse cohort a small slice of the largest,
+# lowest-zoom features is what keeps the overview column light, the finer detail
+# is served by the exact band read with page pruning past the ladder's depth cap.
+_COARSE_TOTAL_FRACTION = 0.10
+
 
 @dataclass
 class ConvertOptions:
-    bands: int = 3
+    # 0 derives the band count from byte density, a positive value forces it.
+    bands: int = 0
     row_group_mb: float = 16.0
-    # None means derive the overview snap grid from the dataset extent.
+    # None derives a per-band overview snap grid from each band's own tolerance.
+    # A set value forces that single grid on every band, overriding the per-band
+    # derivation.
     overview_grid: float | None = None
-    band_fractions: list[float] | None = None
+    # Decoded exact geometry a screen should target, in MB, the banding budget the
+    # derived band count is solved against. Lower asks for more coarse bands.
+    screen_budget_mb: float = _SCREEN_BUDGET_MB
     # Target number of row groups per coarse band.
     coarse_row_groups: int = 32
     # zstd compression level for the written file. Higher is smaller and slower.
@@ -89,17 +134,34 @@ class ConvertOptions:
     # the Parquet native GEOMETRY logical type with automatic per-row-group
     # geospatial statistics. The `geo` key is still written, dual 1.1 plus 2.0.
     native_geo: bool = True
-    # Profile choice. True writes the physical bbox covering struct plus page
-    # index pruning surface (Profile A, default). False omits it (Profile B,
-    # lean 2.0), readers prune row groups from native geospatial statistics
-    # only and page-level pruning is unavailable.
-    bbox: bool = True
+    # Profile choice. True forces the physical bbox covering struct plus page
+    # index pruning surface (Profile A). False forces it off (Profile B, lean
+    # 2.0), readers prune row groups from native geospatial statistics only
+    # and page-level pruning is unavailable. None (default) is adaptive: on
+    # for a count-heavy regime, where many features per row group make page
+    # pruning worth its cost, off for a vertex-heavy regime, where row-group
+    # native statistics already capture what a covering column would add. See
+    # `_detect_regime` and the resolution in `convert()`.
+    bbox: bool | None = None
     # Worker threads for the overview build, the converter's slowest stage.
     # shapely's simplify, make_valid, and set_precision release the GIL, so
     # threads parallelize them nearly linearly. 0 means auto (one per core),
     # 1 forces single-threaded. Only the overview build is threaded, read and
     # write already thread inside pyarrow.
     jobs: int = 0
+    # Density thin band 0 only, so it holds at most one feature per one-pixel
+    # cell per geometry dimension. On by default, `--no-thin` is a debug and
+    # before/after escape only, not a supported profile.
+    thin: bool = True
+    # Band 0's tolerance as a fraction of the larger extent span.
+    coarsest_rel: float = _COARSEST_REL
+    # Each finer coarse band divides the tolerance by this factor, two web
+    # zooms per band.
+    ladder_factor: float = _LADDER_FACTOR
+    # Explicit fraction ladder overriding the derived one, one entry per
+    # coarse band. None derives the ladder from `coarsest_rel` and
+    # `ladder_factor` instead.
+    band_fractions: list[float] | None = None
 
 
 def _find_geometry_column(schema: pa.Schema) -> str:
@@ -255,6 +317,23 @@ def _zoom_for_gsd(gsd: float, world: float) -> int:
     return max(0, round(math.log2(world / (256 * gsd))))
 
 
+def _coarsest_zoom(span_x: float, span_y: float, world: float) -> int:
+    """The web zoom at which the dataset's own extent first fills a `_SCREEN_PX`
+    viewport, the zoom the coarsest band is anchored to. Below this zoom the whole
+    extent is a speck on the map and every feature sits far below one pixel, so a
+    coarse band placed there snaps every feature to nothing (a null overview) and
+    just wastes row groups. Anchoring the coarsest band here instead of at world
+    zoom keeps every emitted band at a zoom where its features are actually
+    paintable. A world-spanning dataset resolves to the same low zoom the fixed
+    ladder used (`_ZOOMS_PER_BAND`), so it is unchanged; a city-extent dataset
+    starts its ladder where the city fills the screen, not where the planet
+    does."""
+    span = max(span_x, span_y, 1e-30)
+    # Never finer than the fixed ladder's old anchor, so a world dataset keeps its
+    # z2 start and stays byte-identical, and the ladder never starts below zero.
+    return max(_ZOOMS_PER_BAND, _zoom_for_gsd(span / _SCREEN_PX, world))
+
+
 def _hilbert_distance(x: np.ndarray, y: np.ndarray, order: int = 16) -> np.ndarray:
     """Hilbert curve distance for integer grid coordinates in [0, 2**order).
     Vectorized over all features. Keeps spatial neighbors adjacent in the sort
@@ -279,14 +358,133 @@ def _hilbert_distance(x: np.ndarray, y: np.ndarray, order: int = 16) -> np.ndarr
     return d
 
 
+def _local_byte_density(
+    cx: np.ndarray, cy: np.ndarray, geom_bytes: np.ndarray, valid: np.ndarray,
+    dataset_bbox: tuple[float, float, float, float], span_x: float, span_y: float,
+) -> float:
+    """Byte density where the bytes actually are, in bytes per CRS area unit.
+    The extent is cut into a `_DENSITY_CELLS` square grid, each valid feature's
+    exact WKB bytes are deposited into its bbox-centroid cell, and the returned
+    density is the byte-weighted `_DENSITY_QUANTILE` over the occupied cells,
+    the density the typical dense screen decodes. The naive whole-extent average
+    spreads a few dense cities over an empty bounding box and understates the
+    density a user actually zooms into, so the ladder would hand off to the
+    unthinned exact band zooms too early and a dense-city screen would decode
+    far past the budget. Uniform data reproduces the plain average. A pure
+    function of the valid centroids and byte lengths over the fixed extent grid,
+    so re-conversion derives the same value and stays idempotent."""
+    ix = np.clip(
+        ((cx[valid] - dataset_bbox[0]) / span_x * _DENSITY_CELLS).astype(np.int64),
+        0, _DENSITY_CELLS - 1,
+    )
+    iy = np.clip(
+        ((cy[valid] - dataset_bbox[1]) / span_y * _DENSITY_CELLS).astype(np.int64),
+        0, _DENSITY_CELLS - 1,
+    )
+    cell_bytes = np.bincount(
+        ix * _DENSITY_CELLS + iy, weights=geom_bytes[valid].astype(np.float64),
+        minlength=_DENSITY_CELLS * _DENSITY_CELLS,
+    )
+    occupied = cell_bytes[cell_bytes > 0]
+    if len(occupied) == 0:
+        return 0.0
+    cell_area = max((span_x / _DENSITY_CELLS) * (span_y / _DENSITY_CELLS), 1e-30)
+    density = occupied / cell_area
+    # Byte-weighted quantile, the density at which the given share of all bytes
+    # lives at or below. Sorting by density and walking the cumulative byte mass
+    # is exact and deterministic.
+    order = np.argsort(density, kind="stable")
+    cum = np.cumsum(occupied[order])
+    k = int(np.searchsorted(cum, _DENSITY_QUANTILE * cum[-1]))
+    return float(density[order][min(k, len(order) - 1)])
+
+
+def _max_coarse_for_zoom(z_coarsest: int) -> int:
+    """The most coarse bands the ladder can hold before a band would serve past
+    `_FINE_MAX_ZOOM - 1`. Band b serves up to z_coarsest + _ZOOMS_PER_BAND * b,
+    and the exact band owns `_FINE_MAX_ZOOM` and beyond, so an overview band at
+    or past `_FINE_MAX_ZOOM` would just be exact geometry grid-snapped."""
+    return max(0, (_FINE_MAX_ZOOM - 1 - z_coarsest) // _ZOOMS_PER_BAND + 1)
+
+
+def _derive_bands(byte_density, span, coarsest_rel, ladder_factor, screen_budget_bytes):
+    """Total band count, coarse plus one exact, capped where exact geometry read
+    with page pruning already meets the per-screen byte budget. `gsd_fine` is the
+    ground sample distance at which a _SCREEN_PX square of exact geometry costs
+    screen_budget_bytes. Coarse bands are the ladder_factor halvings from the
+    coarsest tolerance (span * coarsest_rel) down to gsd_fine, so sparse light data
+    gets a single exact band and dense heavy data gets more, none past the cap."""
+    if byte_density <= 0:
+        return 1
+    gsd_fine = math.sqrt(screen_budget_bytes / byte_density) / _SCREEN_PX
+    coarsest_tol = span * coarsest_rel
+    if coarsest_tol <= gsd_fine or ladder_factor <= 1:
+        return 1
+    steps = math.floor(math.log(coarsest_tol / gsd_fine, ladder_factor)) + 1
+    coarse = min(_MAX_COARSE_BANDS, max(0, steps))
+    return coarse + 1
+
+
+def _detect_regime(total_exact_bytes: int, n_valid: int) -> str:
+    """A human-readable regime label for the footer and logs, count-heavy versus
+    vertex-heavy, from the average exact bytes per valid feature. Descriptive
+    only, the band derivation already adapts to both through byte density, so this
+    never branches the pipeline."""
+    if n_valid <= 0:
+        return "empty"
+    avg = total_exact_bytes / n_valid
+    return "vertex" if avg >= _VERTEX_REGIME_BYTES else "count"
+
+
+def _percentile_desc(metric: np.ndarray) -> np.ndarray:
+    """Descending percentile rank of a cohort, 1.0 for the most important
+    feature and toward 1/m for the least. The single-feature cohort scores 1.0.
+    Ties rank by value, not by input order, features with an equal metric share
+    a percentile (the run's smallest rank), so equal-metric features in the same
+    thinning cell fall to the caller's stable_hash tie-break and the survivor
+    never depends on input order, chunking, or thread count."""
+    m = len(metric)
+    if m == 0:
+        return np.empty(0, dtype=np.float64)
+    order = np.argsort(-metric, kind="stable")  # most important first
+    sorted_desc = metric[order]
+    # Min-rank each run of equal metrics: a run start takes its own index, every
+    # tie in the run carries that start index forward (indices increase, so a
+    # running maximum propagates it). Purely a function of the metric values.
+    idx = np.arange(m, dtype=np.float64)
+    run_start = np.empty(m, dtype=bool)
+    run_start[0] = True
+    run_start[1:] = sorted_desc[1:] != sorted_desc[:-1]
+    minrank_sorted = np.maximum.accumulate(np.where(run_start, idx, 0.0))
+    ranks = np.empty(m, dtype=np.float64)
+    ranks[order] = minrank_sorted
+    return 1.0 - ranks / m
+
+
 def _band_edges(count: int, bands: int, fractions: list[float] | None) -> list[int]:
     """Cumulative-count band boundaries, largest first. Band 0 takes the first
-    fraction of a descending-importance order, and so on."""
+    fraction of a descending-importance order, and so on. With no explicit
+    fractions every band count derives a geometric doubling split whose coarse
+    bands together hold `_COARSE_TOTAL_FRACTION` of the count, band b taking
+    2**b of that total, so band 0 is the smallest cohort, each finer coarse band
+    about doubles it, and the exact final band keeps the large remainder. Keeping
+    the coarse total a small slice is what keeps the overview column light, since
+    every coarse feature carries an overview copy. A single bin (bands == 1) puts
+    everything in band 0."""
     if fractions is None:
-        fractions = _DEFAULT_BAND_FRACTIONS if bands == 3 else None
-    if fractions is None:
-        # Equal count split when no explicit fractions and not the 3 band default.
-        edges = [round(count * (i + 1) / bands) for i in range(bands - 1)]
+        # Geometric doubling split normalized to _COARSE_TOTAL_FRACTION. The
+        # bands-1 coarse bins take 2**b / (2**(bands-1) - 1) of that total, so
+        # band 0 is the smallest coarse cohort, each finer coarse band doubles
+        # it, and the exact final band keeps the 1 - _COARSE_TOTAL_FRACTION
+        # remainder.
+        coarse = bands - 1
+        cum = 0.0
+        edges = []
+        if coarse > 0:
+            denom = (1 << coarse) - 1
+            for b in range(coarse):
+                cum += _COARSE_TOTAL_FRACTION * (1 << b) / denom
+                edges.append(round(count * cum))
     else:
         cum = 0.0
         edges = []
@@ -294,20 +492,6 @@ def _band_edges(count: int, bands: int, fractions: list[float] | None) -> list[i
             cum += f
             edges.append(round(count * cum))
     return [0, *edges, count]
-
-
-def _percentile_desc(metric: np.ndarray) -> np.ndarray:
-    """Descending percentile rank of a cohort, 1.0 for the most important
-    feature and 1/m for the least. The single-feature cohort scores 1.0, so an
-    extent-spanning line can reach band 0 alongside the largest polygons when
-    cohorts are merged by percentile."""
-    m = len(metric)
-    if m == 0:
-        return np.empty(0, dtype=np.float64)
-    order = np.argsort(-metric, kind="stable")  # most important first
-    ranks = np.empty(m, dtype=np.float64)
-    ranks[order] = np.arange(m, dtype=np.float64)
-    return 1.0 - ranks / m
 
 
 def _band_by_fraction(score: np.ndarray, bands: int, fractions: list[float] | None) -> np.ndarray:
@@ -322,9 +506,153 @@ def _band_by_fraction(score: np.ndarray, bands: int, fractions: list[float] | No
     return band
 
 
+def _winners_per_cell(cell_id: np.ndarray, metric: np.ndarray, stable_hash: np.ndarray) -> np.ndarray:
+    """Local indices of the single kept feature per occupied cell, the one with
+    the highest metric, ties broken by stable_hash ascending. A total order on
+    (cell_id, metric descending, stable_hash ascending), so for distinct
+    geometries the survivor never depends on input order, pyarrow chunking, or
+    thread count. Byte-identical duplicate geometries share the hash too and the
+    stable lexsort falls back to input order between them, the surviving row's
+    geometry is the same either way, only its attributes follow input order."""
+    if len(cell_id) == 0:
+        return np.empty(0, dtype=np.int64)
+    # stable_hash is uint32 and stays positive, only metric is negated so that
+    # the highest metric sorts first within a cell.
+    order = np.lexsort((stable_hash, -metric, cell_id))
+    sorted_cells = cell_id[order]
+    first = np.empty(len(order), dtype=bool)
+    first[0] = True
+    first[1:] = sorted_cells[1:] != sorted_cells[:-1]
+    return order[first]
+
+
+def _thin_band0(dimensions, rx, ry, metric, stable_hash, valid,
+                span, coarsest_rel, ladder_factor, origin):
+    """Over all valid features, keep one survivor per coarsest-band cell for even
+    whole-extent coverage. Returns a boolean is_survivor mask (survivors form band 0)
+    and each survivor's cell population as overview_count (0 for non-survivors).
+    Points, lines, and polygons never share a cell (the geometry dimension packs
+    into the cell id's top bits). The coarsest cell size is the band-0 tolerance,
+    span * coarsest_rel. This runs before fraction banding, so band 0 covers the
+    whole extent, not only the clustered top fraction; the caller fraction-bands
+    the non-survivors into bands 1..bands-1. Only band 0 is thinned, so the count
+    is band-0-only."""
+    n = len(valid)
+    is_survivor = np.zeros(n, dtype=bool)
+    counts = np.zeros(n, dtype=np.int64)
+    cell = span * coarsest_rel
+    sel = np.where(valid)[0]
+    if len(sel) == 0 or cell <= 0:
+        return is_survivor, counts
+    ix = np.clip(np.floor((rx[sel] - origin[0]) / cell).astype(np.int64), 0, (1 << 30) - 1)
+    iy = np.clip(np.floor((ry[sel] - origin[1]) / cell).astype(np.int64), 0, (1 << 30) - 1)
+    cell_id = (dimensions[sel].astype(np.int64) << 60) | (ix << 30) | iy
+    winners = _winners_per_cell(cell_id, metric[sel], stable_hash[sel])
+    is_survivor[sel[winners]] = True
+    _, inverse, cell_counts = np.unique(cell_id, return_inverse=True, return_counts=True)
+    counts[sel[winners]] = cell_counts[inverse[winners]]
+    return is_survivor, counts
+
+
+def _representative_points_chunk(
+    geoms: np.ndarray, dimensions: np.ndarray, bounds: np.ndarray, mask: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """A representative point per feature for grid thinning. Default is the bbox
+    centroid. Within `mask`, lines use their length midpoint and polygons and
+    collections use an on-surface point (a plain centroid can fall outside a
+    concave polygon and misplace it). Any feature whose precise point is missing
+    or non finite falls back to the bbox centroid. `mask` names the features that
+    get the precise GEOS point, in practice every valid feature now that every
+    valid feature is thinned. A pure per-feature transform, so splitting the
+    input across threads and concatenating in order is identical to one call."""
+    rx = (bounds[:, 0] + bounds[:, 2]) / 2
+    ry = (bounds[:, 1] + bounds[:, 3]) / 2
+
+    ln = mask & (dimensions == 1)
+    if ln.any():
+        px, py = _precise_xy(
+            lambda g: shapely.line_interpolate_point(g, 0.5, normalized=True), geoms[ln]
+        )
+        ok = np.isfinite(px) & np.isfinite(py)
+        idx = np.where(ln)[0][ok]
+        rx[idx], ry[idx] = px[ok], py[ok]
+
+    poly = mask & (dimensions >= 2)
+    if poly.any():
+        px, py = _precise_xy(shapely.point_on_surface, geoms[poly])
+        ok = np.isfinite(px) & np.isfinite(py)
+        idx = np.where(poly)[0][ok]
+        rx[idx], ry[idx] = px[ok], py[ok]
+
+    return rx, ry
+
+
+def _precise_xy(op, geoms: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """x, y of a representative point per geometry via `op`, NaN where it is
+    missing, so the caller falls back to the bbox centroid there. `point_on_surface`
+    and `line_interpolate_point` can return an EMPTY point on a degenerate feature,
+    and `get_x`/`get_y` raise a GEOSException on an empty point, so only the
+    non-empty results are read. When the vectorized call throws, fall back per
+    feature, never per chunk. A per-chunk fallback would degrade a different set
+    of features depending on how the caller split the table, so the output would
+    depend on `--jobs`, breaking the byte-identical invariant. Per feature, only
+    the one bad geometry degrades to its bbox centroid, the same shape of
+    robustness `_snap_safe` keeps on the overview path. TypeError is caught
+    alongside GEOSException, shapely raises it for a geometry type `op` cannot
+    take, and one such feature must not abort the conversion either."""
+    n = len(geoms)
+    px = np.full(n, np.nan, dtype=np.float64)
+    py = np.full(n, np.nan, dtype=np.float64)
+    try:
+        pts = op(geoms)
+        good = ~(shapely.is_empty(pts) | shapely.is_missing(pts))
+        if good.any():
+            px[good] = shapely.get_x(pts[good])
+            py[good] = shapely.get_y(pts[good])
+    except (shapely.errors.GEOSException, TypeError):
+        for i, g in enumerate(geoms):
+            try:
+                pt = op(np.asarray([g], dtype=object))[0]
+                if pt is not None and not shapely.is_empty(pt):
+                    px[i] = shapely.get_x(pt)
+                    py[i] = shapely.get_y(pt)
+            except (shapely.errors.GEOSException, TypeError):
+                pass  # this feature keeps its NaN and falls back to the centroid
+    return px, py
+
+
+def _representative_points(
+    geoms: np.ndarray, dimensions: np.ndarray, bounds: np.ndarray, mask: np.ndarray,
+    jobs: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """`_representative_points_chunk` for the whole table, fanned out across
+    threads when it helps. Now that every valid feature is thinned, the GEOS
+    `point_on_surface` and `line_interpolate_point` work runs on the whole table,
+    and both release the GIL, so threads parallelize them nearly linearly. The
+    transform is pure per-feature, so splitting the arrays, processing each chunk,
+    and concatenating in order is byte-identical to a single call."""
+    workers = jobs if jobs > 0 else (os.cpu_count() or 1)
+    n = len(geoms)
+    if workers <= 1 or n <= 1:
+        return _representative_points_chunk(geoms, dimensions, bounds, mask)
+    nchunks = min(n, workers * 4)
+    geom_parts = np.array_split(geoms, nchunks)
+    dim_parts = np.array_split(dimensions, nchunks)
+    bound_parts = np.array_split(bounds, nchunks)
+    mask_parts = np.array_split(mask, nchunks)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        parts = list(ex.map(
+            _representative_points_chunk, geom_parts, dim_parts, bound_parts, mask_parts,
+        ))
+    rx = np.concatenate([p[0] for p in parts])
+    ry = np.concatenate([p[1] for p in parts])
+    return rx, ry
+
+
 def _thin_points(
     cx: np.ndarray, cy: np.ndarray, mask: np.ndarray, bands: int, span: float,
     dataset_bbox: tuple[float, float, float, float],
+    coarsest_rel: float = _COARSEST_REL, ladder_factor: float = _LADDER_FACTOR,
 ) -> np.ndarray:
     """Spatially stratify points into bands by grid representativeness, instead
     of a fraction of file order. For each coarse band from coarsest to finest,
@@ -340,7 +668,7 @@ def _thin_points(
         return band
     x0, y0 = dataset_bbox[0], dataset_bbox[1]
     assigned = np.zeros(len(idx), dtype=bool)
-    tolerances = _overview_tolerances(bands, span)
+    tolerances = _overview_tolerances(bands, span, coarsest_rel, ladder_factor)
     for b in sorted(tolerances):  # coarsest (largest cell) first
         cell = tolerances[b]
         remaining = np.where(~assigned)[0]  # positions within idx
@@ -362,7 +690,8 @@ def _assign_bands(
     cx: np.ndarray, cy: np.ndarray, bands: int, fractions: list[float] | None,
     importance_values: np.ndarray | None, importance_column: str | None,
     span: float, dataset_bbox: tuple[float, float, float, float], geographic: bool,
-) -> tuple[np.ndarray, str, str]:
+    coarsest_rel: float = _COARSEST_REL, ladder_factor: float = _LADDER_FACTOR,
+) -> tuple[np.ndarray, str, str, np.ndarray]:
     """Rank features into importance bands per geometry dimension, largest first.
 
     Dimension 2 (polygons) ranks by area, scaled by cos(latitude) on a
@@ -374,8 +703,11 @@ def _assign_bands(
     line can reach band 0 alongside large polygons. Thinned points get their
     band directly from thinning, which replaces fraction banding for them.
 
-    Returns the band per feature, the honest `importance` string, and the
-    `overview_method` (`thin` for a pure-point dataset, else `simplify_snap`).
+    Returns the band per feature, the honest `importance` string, the
+    `overview_method` (`thin` for a pure-point dataset, else `simplify_snap`),
+    and the per-feature percentile `score`, NaN where a feature is not metric
+    ranked (a thinned point, or null/empty), which the band-0 density thinning
+    reuses as its per-cohort-comparable survivor metric.
     """
     n = len(dimensions)
     band = np.full(n, bands - 1, dtype=np.int16)
@@ -408,7 +740,7 @@ def _assign_bands(
             score[m0] = _percentile_desc(importance_values[m0].astype(np.float64))
         else:
             thinned = True
-            tb = _thin_points(cx, cy, m0, bands, span, dataset_bbox)
+            tb = _thin_points(cx, cy, m0, bands, span, dataset_bbox, coarsest_rel, ladder_factor)
             band[m0] = tb[m0]
 
     scored = ~np.isnan(score)
@@ -429,15 +761,37 @@ def _assign_bands(
     # A dataset that is entirely points carries no overview column, its banding
     # is the level of detail. Everything else derives a simplified overview.
     overview_method = "thin" if present == {0} else "simplify_snap"
-    return band, importance, overview_method
+    return band, importance, overview_method, score
 
 
-def _overview_tolerances(bands: int, span: float) -> dict[int, float]:
-    """Simplify tolerance per coarse band, in the data's own units. One
-    extent-relative geometric ladder for every band count. Band 0 resolves at
-    `_COARSEST_REL` of the span and each finer coarse band divides the tolerance
-    by `_LADDER_FACTOR`."""
-    return {b: span * _COARSEST_REL / (_LADDER_FACTOR ** b) for b in range(bands - 1)}
+def _overview_tolerances(
+    bands: int, span: float,
+    coarsest_rel: float = _COARSEST_REL, ladder_factor: float = _LADDER_FACTOR,
+) -> dict[int, float]:
+    """Simplify tolerance and thinning cell size per coarse band, in the data's
+    own units, extent relative rather than zoom anchored. Band 0 resolves at
+    `coarsest_rel` of `span`, the larger of the dataset's own x and y extent,
+    and each finer coarse band divides that tolerance by `ladder_factor`, one
+    geometric ladder for every band count."""
+    return {
+        b: span * coarsest_rel / (ladder_factor ** b)
+        for b in range(bands - 1)
+    }
+
+
+def _overview_grids(
+    bands: int, span: float, coarsest_rel: float, ladder_factor: float,
+    override: float | None,
+) -> dict[int, float]:
+    """Snap grid per coarse band, in the data's own units. Each band snaps to a
+    fraction of its own tolerance (a quarter of its pixel), so a coarse band
+    carries only the coordinate precision it actually paints, not the global
+    fine grid it never shows. A single `override` forces the same grid on
+    every band, the escape hatch for `--overview-grid`."""
+    tol = _overview_tolerances(bands, span, coarsest_rel, ladder_factor)
+    if override is not None:
+        return {b: override for b in tol}
+    return {b: tol[b] / _GRID_SUBPIXEL for b in tol}
 
 
 def _snap_safe(geoms: np.ndarray, grid: float) -> np.ndarray:
@@ -460,13 +814,100 @@ def _snap_safe(geoms: np.ndarray, grid: float) -> np.ndarray:
         return out
 
 
+def _quad_fallback(src: np.ndarray, grid: float, tol: float) -> np.ndarray:
+    """A small grid-aligned quad per feature, for polygon survivors whose shape
+    collapses below their band's pixel. A coarse band's survivor stands for its
+    whole cell (its `overview_count` says for how many features), so writing
+    NULL when the shape is subpixel erases the survivor from the preview
+    entirely. On a buildings dataset at a country zoom that is every survivor,
+    and the whole first paint comes out blank. The quad keeps the survivor a
+    polygon, the same idiom as Tippecanoe's tiny-polygon reduction, which
+    replaces subpixel polygons with small squares rather than dropping them.
+    The square is centred on the feature's representative point and sized by
+    the feature's own area, side `sqrt(area)` clamped between one snap-grid
+    cell and the band pixel, so larger features paint larger. Centre and half
+    side snap to the half-grid lattice, so the corners land on grid multiples
+    and compress like every other snapped coordinate. The quad extends at most
+    half the band pixel beyond the feature's own bbox, which the coarse-band
+    covering padding accounts for. A feature whose quad cannot be built stays
+    None. Guarded per feature on failure so one bad geometry degrades alone,
+    the same shape of robustness as `_snap_safe`."""
+    out = np.full(len(src), None, dtype=object)
+    half_grid = grid / 2.0
+    max_cells = max(1, round(tol / grid))
+
+    def _quads(geoms: np.ndarray) -> np.ndarray:
+        pts = shapely.point_on_surface(geoms)
+        good = ~(shapely.is_missing(pts) | shapely.is_empty(pts))
+        quads = np.full(len(geoms), None, dtype=object)
+        if not good.any():
+            return quads
+        cx = np.round(shapely.get_x(pts[good]) / half_grid) * half_grid
+        cy = np.round(shapely.get_y(pts[good]) / half_grid) * half_grid
+        area = shapely.area(geoms[good])
+        area = np.where(np.isfinite(area), np.maximum(area, 0.0), 0.0)
+        cells = np.clip(np.round(np.sqrt(area) / grid), 1, max_cells)
+        half = cells * half_grid
+        quads[good] = shapely.box(cx - half, cy - half, cx + half, cy + half)
+        return quads
+
+    try:
+        quads = _quads(src)
+        ok = np.array([q is not None for q in quads], dtype=bool)
+        if ok.any():
+            out[ok] = shapely.to_wkb(quads[ok])
+    except (shapely.errors.GEOSException, TypeError):
+        for i, g in enumerate(src):
+            try:
+                q = _quads(np.asarray([g], dtype=object))[0]
+                if q is not None:
+                    out[i] = shapely.to_wkb(q)
+            except (shapely.errors.GEOSException, TypeError):
+                pass  # this feature keeps its None
+    return out
+
+
+def _segment_fallback(src: np.ndarray, grid: float) -> np.ndarray:
+    """A short line segment per feature, for line survivors whose simplified
+    geometry comes out empty. The segment runs through the feature's bbox
+    centre along the bbox diagonal, the line's own dominant direction, with a
+    minimum length of one snap-grid cell so it stays paintable, so a line
+    survivor stays a line, never a point. Built from the bbox alone, no GEOS
+    calls that can throw, and a feature with no finite bbox stays None. This
+    path is rare, a line's topology-preserving simplify almost never empties,
+    it exists so the ladder never writes NULL for a paintable survivor."""
+    out = np.full(len(src), None, dtype=object)
+    b = shapely.bounds(src)
+    mx = (b[:, 0] + b[:, 2]) / 2
+    my = (b[:, 1] + b[:, 3]) / 2
+    dx = b[:, 2] - b[:, 0]
+    dy = b[:, 3] - b[:, 1]
+    ln = np.hypot(dx, dy)
+    ux = np.where(ln > 0, dx / np.maximum(ln, 1e-300), 1.0)
+    uy = np.where(ln > 0, dy / np.maximum(ln, 1e-300), 0.0)
+    half = np.maximum(ln, grid) / 2
+    finite = np.isfinite(mx) & np.isfinite(my) & np.isfinite(half)
+    for i in np.nonzero(finite)[0]:
+        seg = shapely.LineString([
+            (mx[i] - ux[i] * half[i], my[i] - uy[i] * half[i]),
+            (mx[i] + ux[i] * half[i], my[i] + uy[i] * half[i]),
+        ])
+        out[i] = shapely.to_wkb(seg)
+    return out
+
+
 def _overview_values(src: np.ndarray, dims: np.ndarray, tol: float, grid: float) -> np.ndarray:
-    """Per-dimension overview WKB for one coarse band. Polygons and collections
-    simplify plus grid snap, and a result that is empty or degenerate is written
-    as NULL, never empty WKB. Lines simplify plus snap and fall back to the
-    simplified unsnapped geometry when the snap collapses them to empty. Points
-    copy their exact geometry, which is already minimal. Returns an object array
-    of WKB bytes with None where a result is degenerate."""
+    """Per-dimension overview WKB for one coarse band, each dimension keeping
+    its own kind. Polygons and collections simplify plus grid snap, falling
+    back to a small area-sized quad (see `_quad_fallback`) when the shape
+    collapses below the band pixel, so a polygon survivor always paints as a
+    polygon. Lines simplify plus snap with a collapse guard, falling back to
+    the simplified unsnapped line, then to a short oriented segment (see
+    `_segment_fallback`), so a line survivor always paints as a line. Points
+    copy their exact geometry, which is already minimal. Only a feature whose
+    fallback also fails is written as NULL, never empty WKB. Returns an object
+    array of WKB bytes with None where nothing could be written. A pure
+    per-feature transform, safe to chunk across threads."""
     out = np.full(len(src), None, dtype=object)
 
     # Points and multipoints, copy the exact geometry verbatim.
@@ -476,7 +917,8 @@ def _overview_values(src: np.ndarray, dims: np.ndarray, tol: float, grid: float)
 
     # Lines, simplify plus snap, fall back to the simplified unsnapped geometry
     # when the snap collapses the line to empty, so a short line is never
-    # written as empty WKB.
+    # written as empty WKB, and to the representative point when even that is
+    # empty.
     ln = dims == 1
     if ln.any():
         line_src = src[ln]
@@ -487,11 +929,12 @@ def _overview_values(src: np.ndarray, dims: np.ndarray, tol: float, grid: float)
         final[collapsed] = simplified[collapsed]
         wkb = shapely.to_wkb(final)
         still_empty = shapely.is_missing(final) | shapely.is_empty(final)
-        wkb[still_empty] = None
+        if still_empty.any():
+            wkb[still_empty] = _segment_fallback(line_src[still_empty], grid)
         out[ln] = wkb
 
     # Polygons and higher-dimension collections, repair, simplify plus snap,
-    # NULL when the result is empty or degenerate.
+    # a small area-sized quad when the shape collapses below the band pixel.
     poly = dims >= 2
     if poly.any():
         p = src[poly].copy()
@@ -502,7 +945,8 @@ def _overview_values(src: np.ndarray, dims: np.ndarray, tol: float, grid: float)
         snapped = _snap_safe(simplified, grid)
         wkb = shapely.to_wkb(snapped)
         degenerate = shapely.is_missing(snapped) | shapely.is_empty(snapped)
-        wkb[degenerate] = None
+        if degenerate.any():
+            wkb[degenerate] = _quad_fallback(p[degenerate], grid, tol)
         out[poly] = wkb
     return out
 
@@ -537,22 +981,26 @@ def _overview_band(
 
 def _build_overview(
     geoms: np.ndarray, band: np.ndarray, dimensions: np.ndarray, bands: int,
-    span: float, grid: float, geom_bytes: np.ndarray, jobs: int = 1,
-) -> tuple[np.ndarray, dict[int, float]]:
+    span: float, coarsest_rel: float, ladder_factor: float, grids: dict[int, float],
+    geom_bytes: np.ndarray, jobs: int = 1,
+) -> tuple[np.ndarray, dict[int, float], dict[int, float]]:
     """Build the overview WKB for every coarse band feature, per its dimension,
-    NULL for the finest band. Returns a WKB object array and the tolerance used
+    NULL for the finest band. Each coarse band snaps to its own grid from
+    `grids`, so a coarse band carries only the coordinate precision it paints.
+    Returns a WKB object array, the tolerance used per band, and the grid used
     per band, and logs the byte shrink per band, the core of the preview payoff.
 
     Invalid rings are repaired with `make_valid` on this overview path only, so
     one bowtie polygon cannot abort the conversion. The exact `geometry` column
     is never touched, which is the project invariant."""
-    tolerances = _overview_tolerances(bands, span)
+    tolerances = _overview_tolerances(bands, span, coarsest_rel, ladder_factor)
     out = np.full(len(geoms), None, dtype=object)
     for b, tol in tolerances.items():
         mask = band == b
         count = int(mask.sum())
         if count == 0:
             continue
+        grid = grids[b]
         wkb = _overview_band(geoms[mask], dimensions[mask], tol, grid, jobs)
         exact_bytes = int(geom_bytes[mask].sum())
         ov_bytes = int(sum(len(w) for w in wkb if w is not None))
@@ -562,7 +1010,7 @@ def _build_overview(
             b, count, tol, grid, exact_bytes / 1e6, ov_bytes / 1e6, shrink,
         )
         out[mask] = wkb
-    return out, tolerances
+    return out, tolerances, grids
 
 
 def _plan_row_groups(
@@ -660,8 +1108,19 @@ def _wkb_extension_type(native: bool, crs: object, crs_present: bool, large: boo
 def _validate_options(opts: ConvertOptions) -> None:
     """Fail fast on option combinations that would otherwise crash deep in the
     pipeline or silently produce a broken layout."""
-    if opts.bands < 1:
-        raise ValueError(f"bands must be at least 1, got {opts.bands}")
+    if opts.bands < 0:
+        raise ValueError(f"bands must be 0 (derive) or a positive count, got {opts.bands}")
+    # A forced count shares the derived path's cap. Past it the coarsest bands'
+    # per-band cell underflows the band-0 thinning grid's bit budget, the np.clip in
+    # _thin_band0 collapses every cell into one and silently mis-thins, and an
+    # extreme value underflows the tolerance to 0 or overflows _overview_tolerances.
+    if opts.bands > _MAX_COARSE_BANDS + 1:
+        raise ValueError(
+            f"bands must be at most {_MAX_COARSE_BANDS + 1} "
+            f"({_MAX_COARSE_BANDS} coarse plus the exact band), got {opts.bands}"
+        )
+    if opts.screen_budget_mb <= 0:
+        raise ValueError(f"screen_budget_mb must be positive, got {opts.screen_budget_mb}")
     if opts.row_group_mb <= 0:
         raise ValueError(f"row_group_mb must be positive, got {opts.row_group_mb}")
     if opts.coarse_row_groups < 1:
@@ -674,17 +1133,7 @@ def _validate_options(opts: ConvertOptions) -> None:
         raise ValueError(f"compression_level must be at least 1, got {opts.compression_level}")
     if opts.page_size_kb < 1:
         raise ValueError(f"page_size_kb must be at least 1, got {opts.page_size_kb}")
-    if opts.band_fractions is not None:
-        fr = opts.band_fractions
-        if any(f < 0 for f in fr):
-            raise ValueError(f"band_fractions must all be non negative, got {fr}")
-        if len(fr) < opts.bands - 1:
-            raise ValueError(
-                f"need at least bands minus 1 = {opts.bands - 1} band_fractions, got {len(fr)}"
-            )
-        if sum(fr[: opts.bands - 1]) > 1.0 + 1e-9:
-            raise ValueError(f"the first {opts.bands - 1} band_fractions must sum to at most 1, got {fr}")
-    if not opts.bbox and not opts.native_geo:
+    if opts.bbox is False and not opts.native_geo:
         raise ValueError("--no-bbox requires native geo types, there would be no pruning surface at all")
 
 
@@ -749,6 +1198,28 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     length = np.where(np.isfinite(length), length, 0.0)
     log.info("decoded %d geometries and computed area+length+bounds in %.1fs", len(geoms), time.perf_counter() - t)
 
+    # Serialize the exact WKB once, up front, before banding. Its per-feature
+    # byte lengths drive both the finest band's byte budget and the per-band
+    # overview shrink log, and a crc32 of each feature's own bytes is the density
+    # thinning tie-break. A content hash, never Python's salted hash or row
+    # order, so the same geometry always hashes the same and re-conversion stays
+    # idempotent. Null geometries serialize to None and hash to 0, they never
+    # enter a coarse band so the value is moot.
+    geom_wkb = shapely.to_wkb(geoms)
+    stable_hash = np.fromiter(
+        (zlib.crc32(w) if w is not None else 0 for w in geom_wkb),
+        dtype=np.uint32, count=len(geom_wkb),
+    )
+    # Per-feature exact WKB byte lengths, also computed once up front. Null rows
+    # serialize to None and contribute 0 bytes. The total drives the byte-density
+    # band derivation below (which runs before the sort), and the array is
+    # reordered alongside geom_wkb so the finest band's byte budget and the
+    # per-band overview shrink log reuse it without a post-sort recompute.
+    geom_bytes = np.fromiter(
+        (len(w) if w is not None else 0 for w in geom_wkb),
+        dtype=np.int64, count=len(geom_wkb),
+    )
+
     # The dataset extent, computed before banding so point thinning can lay its
     # grid over it. NaN bounds of null and empty geometries are excluded with
     # nanmin/nanmax. Antimeridian-crossing features get a world-spanning bbox
@@ -761,38 +1232,132 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     )
     span_x = max(dataset_bbox[2] - dataset_bbox[0], 1e-12)
     span_y = max(dataset_bbox[3] - dataset_bbox[1], 1e-12)
+    # The single extent-relative span the tolerance ladder anchors to, the
+    # larger of the two axes, so a tall or wide extent still gets one
+    # consistent band 0 tolerance.
     span = max(span_x, span_y)
-    grid = opts.overview_grid if opts.overview_grid is not None else span * _GRID_REL
-    log.info("extent %.4g x %.4g units, overview snap grid %.4g", span_x, span_y, grid)
+    log.info("extent %.4g x %.4g units", span_x, span_y)
 
-    # bbox centroids, reused for cos-latitude area scaling, point thinning, and
-    # the Hilbert minor sort. Null and empty geometries have NaN centroids.
+    # The coarsest band's anchor zoom, where the dataset extent fills the screen.
+    # The whole coarse ladder steps up from here, so a sub-world dataset never
+    # emits coarse bands below its own visible range. A world dataset anchors at
+    # the fixed ladder's old start, so it is unchanged. This single value drives
+    # the band count, the per-band tolerances, and the per-band snap grids, so
+    # they all stay consistent.
+    z_coarsest = _coarsest_zoom(span_x, span_y, world)
+
+    # bbox centroids, reused for the local density estimate, cos-latitude area
+    # scaling, point thinning, and the Hilbert minor sort. Null and empty
+    # geometries have NaN centroids.
     cx = (bounds[:, 0] + bounds[:, 2]) / 2
     cy = (bounds[:, 1] + bounds[:, 3]) / 2
 
-    band, importance, overview_method = _assign_bands(
-        dimensions, area, length, valid, cx, cy, opts.bands, opts.band_fractions,
-        importance_values, opts.importance_column, span, dataset_bbox, geographic,
+    # Derive the band count from local byte density, unless a positive --bands
+    # overrides it. Byte density captures both feature count and geometry
+    # complexity, so dense small features and a few huge polygons both get the
+    # band count they need from one formula, and the local (byte-weighted
+    # quantile over an extent grid) estimate keeps clustered data honest, the
+    # ladder covers the zooms a dense city needs, not just the empty-countryside
+    # average. The coarse count is the number of `ladder_factor` halvings from
+    # the coarsest tolerance (`span * coarsest_rel`) down to `gsd_fine`, the
+    # tolerance at which a screen of exact geometry meets the byte budget, plus
+    # one exact band. `regime` is a descriptive label only, it reports which
+    # regime the file is, it never branches the pipeline.
+    n_valid = int(valid.sum())
+    total_exact_bytes = int(geom_bytes.sum())
+    regime = _detect_regime(total_exact_bytes, n_valid)
+    if opts.bbox is None:
+        bbox_enabled = regime == "count"
+        if not bbox_enabled and not opts.native_geo:
+            log.info(
+                "regime %r would default bbox off, but --no-native-geo leaves no "
+                "pruning surface, forcing bbox on",
+                regime,
+            )
+            bbox_enabled = True
+        log.info("bbox default: %s (regime %r, no flag given)", bbox_enabled, regime)
+    else:
+        bbox_enabled = opts.bbox
+    byte_density = _local_byte_density(
+        cx, cy, geom_bytes, valid, dataset_bbox, span_x, span_y
     )
-    # Pin null and empty geometries into the finest, exact band.
-    band[~valid] = opts.bands - 1
+    avg_density = total_exact_bytes / max(span_x * span_y, 1e-30)
+    log.info(
+        "local byte density %.3g B/unit^2 (whole-extent average %.3g, %.1fx clustering)",
+        byte_density, avg_density, byte_density / avg_density if avg_density > 0 else 0.0,
+    )
+    bands = opts.bands if opts.bands else _derive_bands(
+        byte_density, span, opts.coarsest_rel, opts.ladder_factor,
+        opts.screen_budget_mb * 1_000_000,
+    )
+    # A forced --bands is still held to the zoom ceiling, an overview band at or
+    # past _FINE_MAX_ZOOM would just be exact geometry grid-snapped.
+    max_bands = _max_coarse_for_zoom(z_coarsest) + 1
+    if bands > max_bands:
+        log.warning(
+            "clamping %d bands to %d, the ladder from coarsest zoom %d may not "
+            "serve an overview past zoom %d",
+            bands, max_bands, z_coarsest, _FINE_MAX_ZOOM - 1,
+        )
+        bands = max_bands
+    log.info(
+        "using %d bands (%s) anchored at coarsest zoom %d, regime %r",
+        bands, "manual override" if opts.bands else "derived from local byte density",
+        z_coarsest, regime,
+    )
+
+    band, importance, overview_method, score = _assign_bands(
+        dimensions, area, length, valid, cx, cy, bands, opts.band_fractions,
+        importance_values, opts.importance_column, span, dataset_bbox, geographic,
+        opts.coarsest_rel, opts.ladder_factor,
+    )
+    band[~valid] = bands - 1
     log.info("ranked by importance %r, overview method %r", importance, overview_method)
+
+    survivor_counts = np.zeros(len(band), dtype=np.int64)
+    if opts.thin and bands > 1:
+        rx, ry = _representative_points(geoms, dimensions, bounds, valid, jobs=opts.jobs)
+        metric = np.nan_to_num(score, nan=0.0)
+        origin = (dataset_bbox[0], dataset_bbox[1])
+        is_survivor, survivor_counts = _thin_band0(
+            dimensions, rx, ry, metric, stable_hash, valid,
+            span, opts.coarsest_rel, opts.ladder_factor, origin)
+        # Band 0 = even-coverage survivors over ALL valid features. Fraction-band the
+        # non-survivors into bands 1..bands-1 (finest exact), so band 0 covers the whole
+        # extent while deeper bands stay pure fraction. This runs before, not after,
+        # fraction banding, which is what reclaims the coverage win.
+        nonsurv = valid & ~is_survivor
+        band[is_survivor] = 0
+        band[nonsurv] = _band_by_fraction(score[nonsurv], bands - 1, opts.band_fractions) + 1
+        band[~valid] = bands - 1
+        log.info("band 0 thinned for coverage: %d survivors of %d valid features",
+                 int(is_survivor.sum()), int(valid.sum()))
 
     # Merge empty bands. A tiny dataset can leave a coarse band with no features,
     # which would make `levels` start above 0. Renumber the populated bands to a
     # contiguous 0..k-1 so the level ladder always starts at the coarsest band.
     present = np.unique(band)
-    bands = len(present)
-    if bands < opts.bands:
+    populated = len(present)
+    if populated < bands:
         log.info(
             "merging %d empty band(s), renumbering %d populated bands to 0..%d",
-            opts.bands - bands, bands, bands - 1,
+            bands - populated, populated, populated - 1,
         )
-        band = np.searchsorted(present, band).astype(np.int16)
+    bands = populated
+    # searchsorted maps each surviving band ordinal down to its contiguous index.
+    # A no-op when no band was empty, since present is already 0..bands-1.
+    band = np.searchsorted(present, band).astype(np.int16)
     for b in range(bands):
         n = int((band == b).sum())
         role = "coarse preview" if b == 0 else ("exact detail" if b == bands - 1 else "mid zoom")
         log.info("  band %d: %d features (%.1f%%), %s", b, n, 100 * n / len(band), role)
+
+    # A single-band file has no coarse bands, so nothing was simplified, snapped,
+    # or meaningfully thinned. The footer must describe what the writer actually
+    # did, so the method is `none`, the file is plain exact GeoParquet with the
+    # sort and the footer block only.
+    if bands == 1:
+        overview_method = "none"
 
     # Hilbert minor sort on the bbox centroids quantized over the dataset extent.
     # Null and empty geometries have NaN centroids, park them at the extent origin
@@ -815,38 +1380,49 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     # `binary` array and overflow, and the reordered copy is discarded here
     # anyway. Nothing reads these columns off `table` after the decode above.
     drop = [geom_col]
-    for c in ("geometry", "geom_overview", "band", "bbox"):
+    for c in ("geometry", "geom_overview", "band", "bbox", "overview_count"):
         if c in table.column_names and c not in drop:
             drop.append(c)
     if len(drop) > 1:
         log.info("dropping pre-existing overview columns before rewrite, %s", drop)
     table = table.drop_columns(drop)
 
-    table = table.take(pa.array(sort_idx))
+    # A geometry-only input drops to zero passthrough columns above. `take` on a
+    # zero-column table resets its row count to 0, and the later append_column
+    # calls then fail on a length mismatch, so skip the reorder when there is
+    # nothing to reorder. drop_columns already preserved the row count and the
+    # first appended column re-establishes the length for the rest.
+    if table.num_columns:
+        table = table.take(pa.array(sort_idx))
     geoms = geoms[sort_idx]
     bounds = bounds[sort_idx]
     band = band[sort_idx]
     valid = valid[sort_idx]
     dimensions = dimensions[sort_idx]
+    geom_wkb = geom_wkb[sort_idx]
+    geom_bytes = geom_bytes[sort_idx]
+    survivor_counts = survivor_counts[sort_idx]
     log.info("sorted band-major, Hilbert within each band")
 
-    # Serialize the exact WKB once. Its per-feature byte lengths drive both the
-    # finest band's byte budget and the per-band overview shrink log line.
-    geom_wkb = shapely.to_wkb(geoms)
-    geom_bytes = np.array([len(w) if w is not None else 0 for w in geom_wkb], dtype=np.int64)
+    # Per-band overview snap grid, a pure function of the final band count and
+    # the extent-relative tolerance ladder, so re-conversion stays
+    # byte-identical idempotent. Each coarse band snaps to a quarter of its own
+    # pixel, unless `--overview-grid` forces a single grid on every band.
+    band_grids = _overview_grids(bands, span, opts.coarsest_rel, opts.ladder_factor, opts.overview_grid)
 
     # A pure-point dataset carries no overview column, its banding (thinning or
     # attribute rank) is the level of detail. Everything else builds an overview.
     if overview_method == "thin":
         log.info("point dataset, no overview column, banding is the level of detail")
         overview_wkb = np.full(len(geoms), None, dtype=object)
-        band_tol = _overview_tolerances(bands, span)
+        band_tol = _overview_tolerances(bands, span, opts.coarsest_rel, opts.ladder_factor)
         has_overview = False
     else:
         jobs = opts.jobs if opts.jobs > 0 else (os.cpu_count() or 1)
         log.info("building overview column across %d thread(s)", jobs)
-        overview_wkb, band_tol = _build_overview(
-            geoms, band, dimensions, bands, span, grid, geom_bytes, jobs
+        overview_wkb, band_tol, band_grids = _build_overview(
+            geoms, band, dimensions, bands, span, opts.coarsest_rel, opts.ladder_factor,
+            band_grids, geom_bytes, jobs,
         )
         has_overview = any(v is not None for v in overview_wkb)
 
@@ -865,16 +1441,24 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     # dropped before the sort above, so `table` now holds only the passthrough
     # attribute columns, ready for the rebuilt geometry, bbox, band, and overview.
 
-    # set_precision snapping can move overview vertices up to grid/2 outward, so a
-    # coarse-band feature's overview pixel can leave its exact-geometry bbox. Pad
-    # the coarse-band covering by grid/2 so a viewer pruning on bbox never drops a
-    # feature still painted in the overview. The finest, exact band is untouched.
-    coarse = valid & (band < bands - 1)
-    pad = grid / 2
-    bounds[coarse, 0] -= pad
-    bounds[coarse, 1] -= pad
-    bounds[coarse, 2] += pad
-    bounds[coarse, 3] += pad
+    # The overview can leave a feature's exact-geometry bbox two ways.
+    # set_precision snapping moves vertices up to grid/2 outward, and the quad
+    # fallback centres an up-to-one-pixel square on the representative point,
+    # extending up to half the band tolerance beyond the bbox. Pad each coarse
+    # band's covering by the larger of the two so a viewer pruning on bbox
+    # never drops a feature still painted in the overview. Both are per-band,
+    # so a coarser band pads more than a finer one, and the max keeps a forced
+    # `--overview-grid` coarser than the tolerance covered too. The finest,
+    # exact band is untouched, and null and empty geometries are never padded.
+    for b in range(bands - 1):
+        m = valid & (band == b)
+        if not m.any():
+            continue
+        pad = (max(band_tol.get(b, 0.0), band_grids[b]) if has_overview else band_grids[b]) / 2
+        bounds[m, 0] -= pad
+        bounds[m, 1] -= pad
+        bounds[m, 2] += pad
+        bounds[m, 3] += pad
 
     # Per-band extents for `levels[].extent`, computed from the padded bounds so
     # they enclose the overview geometry too. A band of only null geometries
@@ -903,22 +1487,57 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
         return gtype.wrap_array(storage) if gtype is not None else storage
 
     table = table.append_column("geometry", _geom_array(geom_wkb))
-    if opts.bbox:
+    if bbox_enabled:
         table = table.append_column("bbox", _bbox_struct(bounds, valid))
     table = table.append_column("band", pa.array(band, type=pa.int16()))
     if has_overview:
         table = table.append_column("geom_overview", _geom_array(overview_wkb))
 
+    # The density signal thinning would otherwise destroy. Each coarse-band
+    # survivor records how many features, itself included, competed for its
+    # one-pixel cell, so a viewer can scale the survivor's symbol and a dense
+    # cluster stays distinguishable from sparse coverage. Null on the finest
+    # band (exact, never thinned) and on invalid rows. Only written when
+    # thinning ran and coarse bands exist, a single-band file has no survivors
+    # to weight. Pure-point files carry it too, density matters most there.
+    has_counts = opts.thin and bands > 1
+    if has_counts:
+        count_vals = survivor_counts.astype(np.int64)
+        count_null = (band == bands - 1) | ~valid | (count_vals <= 0)
+        table = table.append_column(
+            "overview_count",
+            pa.array(
+                np.where(count_null, 0, count_vals), type=pa.int32(),
+                mask=count_null,
+            ),
+        )
+
     base_levels = []
     prev_zoom = -1
     for b in sorted(band_rg_end):
         gsd = band_tol.get(b, 0.0) if b < bands - 1 else 0.0
+        # min_zoom is the coarsest web zoom this band starts serving, the natural
+        # pair to max_zoom. Read the cursor before max_zoom advances it, so band 0
+        # is 0 and each later band opens one past the previous band's max_zoom.
+        min_zoom = prev_zoom + 1
         max_zoom = _zoom_for_gsd(gsd, world) if b < bands - 1 else _FINE_MAX_ZOOM
         max_zoom = max(max_zoom, prev_zoom + 1)  # keep the ladder strictly increasing
         prev_zoom = max_zoom
+        # The per-band snap grid, positional origin and cell_size in CRS units. The
+        # finest exact band has no overview and no snap grid, so its grid is null.
+        # `set_precision` snaps to a lattice anchored at coordinate zero, not at
+        # the dataset extent, so the origin is [0, 0], a consumer reconstructing
+        # the lattice must snap from zero, not from the band or dataset corner.
+        g = band_grids.get(b)
+        grid = (
+            {"origin": [0.0, 0.0], "cell_size": [g, g]}
+            if b < bands - 1 and g is not None else None
+        )
         base_levels.append({
             "level": b, "row_group_end": band_rg_end[b],
-            "max_zoom": max_zoom, "gsd": gsd, "extent": band_extents.get(b),
+            "min_zoom": min_zoom, "max_zoom": max_zoom, "gsd": gsd,
+            "grid": grid, "feature_count": int((band == b).sum()),
+            "extent": band_extents.get(b),
         })
 
     type_names = _geometry_type_names(geoms)
@@ -932,7 +1551,7 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
             crs=crs if crs_present else footer._NO_CRS,
             source_column=source_column,
             overview_geometry_types=overview_type_names,
-            covering=opts.bbox,
+            covering=bbox_enabled,
         ),
     }
 
@@ -951,7 +1570,8 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
             "overviews": footer.overviews_meta(
                 "hilbert", base_levels, has_overview,
                 importance=importance, overview_method=overview_method,
-                covering=opts.bbox,
+                regime=regime, covering=bbox_enabled,
+                count_column="overview_count" if has_counts else None,
             ),
         }
 
@@ -981,6 +1601,8 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
         "features": table.num_rows,
         "row_groups": len(plan),
         "bands": bands,
+        "regime": regime,
+        "bbox": bbox_enabled,
         "has_overview": has_overview,
         "crs_preserved": crs_present,
         "geographic": geographic,

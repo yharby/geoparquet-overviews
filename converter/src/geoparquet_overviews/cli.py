@@ -6,7 +6,13 @@ import sys
 
 import click
 
-from .convert import ConvertOptions, convert
+from .convert import (
+    _COARSEST_REL,
+    _LADDER_FACTOR,
+    _SCREEN_BUDGET_MB,
+    ConvertOptions,
+    convert,
+)
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -28,7 +34,19 @@ def main() -> None:
 @main.command()
 @click.argument("src", type=click.Path(exists=True, dir_okay=False))
 @click.argument("dst", type=click.Path(dir_okay=False))
-@click.option("--bands", default=3, show_default=True, help="Number of importance bands.")
+@click.option(
+    "--bands",
+    default=0,
+    show_default=True,
+    help="Number of bands. 0 derives the count from byte density, a positive value forces it.",
+)
+@click.option(
+    "--screen-budget-mb",
+    default=_SCREEN_BUDGET_MB,
+    show_default=True,
+    type=float,
+    help="Decoded geometry a screen should target, in MB. Caps the overview ladder depth, lower asks for more coarse bands. Ignored when --bands is forced.",
+)
 @click.option(
     "--row-group-mb",
     default=16.0,
@@ -40,6 +58,26 @@ def main() -> None:
     default=None,
     type=float,
     help="Coordinate grid the overview geometry snaps to, in CRS units. Derived from the dataset extent when unset.",
+)
+@click.option(
+    "--band-fractions",
+    default=None,
+    type=str,
+    help="Comma-separated share of features per coarse band, largest first, e.g. 0.01,0.02,0.04. Derived from the tolerance ladder when unset.",
+)
+@click.option(
+    "--coarsest-rel",
+    default=_COARSEST_REL,
+    show_default="1/1500",
+    type=float,
+    help="Band 0 simplify tolerance as a fraction of the larger extent span.",
+)
+@click.option(
+    "--ladder-factor",
+    default=_LADDER_FACTOR,
+    show_default=True,
+    type=float,
+    help="Each finer coarse band divides the tolerance by this. 4 steps two web zooms per band, the raster-overview style _ZOOMS_PER_BAND step.",
 )
 @click.option(
     "--coarse-row-groups",
@@ -76,9 +114,8 @@ def main() -> None:
 )
 @click.option(
     "--bbox/--no-bbox",
-    default=True,
-    show_default=True,
-    help="Write the physical bbox covering column (Profile A). --no-bbox omits it and relies on native geospatial statistics only (Profile B), which disables page-level pruning.",
+    default=None,
+    help="Write the physical bbox covering column (Profile A) or omit it and rely on native geospatial statistics only (Profile B, disables page-level pruning). Default is adaptive: on for count-heavy data, off for vertex-heavy data. Either flag forces the choice explicitly.",
 )
 @click.option(
     "--jobs",
@@ -88,21 +125,32 @@ def main() -> None:
     type=int,
     help="Worker threads for the overview build, the slowest stage. 0 is one per core, 1 forces single-threaded.",
 )
+@click.option(
+    "--thin/--no-thin",
+    default=True,
+    show_default=True,
+    help="Thin band 0 for even coverage, at most one feature per screen pixel per geometry dimension. --no-thin is a debug escape only.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Verbose (DEBUG) logging.")
 @click.option("-q", "--quiet", is_flag=True, help="Only print the JSON summary, no stage logs.")
 def convert_cmd(
     src: str,
     dst: str,
     bands: int,
+    screen_budget_mb: float,
     row_group_mb: float,
     overview_grid: float | None,
+    band_fractions: str | None,
+    coarsest_rel: float,
+    ladder_factor: float,
     coarse_row_groups: int,
     compression_level: int,
     page_size_kb: int,
     importance_column: str | None,
     native_geo: bool,
-    bbox: bool,
+    bbox: bool | None,
     jobs: int,
+    thin: bool,
     verbose: bool,
     quiet: bool,
 ) -> None:
@@ -111,8 +159,12 @@ def convert_cmd(
         _setup_logging(verbose)
     opts = ConvertOptions(
         bands=bands,
+        screen_budget_mb=screen_budget_mb,
         row_group_mb=row_group_mb,
         overview_grid=overview_grid,
+        band_fractions=([float(f) for f in band_fractions.split(",")] if band_fractions else None),
+        coarsest_rel=coarsest_rel,
+        ladder_factor=ladder_factor,
         coarse_row_groups=coarse_row_groups,
         compression_level=compression_level,
         page_size_kb=page_size_kb,
@@ -120,6 +172,7 @@ def convert_cmd(
         native_geo=native_geo,
         bbox=bbox,
         jobs=jobs,
+        thin=thin,
     )
     summary = convert(src, dst, opts)
     click.echo(json.dumps(summary, indent=2))

@@ -286,6 +286,14 @@ function bandForIndex(index: number, levels: OverviewLevel[]): number | null {
   return null;
 }
 
+// The primary geometry column's name from the `geo` block, or `geometry` when
+// the block or the field is absent. gpio's web-optimized files keep the source
+// column name (often `geom` from DuckDB/GDAL), so the read path must not assume
+// the literal `geometry`.
+export function primaryGeometryColumn(geo: Record<string, unknown> | null): string {
+  return geo && typeof geo.primary_column === 'string' ? geo.primary_column : 'geometry';
+}
+
 function extractCoveringPaths(geo: Record<string, unknown> | null): CoveringPaths | null {
   if (!geo) return null;
   const primaryColumn = (geo.primary_column as string) ?? 'geometry';
@@ -455,6 +463,7 @@ export function computeFileFacts(meta: GeoParquetMetadata, fileBytes: number, pr
   let exactGeometryBytes = 0;
   let overviewGeometryBytes = 0;
   const geometryCodecs = new Set<string>();
+  const primaryColumn = primaryGeometryColumn(meta.geo);
   for (const rg of meta.rawRowGroups) {
     for (const col of rg.columns) {
       const md = col.meta_data as RawChunkMeta | undefined;
@@ -463,7 +472,7 @@ export function computeFileFacts(meta: GeoParquetMetadata, fileBytes: number, pr
       totalCompressed += compressed;
       totalUncompressed += Number(md.total_uncompressed_size ?? 0);
       const leaf = md.path_in_schema.length === 1 ? md.path_in_schema[0] : null;
-      if (leaf === 'geometry') {
+      if (leaf === primaryColumn) {
         exactGeometryBytes += compressed;
         if (md.codec) geometryCodecs.add(md.codec);
       } else if (overviewColumn && leaf === overviewColumn) {

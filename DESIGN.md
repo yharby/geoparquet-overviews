@@ -41,18 +41,40 @@ plain WKB that every reader already decodes.
 
 ## The idea in depth
 
-1. **Importance order.** Rank features by how much they matter at low zoom,
-   largest first for polygons, and split them into a few bands. Band 0 is the
-   small set of features that make a whole-extent preview. Every feature is
-   stored once, in the band where it first matters. Within a band a Hilbert
-   sort keeps neighbors close so bbox statistics stay tight.
+1. **Fraction banding with a band-0 coverage pass.** Coarse bands take a small
+   importance-ranked slice of the features, largest first. Band 0 gets the
+   smallest slice and each finer coarse band about doubles it, ten percent of
+   the features across all coarse bands by default, and the exact final band
+   keeps the large remainder. That smallest-slice-then-doubling split is how
+   the non-survivors of the band-0 thinning pass below are fraction-banded into
+   the finer coarse bands, under the default thinning path band 0 itself is
+   replaced by the even-coverage thinning survivors over all valid features, so
+   band 0 can end up larger than band 1, not smaller. Every coarse feature
+   carries an overview copy, so keeping the coarse cohort small is what keeps
+   the overview column light, and
+   the depth cap stops the ladder where a screen of exact geometry read with
+   page pruning is already affordable. Band 0 alone is then density thinned to
+   one survivor per pixel per geometry dimension over all valid features, so its
+   whole-extent coverage stays even instead of clustering where the importance
+   rank is densest, and each band-0 survivor records how many features competed
+   for its cell in an `overview_count` column, so the density signal thinning
+   removes from the geometry survives in the data and a viewer can scale a
+   survivor's symbol, keeping a dense city distinguishable from a sparse
+   village. The number of bands is derived from the data, not fixed, and the
+   derivation measures byte density where the data actually sits, not averaged
+   over the bounding box, so clustered data gets the coarse bands its dense
+   screens need. Within a band a Hilbert sort keeps neighbors close so bbox
+   statistics stay tight.
 2. **An overview column.** Coarse bands carry a simplified, grid-snapped copy
-   of their shape in a second geometry column named `geom_overview`. The
-   finest band leaves it null. The primary `geometry` column is never touched.
+   of their shape in a second geometry column named `geom_overview`. Each coarse
+   band snaps to its own grid, a fraction of that band's pixel, so it carries
+   only the coordinate precision it paints. The finest band leaves the overview
+   null. The primary `geometry` column is never touched.
 3. **A footer note.** An `overviews` key next to the standard `geo` key
-   records which row-group prefix belongs to which band and which zooms each
-   band serves. Unknown keys are ignored, so every existing reader sees a
-   valid GeoParquet file and reads every row at exact precision.
+   records which row-group prefix belongs to which band, which zooms each band
+   serves, and how many features it holds. Unknown keys are ignored, so every
+   existing reader sees a valid GeoParquet file and reads every row at exact
+   precision.
 
 Because rows are band-major, coarsest band first, a preview is a contiguous
 prefix of the file. A client that knows nothing but the footer can fetch band
@@ -68,9 +90,10 @@ live in [SPEC.md](SPEC.md).
 
 ```json
 {
-  "version": "0.2.0",
+  "version": "0.3.0",
   "spatial_key": "hilbert",
   "importance": "area_desc",
+  "regime": "count",
   "covering": {
     "bbox": {
       "xmin": ["bbox", "xmin"],
@@ -81,13 +104,17 @@ live in [SPEC.md](SPEC.md).
   },
   "overview_column": "geom_overview",
   "overview_method": "simplify_snap",
+  "count_column": "overview_count",
   "levels": [
-    { "level": 0, "row_group_end": 0,  "max_zoom": 8,  "gsd": 0.005,
-      "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [4096, 428112] },
-    { "level": 1, "row_group_end": 6,  "max_zoom": 10, "gsd": 0.00125,
-      "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [428112, 9532048] },
-    { "level": 2, "row_group_end": 22, "max_zoom": 24, "gsd": 0.0,
-      "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [9532048, 62004224] }
+    { "level": 0, "row_group_end": 0,  "min_zoom": 0, "max_zoom": 2,  "gsd": 0.3516,
+      "grid": { "origin": [0, 0], "cell_size": [0.0879, 0.0879] },
+      "feature_count": 512, "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [4096, 428112] },
+    { "level": 1, "row_group_end": 6,  "min_zoom": 3, "max_zoom": 4, "gsd": 0.0879,
+      "grid": { "origin": [0, 0], "cell_size": [0.0220, 0.0220] },
+      "feature_count": 8192, "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [428112, 9532048] },
+    { "level": 2, "row_group_end": 22, "min_zoom": 5, "max_zoom": 24, "gsd": 0.0,
+      "grid": null,
+      "feature_count": 5642000, "extent": [-179.1, -89.3, 179.4, 89.6], "bytes": [9532048, 62004224] }
   ]
 }
 ```
@@ -96,10 +123,12 @@ live in [SPEC.md](SPEC.md).
 | --- | --- |
 | `version` | Draft version of this convention. |
 | `spatial_key` | The curve used for the within-band sort. Descriptive, readers must not depend on it. |
-| `importance` | How features were ranked into bands. `area_desc` for polygons, `length_desc` for lines, `attribute:<column>` for an attribute-ranked column, `grid_thin` for spatially thinned points, `mixed_quantile_desc` for a mixed-dimension layer merged by quantile. Descriptive. |
+| `importance` | How features were ranked into bands, largest first, and which one wins each band-0 thinning cell. `area_desc` for polygons, `length_desc` for lines, `attribute:<column>` for an attribute-ranked column, `grid_thin` for points with no attribute, `mixed_quantile_desc` for a mixed-dimension layer ranked per cohort by quantile. Descriptive. |
+| `regime` | A label for the data, `count` for many-feature data, `vertex` for few-heavy-geometry data, from the average bytes per feature. Descriptive, it never changes how a reader reads the file. |
 | `covering` | Points at the bbox struct column, mirroring the GeoParquet covering. If present it must match the `geo` covering. |
 | `overview_column` | Name of the simplified geometry column. Absent when the file has no overview column. |
-| `overview_method` | How `geom_overview` was derived. `simplify_snap` for a simplified, grid-snapped copy. `thin` for a point dataset where the banding itself is the level of detail and no overview column exists. |
+| `overview_method` | How `geom_overview` was derived. `simplify_snap` for a simplified, grid-snapped copy. `thin` for a point dataset where the banding itself is the level of detail and no overview column exists. `none` for a single-band file where nothing was reduced at all. |
+| `count_column` | Name of the survivor count column. Each band-0 survivor's value is how many features competed for its thinning cell, the density signal a viewer can scale symbols by, and it is null on every finer band. Absent when band-0 thinning wrote no counts. |
 | `levels` | One entry per band, sorted ascending, coarsest first. |
 
 Each `levels` entry.
@@ -108,8 +137,11 @@ Each `levels` entry.
 | --- | --- |
 | `level` | Band ordinal, 0 is the coarsest. |
 | `row_group_end` | Index of the last row group in this band, inclusive. The band owns the prefix from row group 0. Strictly increasing across levels. |
+| `min_zoom` | Lowest web zoom this band should paint, the pair to `max_zoom`. 0 on level 0, and one past the previous band's `max_zoom` on every later band, so the levels tile the zoom range with no gap. |
 | `max_zoom` | Highest web zoom this band should paint, an advisory hint on the 256px WebMercator model. Strictly increasing. |
-| `gsd` | Ground sample distance the band was simplified to, in CRS units per pixel. The final band is exact and has `gsd` 0. `gsd` is the authoritative resolution signal. |
+| `gsd` | Ground sample distance the band was simplified to, in CRS units per pixel, which on band 0 is also the side of the thinning cell. The final band is exact and has `gsd` 0. `gsd` is the authoritative resolution signal. |
+| `grid` | The band's own coordinate snap grid, `{ origin, cell_size }` in CRS units, a sub-pixel fraction of the band's `gsd`. `origin` is the lattice anchor, `[0, 0]` since the snap runs from coordinate zero. Null on the final band, which has no overview. |
+| `feature_count` | How many features are in the band. Sums across levels to the row count, so the footer attests no feature was lost. Lets a reader price a level before reading it. |
 | `extent` | Padded bounding box of the band's own features, `[xmin, ymin, xmax, ymax]` in CRS units, or null when the band has no valid geometry. Encloses both the exact and the overview geometry of the band. Optional. |
 | `bytes` | File byte offsets `[start, end)` spanning this band's own row groups. Contiguous across bands, so a reader can price a prefix read up to any band. Optional. |
 
@@ -118,6 +150,19 @@ Each `levels` entry.
 Stated here in explanatory form, the normative wording is in
 [SPEC.md](SPEC.md).
 
+- Coarse bands are formed by an importance fraction, largest first, a small
+  slice of the features across all coarse bands with the exact final band
+  keeping the large remainder. Band 0 alone is then density thinned to one
+  survivor per pixel per geometry dimension over all valid features, so its
+  coverage stays even. The number of bands is derived from the data by a
+  decoded-bytes-per-screen budget, so dense many-feature data and sparse
+  heavy-geometry data each get the band count they need. The budget solves
+  against local byte density, a byte-weighted high quantile over a grid laid on
+  the extent, because the whole-extent average understates the dense screens a
+  user actually zooms into and would hand off to the exact band too
+  early. No coarse band ever serves at or past the zoom model's finest zoom,
+  where an overview would just be exact geometry grid-snapped. No feature is
+  dropped, only moved to a finer band.
 - Rows are band-major, then ordered by the `spatial_key` curve within each
   band. A small int16 `band` column records each row's band.
 - Coarse bands carry `geom_overview`, the finest band leaves it null. The
@@ -125,9 +170,12 @@ Stated here in explanatory form, the normative wording is in
 - Row groups cut at band boundaries, so `row_group_end` is exact. Coarse bands
   split into many near-equal row groups so a low-zoom view prunes tightly,
   the finest band cuts by byte budget so range reads stay a similar size.
-- The source CRS is preserved on both geometry columns. Overview tolerances,
-  grid, gsd, and zooms derive from the dataset extent, so degrees and metres
-  both work.
+- The source CRS is preserved on both geometry columns. The overview ladder runs
+  in absolute web zoom, with its coarsest band anchored at the zoom where the
+  dataset extent fills a screen rather than at whole-world zoom, so a city-scale
+  file never spends bands on zooms where its extent is a speck. Tolerances, the
+  per-band snap grids, gsd, and zooms derive from the data in its own CRS units,
+  so degrees and metres both work.
 - The file keeps the GeoParquet bbox covering and writes the Parquet Page
   Index, which together enable the client-side page pruning below. This holds
   even under GeoParquet 2.0, where the covering column is otherwise dropped.
@@ -153,28 +201,55 @@ whole-group read, so the optimization is never load-bearing.
 
 ## Behavior per geometry type
 
-Importance ranking and the overview value both depend on the geometry
+The importance rank that decides which band a feature lands in, and which one
+wins a band-0 thinning cell, and the overview value, both depend on the geometry
 dimension.
 
 | Geometry | Ranked by | Overview value |
 | --- | --- | --- |
-| Polygons | Area, largest first | Simplified, topology preserving, then snapped to the band grid |
-| Lines | Length, longest first | Simplified and snapped |
-| Points | An attribute column when one is given, otherwise spatial grid thinning | The exact minimal geometry, copied. For a thinned point dataset the banding itself is the level of detail and no overview column is written. |
-| Mixed layers | Per-dimension rank merged by quantile | Per the dimension of each feature |
+| Polygons | Area, largest first | Simplified, topology preserving, then snapped to the band grid. A shape that collapses below the band pixel writes a small grid-aligned quad sized by its own area instead, Tippecanoe's tiny-polygon-reduction idiom, so a polygon survivor always paints as a polygon |
+| Lines | Length, longest first | Simplified and snapped, falling back to the unsnapped simplified line, then to a short segment along the line's own direction, so a line survivor always paints as a line |
+| Points | An attribute column when one is given, otherwise the survivor is decided by pure spatial thinning | The exact minimal geometry, copied. For a point-only dataset the banding itself is the level of detail and no overview column is written. |
+| Mixed layers | Each dimension cohort ranked within itself, banded and band-0 thinned in its own cells | Per the dimension of each feature |
 
 The footer records what was done, `importance` names the ranking and
 `overview_method` names the derivation, so a reader never has to guess.
 
 ## Measured on real data
 
-5.65 million building polygons, EPSG 3067 metres, Finland. A whole-country
-preview reads the band 0 overview, about 9 MB in a few range requests. The full
-exact geometry column is about 620 MB, roughly 67x more. Per band, the
-overview column is 73 to 81 percent smaller than the exact geometry it stands
-in for. Page pruning adds about 5.8x on large row groups and 1.5 to 2x on
-default 16 MB groups, so its win scales with how many rows a row group and a
-page hold.
+5.65 million building polygons, EPSG 3067 metres, Finland, converted with the
+light-overviews layout at zstd level 6. The budget derives four bands, three
+coarse plus exact, anchored where Finland fills a screen, with exact geometry
+taking over at zoom 13. The three coarse bands together hold ten percent of the
+features, band 0 additionally thinned to one survivor per pixel for even
+coverage. The exact geometry column is 190.9 MB on disk and decodes to 620 MB.
+
+| band | serves | features | overview, decoded | overview, on disk |
+| --- | --- | --: | --: | --: |
+| 0 | z0 to z8 | 273,105 | 25.38 MB | 4.57 MB |
+| 1 | z9 to z10 | 179,272 | 16.29 MB | 3.42 MB |
+| 2 | z11 to z12 | 358,545 | 29.41 MB | 8.65 MB |
+| 3 (exact) | z13 up | 4,840,353 | none | none |
+
+The overview column totals 16.66 MB on disk. A whole-country first paint reads
+the band 0 overview column, 4.57 MB on disk, and decodes 25.4 MB against the
+620 MB exact geometry column, so first paint moves a fraction of the bytes. Band
+0 is mostly small area-sized quads at that scale, each carrying its
+`overview_count`, so the preview paints as density-weighted building shapes,
+not a blank and not a dot field. A six-archetype bake-off drove the layout. The
+earlier all-band density thinning wrote a 112 MB overview column here, because it
+thinned every band and stored millions of near-exact building shapes a second
+time, and it derived eight bands. Fraction banding plus a band-0-only coverage
+pass and a depth cap brings the overview column down to 16.66 MB, close to the
+fraction-only 14 MB the bake-off measured for the same file, while adding the
+even band-0 coverage and its density counts the fraction-only layout lacked. The
+band-0 coverage fills 2073 of a 4096 cell grid, matching the old thinned band 0
+and beating the 1677 the fraction-only band 0 covered. The whole file is 315 MB
+against the fraction-only 326 MB and the all-band-thinned 432 MB. Page pruning
+adds about 5.8x on large row groups and 1.5 to 2x on default 16 MB groups, so
+its win scales with how many rows a row group and a page hold. No competing
+format, tile pyramid or reordered Parquet, publishes a byte-per-zoom figure to
+compare against.
 
 The file is read unchanged by DuckDB, which sees a normal GeoParquet file with
 a preserved `GEOMETRY('EPSG:3067')` column. The [live
@@ -201,14 +276,76 @@ custom decoder in every client. This convention stays on standard WKB so any
 GeoParquet reader can decode the overview column today, and the footprint
 cost is one column on a small fraction of rows.
 
+**Why not one geometry column per zoom level?** A tempting alternative keeps
+the rows in one pure spatial order and writes a simplified geometry column per
+zoom, with nulls standing in for features thinned out of that zoom. It is
+valid GeoParquet, the reader picks a level by column projection instead of by
+row range, and nulls compress well. It gives up two things this convention is
+built on. First, a coarse view stops being one contiguous byte range. Every
+zoom column spans every row group of the file, so a whole-extent preview
+touches the column chunk of its level in all of them, hundreds of scattered
+range requests on a large file where the band prefix here is a handful of
+sequential ones. Second, the simplified geometry is duplicated across the
+levels that keep a feature, so file size grows with the level count, where
+here each feature carries at most one overview. The per-zoom-column layout
+also fixes the level ladder into the schema itself, adding or removing a level
+is a schema migration, while here it is a footer and row-order change. The
+honest advantages on the other side are a single globally Hilbert-ordered
+row space, no band-major reorder of the exact rows, and per-level control by
+plain column selection in any engine with no footer knowledge at all. For the
+first-paint economics over HTTP, which this proposal optimizes for, the
+contiguous prefix wins.
+
+**How this relates to other cloud-optimized GeoParquet work.** The closest
+prior art is `cloud-optimized-geoparquet` (COGP), which orders features
+coarse to fine and records the layout in a footer key very much like this one,
+levels with a `row_group_end` and a `gsd`. COGP reorders only, it writes no
+reduced geometry, so a whole-extent view still decodes full-precision shapes
+from the coarse prefix. This convention adds the two things reordering alone
+cannot, a physically smaller overview column and band-0 density thinning, so
+band 0 is smaller in bytes, not just first in file order. A related project, `yosegi`,
+does thin per zoom, but it duplicates features across zoom levels, so the file
+stores each feature many times. Here every feature is stored exactly once and a
+coarse band is a subset that points back to that single copy. A proprietary
+feature layer takes a third path, several simplified geometry columns, one per
+display scale, in a single projection. That works but the column count grows
+with the number of levels and the source projection is not preserved. This
+convention keeps one overview column plus a band ordinal keyed by the footer,
+so the schema does not grow with the level count, and it preserves whatever CRS
+the data arrived in, validated on a projected metre dataset.
+
 **Does this replace tiles?** No. For pure cartography at planet scale a tile
-pyramid still wins. The claim is narrower, a dataset that must also be
-analyzed can serve both jobs from one file.
+pyramid, PMTiles or vector tiles, still wins. But a tile pyramid stores every
+shape a second time, quantized and lossy, and a SQL engine cannot read it. The
+claim here is narrower and is the one axis a tile format cannot hold, a dataset
+that must also be analyzed serves both the map and the query from one file,
+with no second pipeline and no duplicated exact geometry.
 
 ## Open questions
 
-- **Per-band extent and byte range** in `levels`, so a client knows the cost
-  of a prefix before reading.
-- **Min and max zoom** per level instead of `max_zoom` only.
+- **Network fragmentation.** Thinning treats features independently, so it will
+  drop segments of a connected road or river network mid-run and leave gaps at
+  coarse zoom. Ranking lines by length keeps the trunks and drops the spurs,
+  which softens it, but true topology-preserving network thinning is a separate
+  and harder problem, and is out of scope for this draft.
+- **Adjacent-cell clumping.** Capping one feature per cell does not enforce a
+  true minimum spacing, so two survivors in adjacent cells can nearly touch, up
+  to about twice the nominal density in clumps. The labelled upgrade path is
+  importance-ordered greedy selection with a minimum-spacing radius.
+- **Aggregation beyond counts.** Survivors now carry `overview_count`, so a
+  viewer can size a proportional symbol, but the count is the only aggregate.
+  A future draft could carry summed attributes on a survivor, or coalesce
+  coverage polygons such as landcover into a neighbor where dropping one would
+  open a visible gap.
+- **Diminishing overview returns on fine coarse bands.** For minimal-vertex
+  features like buildings, a fine coarse band's simplified copy is nearly as
+  heavy as the exact geometry, so an overview copy of every feature at a fine
+  zoom buys little. The light-overviews layout handles this two ways, the depth
+  cap stops the ladder where an exact read with page pruning is already
+  affordable so no overview band is written past it, and the coarse bands hold
+  only a small importance slice so the copies that are written stay a small
+  cohort. What remains is a coarser lever than a per-level exact-read flag, a
+  future draft could let a level declare itself exact-read case by case once its
+  shrink falls under a threshold, if readers grow support for it.
 - **Multiple files.** The same ordering works as a dataset clustering key for
   part-files with non-overlapping ranges.
